@@ -74,10 +74,12 @@ void msplat_sgld_noise(
     float noise_lr, float xyz_lr
 );
 
-// MCMC: Apply opacity and scale regularization as post-Adam parameter nudge
+// MCMC: Apply opacity, scale, and anisotropy regularization as post-Adam
+// parameter nudges. aniso_reg is a hinge on the per-Gaussian scale ratio
+// max(exp(s))/min(exp(s)) above 10:1 — set to 0 to disable.
 void msplat_mcmc_regularization(
     int N, MTensor &opacities, MTensor &scales,
-    float lr, float opacity_reg, float scale_reg
+    float lr, float opacity_reg, float scale_reg, float aniso_reg
 );
 
 #endif

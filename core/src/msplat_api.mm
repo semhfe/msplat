@@ -89,7 +89,8 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
         (int)impl->ds->trainCams.size(),
         config.numDownscales, config.resolutionSchedule,
         config.shDegree, config.shDegreeInterval,
-        config.capMax, config.noiseLr, config.opacityReg, config.scaleReg,
+        config.capMax, config.noiseLr,
+        config.opacityReg, config.scaleReg, config.anisoReg,
         config.iterations, config.keepCrs,
         config.bgColor
     );

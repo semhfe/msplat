@@ -13,6 +13,10 @@ public struct TrainingConfig {
     public var noiseLr: Float = 5e5
     public var opacityReg: Float = 0.01
     public var scaleReg: Float = 0.01
+    /// Anisotropy regularization weight: hinge on max/min scale ratio above
+    /// 10:1. Suppresses needle artifacts where Gaussians elongate along
+    /// under-constrained view rays. 0 disables.
+    public var anisoReg: Float = 0.01
     public var cullRadius: Float = 3.0
     public var keepCrs: Bool = false
     public var downscaleFactor: Float = 1.0
@@ -34,6 +38,7 @@ public struct TrainingConfig {
         c.noiseLr = noiseLr
         c.opacityReg = opacityReg
         c.scaleReg = scaleReg
+        c.anisoReg = anisoReg
         c.cullRadius = cullRadius
         c.keepCrs = keepCrs
         c.downscaleFactor = downscaleFactor

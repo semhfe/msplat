@@ -25,6 +25,7 @@ typedef struct {
     float noiseLr;
     float opacityReg;
     float scaleReg;
+    float anisoReg;
     float cullRadius;
     bool keepCrs;
     float downscaleFactor;
@@ -43,6 +44,7 @@ static inline MsplatConfig msplat_default_config(void) {
     c.noiseLr = 5e5f;
     c.opacityReg = 0.01f;
     c.scaleReg = 0.01f;
+    c.anisoReg = 0.01f;
     c.cullRadius = 3.0f;
     c.keepCrs = false;
     c.downscaleFactor = 1.0f;
