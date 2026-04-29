@@ -89,12 +89,11 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
         (int)impl->ds->trainCams.size(),
         config.numDownscales, config.resolutionSchedule,
         config.shDegree, config.shDegreeInterval,
-        config.refineEvery, config.warmupLength, config.resetAlphaEvery,
-        config.densifyGradThresh, config.densifySizeThresh,
-        config.stopScreenSizeAt, config.splitScreenSize,
+        config.capMax, config.noiseLr, config.opacityReg, config.scaleReg,
         config.iterations, config.keepCrs,
         config.bgColor
     );
+    impl->model->cull_radius = config.cullRadius;
 
     impl->camIndices.resize(impl->ds->trainCams.size());
     std::iota(impl->camIndices.begin(), impl->camIndices.end(), 0);
@@ -115,7 +114,7 @@ Stats Trainer::step() {
 
     impl->model->fullIteration(cam, impl->currentStep, gt, impl->config.ssimWeight);
     impl->model->schedulersStep(impl->currentStep);
-    impl->model->afterTrain(impl->currentStep);
+    impl->model->mcmcAfterTrain(impl->currentStep);
     msplat_commit();
 
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -284,13 +283,11 @@ static msplat::Config configFromC(MsplatConfig c) {
     cfg.ssimWeight = c.ssimWeight;
     cfg.numDownscales = c.numDownscales;
     cfg.resolutionSchedule = c.resolutionSchedule;
-    cfg.refineEvery = c.refineEvery;
-    cfg.warmupLength = c.warmupLength;
-    cfg.resetAlphaEvery = c.resetAlphaEvery;
-    cfg.densifyGradThresh = c.densifyGradThresh;
-    cfg.densifySizeThresh = c.densifySizeThresh;
-    cfg.stopScreenSizeAt = c.stopScreenSizeAt;
-    cfg.splitScreenSize = c.splitScreenSize;
+    cfg.capMax = c.capMax;
+    cfg.noiseLr = c.noiseLr;
+    cfg.opacityReg = c.opacityReg;
+    cfg.scaleReg = c.scaleReg;
+    cfg.cullRadius = c.cullRadius;
     cfg.keepCrs = c.keepCrs;
     cfg.downscaleFactor = c.downscaleFactor;
     memcpy(cfg.bgColor, c.bgColor, sizeof(cfg.bgColor));

@@ -45,7 +45,7 @@ MTensor msplat_render(
     MTensor &opacities, MTensor &background
 );
 
-// Fused forward + backward + Adam + grad_stats in one encoder
+// Fused forward + backward + Adam in one encoder (no grad stats accumulation)
 // Returns: (radii [N], loss_value float)
 std::tuple<MTensor, float> msplat_train_step(
     int num_points, MTensor &means3d, MTensor &scales, float glob_scale,
@@ -61,26 +61,23 @@ std::tuple<MTensor, float> msplat_train_step(
     int num_adam_groups,
     MTensor adam_params[], MTensor adam_exp_avg[], MTensor adam_exp_avg_sq[],
     float adam_step_sizes[], float adam_bc2_sqrts[],
-    float adam_beta1, float adam_beta2, float adam_eps,
-    MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
-    float inv_max_dim
+    float adam_beta1, float adam_beta2, float adam_eps
 );
 
-int msplat_densify(
-    int N, int buf_capacity,
-    float grad_thresh, float size_thresh, float screen_thresh, int check_screen,
-    float cull_alpha_thresh, float cull_scale_thresh, float cull_screen_size, int check_huge,
-    MTensor &xys_grad_norm, MTensor &vis_counts, MTensor &max_2d_size,
-    float half_max_dim,
-    MTensor &means_buf, MTensor &scales_buf, MTensor &quats_buf,
-    MTensor &featuresDc_buf, MTensor &featuresRest_buf, MTensor &opacities_buf,
-    int fr_stride,
-    MTensor adam_exp_avg_buf[], MTensor adam_exp_avg_sq_buf[],
-    MTensor &split_flag, MTensor &dup_flag,
-    MTensor &split_prefix, MTensor &dup_prefix,
-    MTensor &keep_flag, MTensor &keep_prefix,
-    MTensor &block_totals, MTensor &compact_scratch,
-    MTensor &random_samples
+// MCMC: fill an N*3 noise buffer with N(0,1) samples on GPU (PCG+Box-Muller).
+void msplat_sgld_noise_gen(int N, MTensor &noise, uint32_t seed);
+
+// MCMC: Inject SGLD noise into Gaussian positions, weighted by covariance and opacity
+void msplat_sgld_noise(
+    int N, MTensor &means, MTensor &scales, MTensor &quats,
+    MTensor &opacities, MTensor &noise,
+    float noise_lr, float xyz_lr
+);
+
+// MCMC: Apply opacity and scale regularization as post-Adam parameter nudge
+void msplat_mcmc_regularization(
+    int N, MTensor &opacities, MTensor &scales,
+    float lr, float opacity_reg, float scale_reg
 );
 
 #endif

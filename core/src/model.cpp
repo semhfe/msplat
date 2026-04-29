@@ -42,15 +42,13 @@ float l1_loss(const MTensor& rendered, const MTensor& gt) {
 // Model constructor
 Model::Model(const InputData &inputData, int numCameras,
     int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,
-    int refineEvery, int warmupLength, int resetAlphaEvery, float densifyGradThresh, float densifySizeThresh, int stopScreenSizeAt, float splitScreenSize,
+    int capMax, float noiseLr, float opacityReg, float scaleReg,
     int maxSteps, bool keepCrs,
     const float* bgColor)
     : numCameras(numCameras), numDownscales(numDownscales), resolutionSchedule(resolutionSchedule),
       shDegree(shDegree), shDegreeInterval(shDegreeInterval),
-      refineEvery(refineEvery), warmupLength(warmupLength), resetAlphaEvery(resetAlphaEvery),
-      stopSplitAt(maxSteps / 2), densifyGradThresh(densifyGradThresh), densifySizeThresh(densifySizeThresh),
-      stopScreenSizeAt(stopScreenSizeAt), splitScreenSize(splitScreenSize),
-      maxSteps(maxSteps), keepCrs(keepCrs) {
+      maxSteps(maxSteps), keepCrs(keepCrs),
+      cap_max(capMax), noise_lr(noiseLr), opacity_reg(opacityReg), scale_reg(scaleReg) {
 
     int64_t numPoints = inputData.points.count;
     scale = inputData.scale;
@@ -100,12 +98,11 @@ Model::Model(const InputData &inputData, int numCameras,
         featuresRest = gpu_zeros({numPoints, (int64_t)(dimSh - 1), 3}, DType::Float32);
     }
 
-    // Opacities: logit(0.1) = log(0.1/0.9)
+    // Opacities: logit(0.5) = 0.0 — MCMC initialization
     {
-        float logit01 = std::log(0.1f / 0.9f);
         opacities = gpu_empty({numPoints, 1}, DType::Float32);
         float *op = opacities.data<float>();
-        for (int64_t i = 0; i < numPoints; i++) op[i] = logit01;
+        for (int64_t i = 0; i < numPoints; i++) op[i] = 0.0f;
     }
 
     // Background color — default is magenta (high-contrast against typical scenes,
@@ -121,12 +118,25 @@ void Model::setupOptimizers(){
 
 
     num_active = means.size(0);
-    buf_capacity = num_active * 4;
+    buf_capacity = cap_max;
+
+    // Bug fix: when COLMAP produces more 3D points than cap_max, clamp so the
+    // memcpy in allocBuf never writes past the cap_max-sized buffer.
+    int64_t rows_to_copy = std::min((int64_t)num_active, (int64_t)cap_max);
+    if (num_active > cap_max) {
+        std::cerr << "[mcmc] init points (" << num_active
+                  << ") exceed cap_max=" << cap_max
+                  << "; truncating to cap_max\n";
+        num_active = cap_max;
+    }
+
     auto allocBuf = [&](MTensor &buf, const MTensor &param) {
         auto shape = param.shape();
         shape[0] = buf_capacity;
         buf = gpu_zeros(shape, DType::Float32);
-        memcpy(buf.data_ptr(), param.data_ptr(), param.nbytes());
+        // Copy only rows_to_copy rows (param may have more rows than cap_max).
+        size_t row_bytes = param.nbytes() / (size_t)param.size(0);
+        memcpy(buf.data_ptr(), param.data_ptr(), (size_t)rows_to_copy * row_bytes);
     };
     allocBuf(means_buf, means);
     allocBuf(scales_buf, scales);
@@ -148,17 +158,12 @@ void Model::setupOptimizers(){
     means_lr_init = 0.00016f;
     means_lr_final = 0.0000016f;
 
-    densify_split_flag = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_dup_flag = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_split_prefix = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_dup_prefix = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_keep_flag = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_keep_prefix = gpu_zeros({buf_capacity}, DType::Int32);
-    int max_blocks = (buf_capacity + 1023) / 1024;
-    densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
-    int64_t fr_stride = featuresRest.numel() / featuresRest.size(0);
-    densify_compact_scratch = gpu_zeros({(int64_t)buf_capacity * fr_stride}, DType::Float32);
-    densify_random_samples = gpu_zeros({buf_capacity, 3}, DType::Float32);
+    // MCMC: preallocated noise buffer for SGLD perturbation (reused every step)
+    sgld_noise_buf = gpu_empty({(int64_t)cap_max * 3}, DType::Float32);
+
+    // Pre-allocate relocation scratch to avoid repeated heap allocs at step %100
+    scratch_probs_.reserve(cap_max);
+    scratch_count_.reserve(cap_max);
 
     refreshViews();
 }
@@ -170,10 +175,7 @@ void Model::releaseOptimizers(){
     }
     means_buf.reset(); scales_buf.reset(); quats_buf.reset();
     featuresDc_buf.reset(); featuresRest_buf.reset(); opacities_buf.reset();
-    densify_split_flag.reset(); densify_dup_flag.reset();
-    densify_split_prefix.reset(); densify_dup_prefix.reset();
-    densify_keep_flag.reset(); densify_keep_prefix.reset();
-    densify_block_totals.reset(); densify_compact_scratch.reset(); densify_random_samples.reset();
+    sgld_noise_buf.reset();
 }
 
 void Model::schedulersStep(int step){
@@ -194,104 +196,203 @@ void Model::refreshViews(){
     }
 }
 
-void Model::ensureCapacity(int needed){
-    if (needed <= buf_capacity) return;
-    int new_cap = std::max(needed, buf_capacity * 2);
-
-    auto grow = [&](MTensor &buf) {
-        auto shape = buf.shape();
-        shape[0] = new_cap;
-        MTensor new_buf = gpu_zeros(shape, DType::Float32);
-        size_t copy_bytes = num_active * buf.stride0() * sizeof(float);
-        memcpy(new_buf.data_ptr(), buf.data_ptr(), copy_bytes);
-        buf = new_buf;
-    };
-    grow(means_buf); grow(scales_buf); grow(quats_buf);
-    grow(featuresDc_buf); grow(featuresRest_buf); grow(opacities_buf);
-    for (int g = 0; g < N_ADAM_GROUPS; g++) {
-        grow(adam_exp_avg_buf[g]);
-        grow(adam_exp_avg_sq_buf[g]);
-    }
-    densify_split_flag = gpu_zeros({new_cap}, DType::Int32);
-    densify_dup_flag = gpu_zeros({new_cap}, DType::Int32);
-    densify_split_prefix = gpu_zeros({new_cap}, DType::Int32);
-    densify_dup_prefix = gpu_zeros({new_cap}, DType::Int32);
-    densify_keep_flag = gpu_zeros({new_cap}, DType::Int32);
-    densify_keep_prefix = gpu_zeros({new_cap}, DType::Int32);
-    int max_blocks = (new_cap + 1023) / 1024;
-    densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
-    int64_t fr_stride = featuresRest_buf.stride0();
-    densify_compact_scratch = gpu_zeros({(int64_t)new_cap * fr_stride}, DType::Float32);
-    densify_random_samples = gpu_zeros({new_cap, 3}, DType::Float32);
-
-    buf_capacity = new_cap;
-    refreshViews();
-}
-
 int Model::getDownscaleFactor(int step) {
     int remaining = numDownscales - step / resolutionSchedule;
     return 1 << std::max(remaining, 0);
 }
 
-void Model::afterTrain(int step){
-    if (!radii.defined()) return;
+// ── MCMC helpers ────────────────────────────────────────────────────────────
 
-    if (step % refineEvery == 0 && step > warmupLength){
-        int resetInterval = resetAlphaEvery * refineEvery;
-        bool doDensification = step < stopSplitAt && step % resetInterval > numCameras + refineEvery;
+// Equation 9 of the MCMC paper: when N samples are drawn from a single Gaussian,
+// reduce each clone's opacity/scale so that the ensemble preserves total weight.
+void Model::computeRelocation(float opacity_old_sig, float* scale_old_exp, int N,
+                              float& opacity_new_sig, float* scale_new_exp) {
+    opacity_new_sig = 1.0f - std::pow(1.0f - opacity_old_sig, 1.0f / (float)N);
+    float s = std::sqrt(1.0f / (float)N);
+    for (int i = 0; i < 3; i++) scale_new_exp[i] = scale_old_exp[i] * s;
+}
 
-        if (doDensification){
-            int numPointsBefore = num_active;
-            ensureCapacity(3 * num_active);  // worst case: every gaussian splits
+// Move dead Gaussians onto alive ones (weighted by opacity) and redistribute
+// opacity/scale so total weight is preserved.
+void Model::relocate(const std::vector<int>& dead, const std::vector<int>& alive) {
+    if (dead.empty() || alive.empty()) return;
 
-            // Fill random samples for splits (CPU randn, shared memory)
-            {
-                std::mt19937 rng(step);
-                std::normal_distribution<float> dist(0.0f, 1.0f);
-                float *p = densify_random_samples.data<float>();
-                for (int64_t i = 0; i < 2 * num_active * 3; i++) p[i] = dist(rng);
-            }
+    float *mbuf = means_buf.data<float>();
+    float *sbuf = scales_buf.data<float>();
+    float *qbuf = quats_buf.data<float>();
+    float *fdcbuf = featuresDc_buf.data<float>();
+    float *frbuf = featuresRest_buf.data<float>();
+    float *obuf = opacities_buf.data<float>();
+    int64_t fr_stride = featuresRest_buf.stride0();
 
-            float half_max_dim = 0.5f * static_cast<float>((std::max)(lastWidth, lastHeight));
-            int check_screen = (step < stopScreenSizeAt) ? 1 : 0;
-            bool checkHuge = step > refineEvery * resetAlphaEvery;
-            int fr_stride = (int)featuresRest_buf.stride0();
-
-            int new_count = msplat_densify(
-                num_active, buf_capacity,
-                densifyGradThresh, densifySizeThresh, splitScreenSize, check_screen,
-                0.1f, 0.5f, 0.15f, checkHuge ? 1 : 0,
-                xysGradNorm, visCounts, max2DSize, half_max_dim,
-                means_buf, scales_buf, quats_buf,
-                featuresDc_buf, featuresRest_buf, opacities_buf, fr_stride,
-                adam_exp_avg_buf, adam_exp_avg_sq_buf,
-                densify_split_flag, densify_dup_flag,
-                densify_split_prefix, densify_dup_prefix,
-                densify_keep_flag, densify_keep_prefix,
-                densify_block_totals, densify_compact_scratch,
-                densify_random_samples
-            );
-
-            num_active = new_count;
-            refreshViews();
-            std::cout << "Densified: " << numPointsBefore << " -> " << num_active << " gaussians" << std::endl;
+    auto zeroAdamAt = [&](int idx) {
+        for (int g = 0; g < N_ADAM_GROUPS; g++) {
+            int64_t st = adam_exp_avg_buf[g].stride0();
+            memset(adam_exp_avg_buf[g].data<float>() + idx * st, 0, st * sizeof(float));
+            memset(adam_exp_avg_sq_buf[g].data<float>() + idx * st, 0, st * sizeof(float));
         }
+    };
 
-        if (step < stopSplitAt && step % resetInterval == refineEvery){
-            msplat_gpu_sync();
-            constexpr float resetLogit = -1.3862943611198906f;
-            float *op = opacities.data<float>();
-            for (int64_t i = 0; i < opacities.numel(); i++)
-                if (op[i] > resetLogit) op[i] = resetLogit;
+    // Weighted sample of source alive-indices, one per dead slot.
+    scratch_probs_.resize(alive.size());
+    for (size_t i = 0; i < alive.size(); i++)
+        scratch_probs_[i] = 1.0f / (1.0f + std::exp(-obuf[alive[i]]));
 
-            adam_exp_avg[5].zero();
-            adam_exp_avg_sq[5].zero();
-            fprintf(stderr, "Opacity reset at step %d\n", step);
+    std::mt19937 rng((unsigned)(0x9E3779B9u ^ (unsigned)(++mcmc_relocation_count)));
+    std::discrete_distribution<int> dist(scratch_probs_.begin(), scratch_probs_.end());
+
+    scratch_count_.assign(alive.size(), 0);
+    std::vector<int> chosen_alive(dead.size());
+    for (size_t i = 0; i < dead.size(); i++) {
+        int a = dist(rng);
+        chosen_alive[i] = a;
+        scratch_count_[a]++;
+    }
+
+    // Apply Eq. 9 to each source with count > 0 (writes updated opacity/scale
+    // back to source so dead slots can copy the post-relocation values).
+    for (size_t a = 0; a < alive.size(); a++) {
+        if (scratch_count_[a] == 0) continue;
+        int src = alive[a];
+        int N = scratch_count_[a];
+
+        float op_old_sig = 1.0f / (1.0f + std::exp(-obuf[src]));
+        float s_old_exp[3] = {
+            std::exp(sbuf[src*3]), std::exp(sbuf[src*3+1]), std::exp(sbuf[src*3+2])
+        };
+        float op_new_sig;
+        float s_new_exp[3];
+        computeRelocation(op_old_sig, s_old_exp, N, op_new_sig, s_new_exp);
+
+        // Clamp to avoid log(0)/division-by-zero at extremes.
+        op_new_sig = std::clamp(op_new_sig, 1e-6f, 1.0f - 1e-6f);
+        obuf[src] = std::log(op_new_sig / (1.0f - op_new_sig));
+        for (int j = 0; j < 3; j++) sbuf[src*3+j] = std::log(std::max(s_new_exp[j], 1e-10f));
+        zeroAdamAt(src);
+    }
+
+    // Copy source params into each dead slot.
+    for (size_t i = 0; i < dead.size(); i++) {
+        int dst = dead[i];
+        int src = alive[chosen_alive[i]];
+        memcpy(mbuf + dst*3,   mbuf + src*3,   3 * sizeof(float));
+        memcpy(qbuf + dst*4,   qbuf + src*4,   4 * sizeof(float));
+        memcpy(fdcbuf + dst*3, fdcbuf + src*3, 3 * sizeof(float));
+        memcpy(frbuf + dst*fr_stride, frbuf + src*fr_stride, fr_stride * sizeof(float));
+        obuf[dst] = obuf[src];
+        memcpy(sbuf + dst*3, sbuf + src*3, 3 * sizeof(float));
+        zeroAdamAt(dst);
+    }
+}
+
+// Grow num_active toward cap_max by ~5% per call.
+int Model::addNewGaussians() {
+    int target = std::min(cap_max, (int)(1.05f * (float)num_active));
+    int num_new = target - num_active;
+    if (num_new <= 0) return 0;
+
+    float *mbuf = means_buf.data<float>();
+    float *sbuf = scales_buf.data<float>();
+    float *qbuf = quats_buf.data<float>();
+    float *fdcbuf = featuresDc_buf.data<float>();
+    float *frbuf = featuresRest_buf.data<float>();
+    float *obuf = opacities_buf.data<float>();
+    int64_t fr_stride = featuresRest_buf.stride0();
+
+    auto zeroAdamAt = [&](int idx) {
+        for (int g = 0; g < N_ADAM_GROUPS; g++) {
+            int64_t st = adam_exp_avg_buf[g].stride0();
+            memset(adam_exp_avg_buf[g].data<float>() + idx * st, 0, st * sizeof(float));
+            memset(adam_exp_avg_sq_buf[g].data<float>() + idx * st, 0, st * sizeof(float));
         }
+    };
 
-        xysGradNorm.reset();
-        visCounts.reset();
-        max2DSize.reset();
+    scratch_probs_.resize(num_active);
+    for (int i = 0; i < num_active; i++)
+        scratch_probs_[i] = 1.0f / (1.0f + std::exp(-obuf[i]));
+
+    std::mt19937 rng((unsigned)(0xA24BAED4u ^ (unsigned)(++mcmc_relocation_count)));
+    std::discrete_distribution<int> dist(scratch_probs_.begin(), scratch_probs_.end());
+
+    scratch_count_.assign(num_active, 0);
+    std::vector<int> chosen_src(num_new);
+    for (int i = 0; i < num_new; i++) {
+        int s = dist(rng);
+        chosen_src[i] = s;
+        scratch_count_[s]++;
+    }
+
+    // Apply Eq. 9 to each source with count > 0 (source's N counts itself via
+    // each sample drawn — the new slots then copy its post-relocation values).
+    for (int src = 0; src < num_active; src++) {
+        if (scratch_count_[src] == 0) continue;
+        int N = scratch_count_[src];
+
+        float op_old_sig = 1.0f / (1.0f + std::exp(-obuf[src]));
+        float s_old_exp[3] = {
+            std::exp(sbuf[src*3]), std::exp(sbuf[src*3+1]), std::exp(sbuf[src*3+2])
+        };
+        float op_new_sig;
+        float s_new_exp[3];
+        computeRelocation(op_old_sig, s_old_exp, N, op_new_sig, s_new_exp);
+
+        op_new_sig = std::clamp(op_new_sig, 1e-6f, 1.0f - 1e-6f);
+        obuf[src] = std::log(op_new_sig / (1.0f - op_new_sig));
+        for (int j = 0; j < 3; j++) sbuf[src*3+j] = std::log(std::max(s_new_exp[j], 1e-10f));
+        zeroAdamAt(src);
+    }
+
+    for (int i = 0; i < num_new; i++) {
+        int dst = num_active + i;
+        int src = chosen_src[i];
+        memcpy(mbuf + dst*3,   mbuf + src*3,   3 * sizeof(float));
+        memcpy(qbuf + dst*4,   qbuf + src*4,   4 * sizeof(float));
+        memcpy(fdcbuf + dst*3, fdcbuf + src*3, 3 * sizeof(float));
+        memcpy(frbuf + dst*fr_stride, frbuf + src*fr_stride, fr_stride * sizeof(float));
+        obuf[dst] = obuf[src];
+        memcpy(sbuf + dst*3, sbuf + src*3, 3 * sizeof(float));
+        zeroAdamAt(dst);
+    }
+
+    num_active += num_new;
+    return num_new;
+}
+
+void Model::mcmcAfterTrain(int step) {
+    if (step < 500 || step % 100 != 0) return;
+    msplat_gpu_sync();
+
+    const float *op = opacities.data<float>();
+    const float *mn = means.data<float>();
+    const float r2 = cull_radius > 0.0f ? cull_radius * cull_radius : -1.0f;
+    std::vector<int> dead, alive;
+    dead.reserve(num_active / 8);
+    alive.reserve(num_active);
+    int culled = 0;
+    for (int i = 0; i < num_active; i++) {
+        float sig = 1.0f / (1.0f + std::exp(-op[i]));
+        bool is_dead = (sig <= 0.005f);
+        if (!is_dead && r2 > 0.0f) {
+            float x = mn[i*3 + 0], y = mn[i*3 + 1], z = mn[i*3 + 2];
+            if (x*x + y*y + z*z > r2) { is_dead = true; culled++; }
+        }
+        if (is_dead) dead.push_back(i);
+        else         alive.push_back(i);
+    }
+
+    int dead_count = (int)dead.size();
+    if (!dead.empty() && !alive.empty()) relocate(dead, alive);
+    int grown = addNewGaussians();
+
+    if (dead_count > 0 || grown > 0) refreshViews();
+
+    // Throttle stdout to every 1000 steps — matches the step-timer output cadence.
+    if (step % 1000 == 0) {
+        std::cout << "MCMC step=" << step
+                  << " active=" << num_active
+                  << " dead=" << dead_count
+                  << " culled=" << culled
+                  << " grown=" << grown << std::endl;
     }
 }
 
@@ -438,7 +539,7 @@ int Model::loadCheckpoint(const std::string &filename) {
     // Rebuild backing buffers with loaded data (don't call setupOptimizers —
     // it would zero the optimizer state we just loaded)
     num_active = (int)numPts;
-    buf_capacity = num_active * 4;
+    buf_capacity = cap_max;
 
     // Copy gaussian params into oversized backing buffers
     auto allocBuf = [&](MTensor &buf, const MTensor &param) {
@@ -466,18 +567,8 @@ int Model::loadCheckpoint(const std::string &filename) {
         adam_exp_avg_sq_buf[g] = sq_buf;
     }
 
-    // Allocate densification scratch buffers
-    densify_split_flag = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_dup_flag = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_split_prefix = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_dup_prefix = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_keep_flag = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_keep_prefix = gpu_zeros({buf_capacity}, DType::Int32);
-    int max_blocks = (buf_capacity + 1023) / 1024;
-    densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
-    int64_t fr_stride = featuresRest.numel() / featuresRest.size(0);
-    densify_compact_scratch = gpu_zeros({(int64_t)buf_capacity * fr_stride}, DType::Float32);
-    densify_random_samples = gpu_zeros({buf_capacity, 3}, DType::Float32);
+    // MCMC: preallocated noise buffer for SGLD perturbation
+    sgld_noise_buf = gpu_empty({(int64_t)cap_max * 3}, DType::Float32);
 
     refreshViews();
 
@@ -570,14 +661,6 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
         adam_bc2s[i] = std::sqrt(bc2);
     }
 
-    if (!xysGradNorm.defined()) {
-    
-        xysGradNorm = gpu_zeros({numPoints}, DType::Float32);
-        visCounts = gpu_zeros({numPoints}, DType::Float32);
-        max2DSize = gpu_zeros({numPoints}, DType::Float32);
-    }
-
-    float invMaxDim = 1.0f / static_cast<float>((std::max)(lastHeight, lastWidth));
     float lossInvN = 1.0f / (float)(s.height * s.width * 3);
 
     auto [r, loss] = msplat_train_step(
@@ -590,8 +673,16 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
         N_ADAM_GROUPS,
         adam_p, adam_ea, adam_eas,
         adam_ss, adam_bc2s,
-        adam_beta1, adam_beta2, adam_eps,
-        visCounts, xysGradNorm, max2DSize, invMaxDim);
+        adam_beta1, adam_beta2, adam_eps);
 
     radii = r;
+
+    // MCMC: SGLD noise perturbation, then post-Adam opacity/scale regularization.
+    // Noise is generated on GPU (PCG+Box-Muller, seeded by step) — previously this
+    // was a CPU mt19937 loop costing ~10–50 ms/iter at 1M splats.
+    msplat_sgld_noise_gen(num_active, sgld_noise_buf, (uint32_t)step);
+    msplat_sgld_noise(num_active, means, scales, quats, opacities,
+                      sgld_noise_buf, noise_lr, adam_lr[0]);
+    msplat_mcmc_regularization(num_active, opacities, scales,
+                               adam_lr[0], opacity_reg, scale_reg);
 }

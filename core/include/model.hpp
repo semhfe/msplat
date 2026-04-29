@@ -12,7 +12,7 @@ float l1_loss(const MTensor& rendered, const MTensor& gt);
 struct Model{
   Model(const InputData &inputData, int numCameras,
         int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,
-        int refineEvery, int warmupLength, int resetAlphaEvery, float densifyGradThresh, float densifySizeThresh, int stopScreenSizeAt, float splitScreenSize,
+        int capMax, float noiseLr, float opacityReg, float scaleReg,
         int maxSteps, bool keepCrs,
         const float* bgColor = nullptr);
 
@@ -23,7 +23,7 @@ struct Model{
 
   void schedulersStep(int step);
   int getDownscaleFactor(int step);
-  void afterTrain(int step);
+  void mcmcAfterTrain(int step);
   void save(const std::string &filename, int step);
   void savePly(const std::string &filename, int step);
   void saveSplat(const std::string &filename);
@@ -59,22 +59,19 @@ struct Model{
   MTensor adam_exp_avg_buf[N_ADAM_GROUPS], adam_exp_avg_sq_buf[N_ADAM_GROUPS];
   int num_active = 0, buf_capacity = 0;
   void refreshViews();
-  void ensureCapacity(int needed);
 
-  MTensor densify_split_flag, densify_dup_flag;
-  MTensor densify_split_prefix, densify_dup_prefix;
-  MTensor densify_keep_flag, densify_keep_prefix;
-  MTensor densify_block_totals;
-  MTensor densify_compact_scratch;
-  MTensor densify_random_samples;
+  // MCMC: SGLD noise buffer (preallocated at cap_max * 3 floats)
+  MTensor sgld_noise_buf;
+  // MCMC: monotonic counter used to diversify RNG seeds across relocation calls
+  int mcmc_relocation_count = 0;
+  // Pre-allocated scratch space for relocate() / addNewGaussians() to avoid
+  // 4–16 MB alloc/free every 100 training steps at cap_max=1M.
+  std::vector<float> scratch_probs_;
+  std::vector<int>   scratch_count_;
 
   MTensor radii;
   int lastHeight;
   int lastWidth;
-
-  MTensor xysGradNorm;
-  MTensor visCounts;
-  MTensor max2DSize;
 
   MTensor backgroundColor;
   MTensor window2d;  // SSIM window (11,11) f32
@@ -84,19 +81,26 @@ struct Model{
   int resolutionSchedule;
   int shDegree;
   int shDegreeInterval;
-  int refineEvery;
-  int warmupLength;
-  int resetAlphaEvery;
-  int stopSplitAt;
-  float densifyGradThresh;
-  float densifySizeThresh;
-  int stopScreenSizeAt;
-  float splitScreenSize;
   int maxSteps;
   bool keepCrs;
 
+  // MCMC parameters
+  int cap_max;
+  float noise_lr;
+  float opacity_reg;
+  float scale_reg;
+  // MCMC: cull Gaussians whose normalized-space position ||mean|| > cull_radius.
+  // 0 (or negative) disables the cull. Default 3.0 = 3× the scene's unit-sphere.
+  float cull_radius = 0.0f;
+
   float scale;
   float translation[3] = {};
+
+private:
+  void relocate(const std::vector<int>& dead_indices, const std::vector<int>& alive_indices);
+  int addNewGaussians();
+  void computeRelocation(float opacity_old_sig, float* scale_old_exp, int N,
+                         float& opacity_new_sig, float* scale_new_exp);
 };
 
 #endif

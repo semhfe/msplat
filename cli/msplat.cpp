@@ -70,20 +70,19 @@ int main(int argc, char *argv[]) {
     float ssimWeight = 0.2f;
     app.add_option("--ssim-weight", ssimWeight, "SSIM loss weight (0 = L1 only)")
         ->check(CLI::Range(0.0f, 1.0f));
-    int refineEvery = 100;
-    app.add_option("--refine-every", refineEvery, "Densify/prune every N steps");
-    int warmupLength = 500;
-    app.add_option("--warmup-length", warmupLength, "Steps before first densification");
-    int resetAlphaEvery = 30;
-    app.add_option("--reset-alpha-every", resetAlphaEvery, "Reset opacity every N refinements");
-    float densifyGradThresh = 0.0002f;
-    app.add_option("--densify-grad-thresh", densifyGradThresh, "Gradient threshold for split/dup");
-    float densifySizeThresh = 0.01f;
-    app.add_option("--densify-size-thresh", densifySizeThresh, "Size threshold (dup vs split)");
-    int stopScreenSizeAt = 4000;
-    app.add_option("--stop-screen-size-at", stopScreenSizeAt, "Stop splitting large gaussians after N steps");
-    float splitScreenSize = 0.05f;
-    app.add_option("--split-screen-size", splitScreenSize, "Screen-space split threshold");
+    // MCMC parameters (3DGS-MCMC, NeurIPS 2024): fixed Gaussian budget + relocation.
+    int capMax = 1000000;
+    app.add_option("--cap-max", capMax, "Maximum Gaussian budget (fixed)")
+        ->check(CLI::Range(10000, 10000000));
+    float noiseLr = 5e5f;
+    app.add_option("--noise-lr", noiseLr, "SGLD noise learning rate");
+    float opacityReg = 0.01f;
+    app.add_option("--opacity-reg", opacityReg, "Opacity regularization weight");
+    float scaleReg = 0.01f;
+    app.add_option("--scale-reg", scaleReg, "Scale regularization weight");
+    float cullRadius = 3.0f;
+    app.add_option("--cull-radius", cullRadius, "Cull splats with ||mean|| > r in normalized space (0 = off)")
+        ->check(CLI::Range(0.0f, 100.0f));
     bool keepCrs = false;
     app.add_flag("--keep-crs", keepCrs, "Retain input coordinate reference system");
     std::vector<float> bgColor = {0.6130f, 0.0101f, 0.3984f};
@@ -119,10 +118,10 @@ int main(int argc, char *argv[]) {
 
         Model model(inputData, cams.size(),
                      numDownscales, resolutionSchedule, shDegree, shDegreeInterval,
-                     refineEvery, warmupLength, resetAlphaEvery, densifyGradThresh,
-                     densifySizeThresh, stopScreenSizeAt, splitScreenSize,
+                     capMax, noiseLr, opacityReg, scaleReg,
                      numIters, keepCrs,
                      bgColor.data());
+        model.cull_radius = cullRadius;
 
         std::vector<size_t> camIndices(cams.size());
         std::iota(camIndices.begin(), camIndices.end(), 0);
@@ -149,8 +148,19 @@ int main(int argc, char *argv[]) {
             MTensor gt = cam.getGPUImage(model.getDownscaleFactor(step));
             model.fullIteration(cam, step, gt, ssimWeight);
             model.schedulersStep(step);
-            model.afterTrain(step);
+            model.mcmcAfterTrain(step);
             msplat_commit();
+
+            // Progress output for GUI integration (every 1000 steps)
+            if (step % 1000 == 0 || step == 1) {
+                auto iter_end_time = cpu_now();
+                double ms = std::chrono::duration_cast<std::chrono::microseconds>(
+                    iter_end_time - iter_start).count() / 1000.0;
+                std::cout << "step=" << step
+                          << " splats=" << model.means.size(0)
+                          << " " << std::fixed << std::setprecision(1)
+                          << ms << "ms/step" << std::endl;
+            }
 
             if (benchmarking && step > (size_t)bench_warmup) {
                 auto pre_sync = cpu_now();

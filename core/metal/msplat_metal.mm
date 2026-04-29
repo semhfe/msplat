@@ -29,9 +29,9 @@ static bool g_profile_stages_checked = false;
 // Stage names for training pipeline
 static const char* g_train_stage_names[] = {
     "blit_zero", "proj_sh_fwd", "prefix_sort_pack", "rast_fwd",
-    "loss_fwd_bwd", "rast_bwd", "proj_sh_bwd_adam", "grad_stats"
+    "loss_fwd_bwd", "rast_bwd", "proj_sh_bwd_adam"
 };
-static constexpr int N_TRAIN_STAGES = 8;
+static constexpr int N_TRAIN_STAGES = 7;
 
 static std::mutex g_stage_timing_mutex;
 // Per-stage accumulated times (ms), indexed by stage
@@ -152,14 +152,10 @@ struct MetalContext {
     // Backward pipeline kernels
     id<MTLComputePipelineState> project_and_sh_backward_kernel_cpso;
     id<MTLComputePipelineState> fused_adam_kernel_cpso;
-    id<MTLComputePipelineState> accumulate_grad_stats_kernel_cpso;
-    // GPU densification kernels
-    id<MTLComputePipelineState> densify_classify_kernel_cpso;
-    id<MTLComputePipelineState> densify_append_split_kernel_cpso;
-    id<MTLComputePipelineState> densify_append_dup_kernel_cpso;
-    id<MTLComputePipelineState> densify_cull_classify_kernel_cpso;
-    id<MTLComputePipelineState> compact_scatter_kernel_cpso;
-    id<MTLComputePipelineState> compact_copy_back_kernel_cpso;
+    // MCMC kernels
+    id<MTLComputePipelineState> sgld_noise_gen_kernel_cpso;
+    id<MTLComputePipelineState> sgld_noise_kernel_cpso;
+    id<MTLComputePipelineState> mcmc_regularization_kernel_cpso;
 };
 
 // Explicit metallib path (set by Swift/Python wrappers before first use)
@@ -255,14 +251,10 @@ MetalContext* init_msplat_metal_context() {
     // Backward pipeline
     ctx->project_and_sh_backward_kernel_cpso      = load(@"project_and_sh_backward_kernel");
     ctx->fused_adam_kernel_cpso                    = load(@"fused_adam_kernel");
-    ctx->accumulate_grad_stats_kernel_cpso        = load(@"accumulate_grad_stats_kernel");
-    // GPU densification
-    ctx->densify_classify_kernel_cpso             = load(@"densify_classify_kernel");
-    ctx->densify_append_split_kernel_cpso         = load(@"densify_append_split_kernel");
-    ctx->densify_append_dup_kernel_cpso           = load(@"densify_append_dup_kernel");
-    ctx->densify_cull_classify_kernel_cpso        = load(@"densify_cull_classify_kernel");
-    ctx->compact_scatter_kernel_cpso              = load(@"compact_scatter_kernel");
-    ctx->compact_copy_back_kernel_cpso            = load(@"compact_copy_back_kernel");
+    // MCMC kernels
+    ctx->sgld_noise_gen_kernel_cpso               = load(@"sgld_noise_gen_kernel");
+    ctx->sgld_noise_kernel_cpso                   = load(@"sgld_noise_kernel");
+    ctx->mcmc_regularization_kernel_cpso          = load(@"mcmc_regularization_kernel");
 
     [metal_library release];
 
@@ -524,7 +516,7 @@ static void forward_pipeline(
         (uint32_t)tile_bounds_x, (uint32_t)tile_bounds_y,
         (uint32_t)std::get<2>(tile_bounds), 0xDEAD
     });
-    auto cam_pos_arr = std::make_shared<std::array<float, 3>>(std::array<float, 3>{cam_pos[0], cam_pos[1], cam_pos[2]});
+    auto cam_pos_arr = std::make_shared<std::array<float, 4>>(std::array<float, 4>{cam_pos[0], cam_pos[1], cam_pos[2], 0.0f});
     uint32_t num_points_u32 = (uint32_t)num_points;
     uint32_t capacity_u32 = (uint32_t)capacity;
     uint32_t prefix_N = (uint32_t)num_points;
@@ -782,9 +774,7 @@ std::tuple<MTensor, float> msplat_train_step(
     int num_adam_groups,
     MTensor adam_params[], MTensor adam_exp_avg[], MTensor adam_exp_avg_sq[],
     float adam_step_sizes[], float adam_bc2_sqrts[],
-    float adam_beta1, float adam_beta2, float adam_eps,
-    MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
-    float inv_max_dim
+    float adam_beta1, float adam_beta2, float adam_eps
 ) {
     MetalContext* ctx = get_global_context();
     int tile_bounds_x = std::get<0>(tile_bounds);
@@ -856,7 +846,7 @@ std::tuple<MTensor, float> msplat_train_step(
         (uint32_t)tile_bounds_x, (uint32_t)tile_bounds_y,
         (uint32_t)std::get<2>(tile_bounds), 0xDEAD
     });
-    auto cam_pos_arr = std::make_shared<std::array<float, 3>>(std::array<float, 3>{cam_pos[0], cam_pos[1], cam_pos[2]});
+    auto cam_pos_arr = std::make_shared<std::array<float, 4>>(std::array<float, 4>{cam_pos[0], cam_pos[1], cam_pos[2], 0.0f});
     uint32_t num_points_u32 = (uint32_t)num_points;
     uint32_t capacity_u32 = (uint32_t)capacity;
     uint32_t prefix_N = (uint32_t)num_points;
@@ -1140,19 +1130,7 @@ std::tuple<MTensor, float> msplat_train_step(
 
     // ========================== DISPATCH ==========================
 
-    // Encode accumulate_grad_stats as a lambda (shared by both paths)
-    auto encode_grad_stats = [&](id<MTLComputeCommandEncoder> enc) {
-        NSUInteger tpg = MIN(ctx->accumulate_grad_stats_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
-        [enc setComputePipelineState:ctx->accumulate_grad_stats_kernel_cpso];
-        ENC_SCALAR(enc, num_points, 0);
-        ENC_BUF(enc, radii_out, 1);
-        ENC_BUF(enc, v_xy, 2);
-        ENC_BUF(enc, vis_counts, 3);
-        ENC_BUF(enc, xys_grad_norm, 4);
-        ENC_BUF(enc, max_2d_size, 5);
-        ENC_SCALAR(enc, inv_max_dim, 6);
-        [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
-    };
+    // (MCMC: grad stats accumulation removed — no longer needed for densification)
 
     // Blit-zero helper (shared by both paths)
     auto do_blit_zero = [&](id<MTLCommandBuffer> cb) {
@@ -1248,10 +1226,7 @@ std::tuple<MTensor, float> msplat_train_step(
             encode_proj_sh_bwd_adam(enc);
             [enc endEncoding];
 
-            // Stage 7: grad_stats
-            enc = make_profiled_encoder(6);
-            encode_grad_stats(enc);
-            [enc endEncoding];
+            // (MCMC: grad_stats stage removed)
         });
 
         // Add completion handler to read timestamps after GPU finishes
@@ -1318,9 +1293,6 @@ std::tuple<MTensor, float> msplat_train_step(
             encode_proj_sh_bwd_adam(enc);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-            // --- Accumulate grad stats ---
-            encode_grad_stats(enc);
-
             [enc endEncoding];
         });
     }
@@ -1330,263 +1302,72 @@ std::tuple<MTensor, float> msplat_train_step(
 }
 
 // ============================================================================
-// GPU-native densification (v34 Phase 3)
-// Entire classify → grow → cull → compact pipeline in one compute encoder.
-// Returns new num_active after densification.
+// MCMC: fill noise buffer with N(0,1) samples on GPU via PCG+Box-Muller.
+// `seed` should vary per iteration — typically the training step.
 // ============================================================================
-int msplat_densify(
-    int N, int buf_capacity,
-    float grad_thresh, float size_thresh, float screen_thresh, int check_screen,
-    float cull_alpha_thresh, float cull_scale_thresh, float cull_screen_size, int check_huge,
-    MTensor &xys_grad_norm, MTensor &vis_counts, MTensor &max_2d_size,
-    float half_max_dim,
-    MTensor &means_buf, MTensor &scales_buf, MTensor &quats_buf,
-    MTensor &featuresDc_buf, MTensor &featuresRest_buf, MTensor &opacities_buf,
-    int fr_stride,
-    MTensor adam_exp_avg_buf[], MTensor adam_exp_avg_sq_buf[],
-    MTensor &split_flag, MTensor &dup_flag,
-    MTensor &split_prefix, MTensor &dup_prefix,
-    MTensor &keep_flag, MTensor &keep_prefix,
-    MTensor &block_totals, MTensor &compact_scratch,
-    MTensor &random_samples
-) {
+void msplat_sgld_noise_gen(int N, MTensor &noise, uint32_t seed) {
     MetalContext* ctx = get_global_context();
-
-    // Worst case: each of N gaussians splits (2 children) + dups (1 copy) = 3N
-    int worst_case = 3 * N;
-    assert(worst_case <= buf_capacity && "gpu_densify: 3*N exceeds buf_capacity");
-
-    float log_size_fac = std::log(1.6f);
-
-    // Strides for each of the 18 buffers (6 params + 12 optimizer states)
-    // Order: means(3), scales(3), quats(4), featuresDc(3), featuresRest(fr_stride), opacities(1)
-    int strides[6] = {3, 3, 4, 3, fr_stride, 1};
-    int max_stride = fr_stride;  // featuresRest has the largest stride
-
-    // Collect all 18 buffers in order for compact loops (std::array for block capture)
-    std::array<MTensor*, 18> all_bufs = {{
-        &means_buf, &scales_buf, &quats_buf, &featuresDc_buf, &featuresRest_buf, &opacities_buf,
-        &adam_exp_avg_buf[0], &adam_exp_avg_buf[1], &adam_exp_avg_buf[2],
-        &adam_exp_avg_buf[3], &adam_exp_avg_buf[4], &adam_exp_avg_buf[5],
-        &adam_exp_avg_sq_buf[0], &adam_exp_avg_sq_buf[1], &adam_exp_avg_sq_buf[2],
-        &adam_exp_avg_sq_buf[3], &adam_exp_avg_sq_buf[4], &adam_exp_avg_sq_buf[5]
-    }};
-    std::array<int, 18> all_strides = {{
-        3, 3, 4, 3, fr_stride, 1,
-        3, 3, 4, 3, fr_stride, 1,
-        3, 3, 4, 3, fr_stride, 1
-    }};
-
-    uint32_t N_u32 = (uint32_t)N;
-    uint32_t K = (uint32_t)((N + 1023) / 1024);  // threadgroups for prefix sum on N elements
-    int check_screen_int = check_screen;
-    int check_huge_int = check_huge;
-
-    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
-    assert(command_buffer && "Failed to retrieve command buffer reference");
-
     dispatch_sync(ctx->d_queue, ^(){
-        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
-        assert(enc && "Failed to create compute command encoder");
-
-        // ---- Stage 1: Classify (split/dup) ----
-        {
-            NSUInteger tpg = MIN(ctx->densify_classify_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)N);
-            [enc setComputePipelineState:ctx->densify_classify_kernel_cpso];
-            ENC_SCALAR(enc, N_u32, 0);
-            ENC_BUF(enc, xys_grad_norm, 1);
-            ENC_BUF(enc, vis_counts, 2);
-            ENC_BUF(enc, scales_buf, 3);
-            ENC_BUF(enc, max_2d_size, 4);
-            ENC_SCALAR(enc, half_max_dim, 5);
-            ENC_SCALAR(enc, grad_thresh, 6);
-            ENC_SCALAR(enc, size_thresh, 7);
-            ENC_SCALAR(enc, screen_thresh, 8);
-            ENC_SCALAR(enc, check_screen_int, 9);
-            ENC_BUF(enc, split_flag, 10);
-            ENC_BUF(enc, dup_flag, 11);
-            [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-        // ---- Stage 2: Prefix sum on split_flag → split_prefix ----
-        {
-            [enc setComputePipelineState:ctx->block_reduce_kernel_cpso];
-            ENC_SCALAR(enc, N_u32, 0); ENC_BUF(enc, split_flag, 1);
-            ENC_BUF(enc, block_totals, 2);
-            [enc dispatchThreadgroups:MTLSizeMake(K, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        {
-            [enc setComputePipelineState:ctx->block_scan_propagate_kernel_cpso];
-            ENC_SCALAR(enc, N_u32, 0); ENC_BUF(enc, split_flag, 1);
-            ENC_BUF(enc, split_prefix, 2); ENC_BUF(enc, block_totals, 3);
-            [enc dispatchThreadgroups:MTLSizeMake(K, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-        // ---- Stage 3: Prefix sum on dup_flag → dup_prefix ----
-        {
-            [enc setComputePipelineState:ctx->block_reduce_kernel_cpso];
-            ENC_SCALAR(enc, N_u32, 0); ENC_BUF(enc, dup_flag, 1);
-            ENC_BUF(enc, block_totals, 2);
-            [enc dispatchThreadgroups:MTLSizeMake(K, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        {
-            [enc setComputePipelineState:ctx->block_scan_propagate_kernel_cpso];
-            ENC_SCALAR(enc, N_u32, 0); ENC_BUF(enc, dup_flag, 1);
-            ENC_BUF(enc, dup_prefix, 2); ENC_BUF(enc, block_totals, 3);
-            [enc dispatchThreadgroups:MTLSizeMake(K, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-        // ---- Stage 4: Append split children ----
-        {
-            NSUInteger tpg = MIN(ctx->densify_append_split_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)N);
-            [enc setComputePipelineState:ctx->densify_append_split_kernel_cpso];
-            ENC_SCALAR(enc, N_u32, 0);
-            ENC_BUF(enc, split_flag, 1);
-            ENC_BUF(enc, split_prefix, 2);
-            ENC_BUF(enc, random_samples, 3);
-            ENC_SCALAR(enc, log_size_fac, 4);
-            ENC_BUF(enc, means_buf, 5);
-            ENC_BUF(enc, scales_buf, 6);
-            ENC_BUF(enc, quats_buf, 7);
-            ENC_BUF(enc, featuresDc_buf, 8);
-            ENC_BUF(enc, featuresRest_buf, 9);
-            ENC_BUF(enc, opacities_buf, 10);
-            int fr_stride_val = fr_stride;
-            ENC_SCALAR(enc, fr_stride_val, 11);
-            ENC_BUF(enc, adam_exp_avg_buf[0], 12);
-            ENC_BUF(enc, adam_exp_avg_buf[1], 13);
-            ENC_BUF(enc, adam_exp_avg_buf[2], 14);
-            ENC_BUF(enc, adam_exp_avg_buf[3], 15);
-            ENC_BUF(enc, adam_exp_avg_buf[4], 16);
-            ENC_BUF(enc, adam_exp_avg_buf[5], 17);
-            ENC_BUF(enc, adam_exp_avg_sq_buf[0], 18);
-            ENC_BUF(enc, adam_exp_avg_sq_buf[1], 19);
-            ENC_BUF(enc, adam_exp_avg_sq_buf[2], 20);
-            ENC_BUF(enc, adam_exp_avg_sq_buf[3], 21);
-            ENC_BUF(enc, adam_exp_avg_sq_buf[4], 22);
-            ENC_BUF(enc, adam_exp_avg_sq_buf[5], 23);
-            [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-        // ---- Stage 5: Append duplicates ----
-        {
-            NSUInteger tpg = MIN(ctx->densify_append_dup_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)N);
-            [enc setComputePipelineState:ctx->densify_append_dup_kernel_cpso];
-            ENC_SCALAR(enc, N_u32, 0);
-            ENC_BUF(enc, dup_flag, 1);
-            ENC_BUF(enc, dup_prefix, 2);
-            ENC_BUF(enc, split_prefix, 3);
-            ENC_BUF(enc, means_buf, 4);
-            ENC_BUF(enc, scales_buf, 5);
-            ENC_BUF(enc, quats_buf, 6);
-            ENC_BUF(enc, featuresDc_buf, 7);
-            ENC_BUF(enc, featuresRest_buf, 8);
-            ENC_BUF(enc, opacities_buf, 9);
-            int fr_stride_val = fr_stride;
-            ENC_SCALAR(enc, fr_stride_val, 10);
-            ENC_BUF(enc, adam_exp_avg_buf[0], 11);
-            ENC_BUF(enc, adam_exp_avg_buf[1], 12);
-            ENC_BUF(enc, adam_exp_avg_buf[2], 13);
-            ENC_BUF(enc, adam_exp_avg_buf[3], 14);
-            ENC_BUF(enc, adam_exp_avg_buf[4], 15);
-            ENC_BUF(enc, adam_exp_avg_buf[5], 16);
-            ENC_BUF(enc, adam_exp_avg_sq_buf[0], 17);
-            ENC_BUF(enc, adam_exp_avg_sq_buf[1], 18);
-            ENC_BUF(enc, adam_exp_avg_sq_buf[2], 19);
-            ENC_BUF(enc, adam_exp_avg_sq_buf[3], 20);
-            ENC_BUF(enc, adam_exp_avg_sq_buf[4], 21);
-            ENC_BUF(enc, adam_exp_avg_sq_buf[5], 22);
-            [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-        // ---- Stage 6: Cull classify (on post-growth population) ----
-        // Dispatch worst_case threads; kernel reads N_new from prefix sums
-        {
-            uint32_t wc = (uint32_t)worst_case;
-            NSUInteger tpg = MIN(ctx->densify_cull_classify_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)worst_case);
-            [enc setComputePipelineState:ctx->densify_cull_classify_kernel_cpso];
-            ENC_SCALAR(enc, N_u32, 0);
-            ENC_BUF(enc, split_prefix, 1);
-            ENC_BUF(enc, dup_prefix, 2);
-            ENC_BUF(enc, split_flag, 3);
-            ENC_BUF(enc, opacities_buf, 4);
-            ENC_BUF(enc, scales_buf, 5);
-            ENC_BUF(enc, max_2d_size, 6);
-            ENC_SCALAR(enc, cull_alpha_thresh, 7);
-            ENC_SCALAR(enc, cull_scale_thresh, 8);
-            ENC_SCALAR(enc, cull_screen_size, 9);
-            ENC_SCALAR(enc, check_huge_int, 10);
-            ENC_SCALAR(enc, check_screen_int, 11);
-            ENC_BUF(enc, keep_flag, 12);
-            [enc dispatchThreads:MTLSizeMake(worst_case, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-        // ---- Stage 7: Prefix sum on keep_flag → keep_prefix ----
-        // Over worst_case elements (includes padding zeros for unused slots)
-        {
-            uint32_t wc = (uint32_t)worst_case;
-            uint32_t K2 = (uint32_t)((worst_case + 1023) / 1024);
-            [enc setComputePipelineState:ctx->block_reduce_kernel_cpso];
-            ENC_SCALAR(enc, wc, 0); ENC_BUF(enc, keep_flag, 1);
-            ENC_BUF(enc, block_totals, 2);
-            [enc dispatchThreadgroups:MTLSizeMake(K2, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        {
-            uint32_t wc = (uint32_t)worst_case;
-            uint32_t K2 = (uint32_t)((worst_case + 1023) / 1024);
-            [enc setComputePipelineState:ctx->block_scan_propagate_kernel_cpso];
-            ENC_SCALAR(enc, wc, 0); ENC_BUF(enc, keep_flag, 1);
-            ENC_BUF(enc, keep_prefix, 2); ENC_BUF(enc, block_totals, 3);
-            [enc dispatchThreadgroups:MTLSizeMake(K2, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-        // ---- Stage 8: Compact scatter (18 buffers → scratch) ----
-        // For each buffer: scatter kept elements into compact_scratch
-        // Then copy back. We reuse compact_scratch at different offsets per stride.
-        for (int b = 0; b < 18; b++) {
-            uint32_t wc = (uint32_t)worst_case;
-            uint32_t stride_u32 = (uint32_t)all_strides[b];
-            uint32_t total_threads = wc * stride_u32;
-            NSUInteger tpg = MIN(ctx->compact_scatter_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)total_threads);
-            [enc setComputePipelineState:ctx->compact_scatter_kernel_cpso];
-            [enc setBuffer:all_bufs[b]->buffer() offset:0 atIndex:0];
-            ENC_BUF(enc, compact_scratch, 1);
-            ENC_BUF(enc, keep_prefix, 2);
-            ENC_BUF(enc, keep_flag, 3);
-            ENC_SCALAR(enc, wc, 4);
-            ENC_SCALAR(enc, stride_u32, 5);
-            [enc dispatchThreads:MTLSizeMake(total_threads, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
-
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-            // Copy back from scratch to buffer
-            uint32_t last_idx = wc - 1;
-            [enc setComputePipelineState:ctx->compact_copy_back_kernel_cpso];
-            ENC_BUF(enc, compact_scratch, 0);
-            [enc setBuffer:all_bufs[b]->buffer() offset:0 atIndex:1];
-            ENC_BUF(enc, keep_prefix, 2);
-            ENC_SCALAR(enc, last_idx, 3);
-            ENC_SCALAR(enc, stride_u32, 4);
-            [enc dispatchThreads:MTLSizeMake(total_threads, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
-
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        }
-
+        id<MTLCommandBuffer> cb = ctx->getCommandBuffer();
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        NSUInteger tpg = MIN(ctx->sgld_noise_gen_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)N);
+        [enc setComputePipelineState:ctx->sgld_noise_gen_kernel_cpso];
+        ENC_BUF(enc, noise, 0);
+        ENC_SCALAR(enc, N, 1);
+        ENC_SCALAR(enc, seed, 2);
+        [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         [enc endEncoding];
     });
-
-    // Single GPU→CPU sync: read new_count from keep_prefix[worst_case - 1]
-    ctx->syncCB();
-    int new_count = keep_prefix.data<int32_t>()[worst_case - 1];
-    return new_count;
 }
+
+// ============================================================================
+// MCMC: SGLD noise injection
+// ============================================================================
+void msplat_sgld_noise(
+    int N, MTensor &means, MTensor &scales, MTensor &quats,
+    MTensor &opacities, MTensor &noise,
+    float noise_lr, float xyz_lr
+) {
+    MetalContext* ctx = get_global_context();
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLCommandBuffer> cb = ctx->getCommandBuffer();
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        NSUInteger tpg = MIN(ctx->sgld_noise_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)N);
+        [enc setComputePipelineState:ctx->sgld_noise_kernel_cpso];
+        ENC_BUF(enc, means, 0);
+        ENC_BUF(enc, scales, 1);
+        ENC_BUF(enc, quats, 2);
+        ENC_BUF(enc, opacities, 3);
+        ENC_BUF(enc, noise, 4);
+        ENC_SCALAR(enc, N, 5);
+        ENC_SCALAR(enc, noise_lr, 6);
+        ENC_SCALAR(enc, xyz_lr, 7);
+        [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc endEncoding];
+    });
+}
+
+// ============================================================================
+// MCMC: Opacity + scale regularization (post-Adam nudge)
+// ============================================================================
+void msplat_mcmc_regularization(
+    int N, MTensor &opacities, MTensor &scales,
+    float lr, float opacity_reg, float scale_reg
+) {
+    MetalContext* ctx = get_global_context();
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLCommandBuffer> cb = ctx->getCommandBuffer();
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        NSUInteger tpg = MIN(ctx->mcmc_regularization_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)N);
+        [enc setComputePipelineState:ctx->mcmc_regularization_kernel_cpso];
+        ENC_BUF(enc, opacities, 0);
+        ENC_BUF(enc, scales, 1);
+        ENC_SCALAR(enc, N, 2);
+        ENC_SCALAR(enc, lr, 3);
+        ENC_SCALAR(enc, opacity_reg, 4);
+        ENC_SCALAR(enc, scale_reg, 5);
+        [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc endEncoding];
+    });
+}
+

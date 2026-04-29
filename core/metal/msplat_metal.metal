@@ -1638,30 +1638,6 @@ kernel void compute_cov2d_bounds_kernel(
 
 // Fused Adam optimizer kernel: single-pass update for params, exp_avg, exp_avg_sq.
 // Precomputed on CPU: step_size = lr / (1 - beta1^t), bc2_sqrt = sqrt(1 - beta2^t)
-// Fused per-step gradient accumulation for densification.
-// Replaces ~8 MPS dispatches (boolean mask, vector_norm, index_put_, max) with 1 kernel.
-kernel void accumulate_grad_stats_kernel(
-    constant int& num_points,
-    constant int* radii [[buffer(1)]],
-    constant float* xys_grad [[buffer(2)]],     // (N, 2) packed float2
-    device float* vis_counts [[buffer(3)]],      // (N,) in-place
-    device float* xys_grad_norm [[buffer(4)]],   // (N,) in-place
-    device float* max_2d_size [[buffer(5)]],     // (N,) in-place
-    constant float& inv_max_dim [[buffer(6)]],   // 1.0 / max(H, W)
-    uint idx [[thread_position_in_grid]]
-) {
-    if (idx >= (uint)num_points) return;
-    if (radii[idx] <= 0) return;
-
-    vis_counts[idx] += 1.0f;
-
-    float gx = xys_grad[idx * 2];
-    float gy = xys_grad[idx * 2 + 1];
-    xys_grad_norm[idx] += sqrt(gx * gx + gy * gy);
-
-    float r = (float)radii[idx] * inv_max_dim;
-    max_2d_size[idx] = max(max_2d_size[idx], r);
-}
 
 kernel void fused_adam_kernel(
     device float * params [[buffer(0)]],
@@ -3464,278 +3440,123 @@ kernel void ssim_v_bwd_kernel(
 }
 
 // ============================================================
-// GPU Densification Kernels (Phase 3)
+// MCMC Kernels: SGLD Noise Injection + Regularization
 // ============================================================
 
-#define DENSIFY_NOTHING 0
-#define DENSIFY_SPLIT   1
-#define DENSIFY_DUP     2
-
-// Classify each gaussian as split, dup, or nothing based on gradient and scale thresholds.
-kernel void densify_classify_kernel(
-    constant int& N,
-    constant float* xys_grad_norm    [[buffer(1)]],
-    constant float* vis_counts       [[buffer(2)]],
-    constant float* scales           [[buffer(3)]],  // [N,3] log-space
-    constant float* max_2d_size      [[buffer(4)]],
-    constant float& half_max_dim     [[buffer(5)]],  // 0.5 * max(W,H)
-    constant float& grad_thresh      [[buffer(6)]],
-    constant float& size_thresh      [[buffer(7)]],
-    constant float& screen_thresh    [[buffer(8)]],
-    constant int& check_screen       [[buffer(9)]],
-    device int* split_flag           [[buffer(10)]],
-    device int* dup_flag             [[buffer(11)]],
+// SGLD noise injection: perturb Gaussian positions by covariance-weighted noise.
+// Implements: xyz += Σ @ (noise_lr * xyz_lr * op_weight * randn)
+// where Σ = R @ diag(exp(s)²) @ R^T is the 3D covariance.
+// Fill `noise` with N*3 standard-normal samples via Box-Muller over a PCG-hashed
+// counter. Seed varies per iteration so successive calls give independent samples.
+// Replaces the CPU std::mt19937 loop that previously cost ~10–50 ms/iter at 1M splats.
+static inline uint pcg_hash32(uint seed, uint idx) {
+    uint x = seed * 747796405u + idx * 2891336453u;
+    x = ((x >> ((x >> 28) + 4)) ^ x) * 277803737u;
+    return (x >> 22) ^ x;
+}
+static inline float pcg_unit(uint h) {
+    // Map to (0, 1): +0.5 keeps us off the log(0) edge for Box-Muller.
+    return (float(h >> 9) + 0.5f) * (1.0f / float(1u << 23));
+}
+kernel void sgld_noise_gen_kernel(
+    device float* noise   [[buffer(0)]],
+    constant int& N       [[buffer(1)]],
+    constant uint& seed   [[buffer(2)]],
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= (uint)N) return;
-    float vc = vis_counts[idx];
-    if (vc <= 0.0f) { split_flag[idx] = 0; dup_flag[idx] = 0; return; }
-
-    float avg_grad = (xys_grad_norm[idx] / vc) * half_max_dim;
-    bool high_grad = avg_grad > grad_thresh;
-
-    float s0 = scales[idx*3], s1 = scales[idx*3+1], s2 = scales[idx*3+2];
-    float max_scale = max(max(exp(s0), exp(s1)), exp(s2));
-    bool is_large = max_scale > size_thresh;
-
-    bool do_split = is_large;
-    if (check_screen && max_2d_size[idx] > screen_thresh) do_split = true;
-    do_split = do_split && high_grad;
-
-    bool do_dup = !is_large && high_grad;
-
-    split_flag[idx] = do_split ? 1 : 0;
-    dup_flag[idx]   = do_dup   ? 1 : 0;
+    uint base = idx * 4u;
+    float u0 = pcg_unit(pcg_hash32(seed, base + 0u));
+    float u1 = pcg_unit(pcg_hash32(seed, base + 1u));
+    float u2 = pcg_unit(pcg_hash32(seed, base + 2u));
+    float u3 = pcg_unit(pcg_hash32(seed, base + 3u));
+    float r01 = sqrt(-2.0f * log(u0));
+    float r23 = sqrt(-2.0f * log(u2));
+    float ang01 = 6.283185307179586f * u1;
+    float ang23 = 6.283185307179586f * u3;
+    noise[idx*3 + 0] = r01 * cos(ang01);
+    noise[idx*3 + 1] = r01 * sin(ang01);
+    noise[idx*3 + 2] = r23 * cos(ang23);
 }
 
-// Append split children into backing buffers. One thread per original gaussian.
-// Each split gaussian produces 2 children at [N + 2*(ord)], [N + 2*(ord)+1].
-// Also shrinks parent scale by 1/1.6 and zeros optimizer state for children.
-kernel void densify_append_split_kernel(
-    constant int& N,
-    constant int* split_flag         [[buffer(1)]],
-    constant int* split_prefix       [[buffer(2)]],  // inclusive prefix sum
-    constant float* random_samples   [[buffer(3)]],  // [2*N, 3] randn
-    constant float& log_size_fac     [[buffer(4)]],  // log(1.6)
-    device float* means_buf          [[buffer(5)]],
-    device float* scales_buf         [[buffer(6)]],
-    device float* quats_buf          [[buffer(7)]],
-    device float* featuresDc_buf     [[buffer(8)]],
-    device float* featuresRest_buf   [[buffer(9)]],
-    device float* opacities_buf      [[buffer(10)]],
-    constant int& fr_stride          [[buffer(11)]],  // featuresRest stride (e.g. 45)
-    device float* adam_ea0           [[buffer(12)]],  // adam_exp_avg_buf[0..5]
-    device float* adam_ea1           [[buffer(13)]],
-    device float* adam_ea2           [[buffer(14)]],
-    device float* adam_ea3           [[buffer(15)]],
-    device float* adam_ea4           [[buffer(16)]],
-    device float* adam_ea5           [[buffer(17)]],
-    device float* adam_es0           [[buffer(18)]],  // adam_exp_avg_sq_buf[0..5]
-    device float* adam_es1           [[buffer(19)]],
-    device float* adam_es2           [[buffer(20)]],
-    device float* adam_es3           [[buffer(21)]],
-    device float* adam_es4           [[buffer(22)]],
-    device float* adam_es5           [[buffer(23)]],
+kernel void sgld_noise_kernel(
+    device float* means       [[buffer(0)]],   // [N, 3] positions to perturb
+    constant float* scales    [[buffer(1)]],   // [N, 3] log-scale
+    constant float* quats     [[buffer(2)]],   // [N, 4] quaternions
+    constant float* opacities [[buffer(3)]],   // [N, 1] logit-opacity
+    constant float* noise     [[buffer(4)]],   // [N, 3] randn samples (CPU-generated)
+    constant int& N           [[buffer(5)]],
+    constant float& noise_lr  [[buffer(6)]],
+    constant float& xyz_lr    [[buffer(7)]],   // current position learning rate
     uint idx [[thread_position_in_grid]]
 ) {
-    if (idx >= (uint)N || split_flag[idx] == 0) return;
+    if (idx >= (uint)N) return;
 
-    int ord = split_prefix[idx] - 1;  // 0-based ordinal among splits
-    int c0 = N + 2 * ord;             // child 0 position
-    int c1 = c0 + 1;                  // child 1 position
+    // 1. Opacity weight: apply noise to low/mid-opacity (exploring) Gaussians;
+    // suppress noise for high-opacity (settled surface) Gaussians.
+    // Transition at op_sig=0.5 — previously had the sigmoid inverted
+    // (was applying max noise to fully-opaque Gaussians, destroying surfaces).
+    float op_sig = 1.0f / (1.0f + exp(-opacities[idx]));
+    float weight = 1.0f / (1.0f + exp(100.0f * (op_sig - 0.5f)));
 
-    // Read parent quaternion and normalize
-    float qw = quats_buf[idx*4], qx = quats_buf[idx*4+1];
-    float qy = quats_buf[idx*4+2], qz = quats_buf[idx*4+3];
+    // 2. Scale noise
+    float noise_scale = noise_lr * xyz_lr * weight;
+    float n0 = noise[idx*3]   * noise_scale;
+    float n1 = noise[idx*3+1] * noise_scale;
+    float n2 = noise[idx*3+2] * noise_scale;
+
+    // 3. Build rotation matrix from quaternion (normalize first)
+    float qw = quats[idx*4], qx = quats[idx*4+1], qy = quats[idx*4+2], qz = quats[idx*4+3];
     float qlen = sqrt(qw*qw + qx*qx + qy*qy + qz*qz);
     qw /= qlen; qx /= qlen; qy /= qlen; qz /= qlen;
 
-    // Parent scale (exp)
-    float sx = exp(scales_buf[idx*3]), sy = exp(scales_buf[idx*3+1]), sz = exp(scales_buf[idx*3+2]);
+    float sx = exp(scales[idx*3]), sy = exp(scales[idx*3+1]), sz = exp(scales[idx*3+2]);
 
-    // For each of 2 children
-    for (int k = 0; k < 2; k++) {
-        int child = (k == 0) ? c0 : c1;
-        int rand_idx = ord * 2 + k;
+    // Σ @ noise = R @ diag(s²) @ R^T @ noise
+    // Step A: R^T @ noise
+    float rt0 = (1-2*(qy*qy+qz*qz))*n0 + 2*(qx*qy+qw*qz)*n1 + 2*(qx*qz-qw*qy)*n2;
+    float rt1 = 2*(qx*qy-qw*qz)*n0 + (1-2*(qx*qx+qz*qz))*n1 + 2*(qy*qz+qw*qx)*n2;
+    float rt2 = 2*(qx*qz+qw*qy)*n0 + 2*(qy*qz-qw*qx)*n1 + (1-2*(qx*qx+qy*qy))*n2;
 
-        // Scale random sample by parent scale
-        float r0 = random_samples[rand_idx*3]   * sx;
-        float r1 = random_samples[rand_idx*3+1] * sy;
-        float r2 = random_samples[rand_idx*3+2] * sz;
+    // Step B: diag(s²) @ result
+    rt0 *= sx * sx;
+    rt1 *= sy * sy;
+    rt2 *= sz * sz;
 
-        // Rotate by parent quaternion: v' = R @ v
-        float v0 = (1-2*(qy*qy+qz*qz))*r0 + 2*(qx*qy-qw*qz)*r1 + 2*(qx*qz+qw*qy)*r2;
-        float v1 = 2*(qx*qy+qw*qz)*r0 + (1-2*(qx*qx+qz*qz))*r1 + 2*(qy*qz-qw*qx)*r2;
-        float v2 = 2*(qx*qz-qw*qy)*r0 + 2*(qy*qz+qw*qx)*r1 + (1-2*(qx*qx+qy*qy))*r2;
+    // Step C: R @ result
+    float v0 = (1-2*(qy*qy+qz*qz))*rt0 + 2*(qx*qy-qw*qz)*rt1 + 2*(qx*qz+qw*qy)*rt2;
+    float v1 = 2*(qx*qy+qw*qz)*rt0 + (1-2*(qx*qx+qz*qz))*rt1 + 2*(qy*qz-qw*qx)*rt2;
+    float v2 = 2*(qx*qz-qw*qy)*rt0 + 2*(qy*qz+qw*qx)*rt1 + (1-2*(qx*qx+qy*qy))*rt2;
 
-        // Child position = parent + rotated offset
-        means_buf[child*3]   = means_buf[idx*3]   + v0;
-        means_buf[child*3+1] = means_buf[idx*3+1] + v1;
-        means_buf[child*3+2] = means_buf[idx*3+2] + v2;
+    // 4. Add to position
+    means[idx*3]   += v0;
+    means[idx*3+1] += v1;
+    means[idx*3+2] += v2;
+}
 
-        // Child scale = shrunk parent scale
-        scales_buf[child*3]   = scales_buf[idx*3]   - log_size_fac;
-        scales_buf[child*3+1] = scales_buf[idx*3+1] - log_size_fac;
-        scales_buf[child*3+2] = scales_buf[idx*3+2] - log_size_fac;
+// MCMC regularization: post-Adam nudge for opacity and scale.
+// Equivalent to one SGD step on: loss_reg = opacity_reg * |sigmoid(op)| + scale_reg * |exp(s)|
+// Gradients: d/d_logit(sigmoid(x)) = sigmoid(x)*(1-sigmoid(x)),  d/d_log_s(exp(s)) = exp(s)
+kernel void mcmc_regularization_kernel(
+    device float* opacities   [[buffer(0)]],   // [N, 1] logit-opacity
+    device float* scales      [[buffer(1)]],   // [N, 3] log-scale
+    constant int& N           [[buffer(2)]],
+    constant float& lr        [[buffer(3)]],   // learning rate (mean of position LR)
+    constant float& op_reg    [[buffer(4)]],   // opacity regularization weight
+    constant float& sc_reg    [[buffer(5)]],   // scale regularization weight
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= (uint)N) return;
 
-        // Copy parent quaternion, featuresDc, opacities
-        for (int j = 0; j < 4; j++) quats_buf[child*4+j] = quats_buf[idx*4+j];
-        for (int j = 0; j < 3; j++) featuresDc_buf[child*3+j] = featuresDc_buf[idx*3+j];
-        for (int j = 0; j < fr_stride; j++) featuresRest_buf[child*fr_stride+j] = featuresRest_buf[idx*fr_stride+j];
-        opacities_buf[child] = opacities_buf[idx];
+    // Opacity regularization: nudge toward lower opacity
+    float op = opacities[idx];
+    float sig = 1.0f / (1.0f + exp(-op));
+    opacities[idx] -= lr * op_reg * sig * (1.0f - sig);
 
-        // Zero optimizer state for children (strides: 3,3,4,3,fr_stride,1)
-        for (int j = 0; j < 3; j++) { adam_ea0[child*3+j] = 0; adam_es0[child*3+j] = 0; }
-        for (int j = 0; j < 3; j++) { adam_ea1[child*3+j] = 0; adam_es1[child*3+j] = 0; }
-        for (int j = 0; j < 4; j++) { adam_ea2[child*4+j] = 0; adam_es2[child*4+j] = 0; }
-        for (int j = 0; j < 3; j++) { adam_ea3[child*3+j] = 0; adam_es3[child*3+j] = 0; }
-        for (int j = 0; j < fr_stride; j++) { adam_ea4[child*fr_stride+j] = 0; adam_es4[child*fr_stride+j] = 0; }
-        adam_ea5[child] = 0; adam_es5[child] = 0;
+    // Scale regularization: nudge toward smaller scale
+    for (int i = 0; i < 3; i++) {
+        float s = scales[idx*3 + i];
+        scales[idx*3 + i] -= lr * sc_reg * exp(s);
     }
-
-    // Shrink parent scale in-place
-    scales_buf[idx*3]   -= log_size_fac;
-    scales_buf[idx*3+1] -= log_size_fac;
-    scales_buf[idx*3+2] -= log_size_fac;
 }
 
-// Append duplicate copies into backing buffers. One thread per original gaussian.
-// Each dup produces 1 copy at [N + 2*nSplits + dup_ord].
-kernel void densify_append_dup_kernel(
-    constant int& N,
-    constant int* dup_flag           [[buffer(1)]],
-    constant int* dup_prefix         [[buffer(2)]],  // inclusive prefix sum
-    constant int* split_prefix       [[buffer(3)]],  // to read nSplits = split_prefix[N-1]
-    device float* means_buf          [[buffer(4)]],
-    device float* scales_buf         [[buffer(5)]],
-    device float* quats_buf          [[buffer(6)]],
-    device float* featuresDc_buf     [[buffer(7)]],
-    device float* featuresRest_buf   [[buffer(8)]],
-    device float* opacities_buf      [[buffer(9)]],
-    constant int& fr_stride          [[buffer(10)]],
-    device float* adam_ea0           [[buffer(11)]],
-    device float* adam_ea1           [[buffer(12)]],
-    device float* adam_ea2           [[buffer(13)]],
-    device float* adam_ea3           [[buffer(14)]],
-    device float* adam_ea4           [[buffer(15)]],
-    device float* adam_ea5           [[buffer(16)]],
-    device float* adam_es0           [[buffer(17)]],
-    device float* adam_es1           [[buffer(18)]],
-    device float* adam_es2           [[buffer(19)]],
-    device float* adam_es3           [[buffer(20)]],
-    device float* adam_es4           [[buffer(21)]],
-    device float* adam_es5           [[buffer(22)]],
-    uint idx [[thread_position_in_grid]]
-) {
-    if (idx >= (uint)N || dup_flag[idx] == 0) return;
-
-    int nSplits = (N > 0) ? split_prefix[N - 1] : 0;
-    int ord = dup_prefix[idx] - 1;
-    int dst = N + 2 * nSplits + ord;
-
-    // Copy all parent data
-    for (int j = 0; j < 3; j++) means_buf[dst*3+j] = means_buf[idx*3+j];
-    for (int j = 0; j < 3; j++) scales_buf[dst*3+j] = scales_buf[idx*3+j];
-    for (int j = 0; j < 4; j++) quats_buf[dst*4+j] = quats_buf[idx*4+j];
-    for (int j = 0; j < 3; j++) featuresDc_buf[dst*3+j] = featuresDc_buf[idx*3+j];
-    for (int j = 0; j < fr_stride; j++) featuresRest_buf[dst*fr_stride+j] = featuresRest_buf[idx*fr_stride+j];
-    opacities_buf[dst] = opacities_buf[idx];
-
-    // Zero optimizer state
-    for (int j = 0; j < 3; j++) { adam_ea0[dst*3+j] = 0; adam_es0[dst*3+j] = 0; }
-    for (int j = 0; j < 3; j++) { adam_ea1[dst*3+j] = 0; adam_es1[dst*3+j] = 0; }
-    for (int j = 0; j < 4; j++) { adam_ea2[dst*4+j] = 0; adam_es2[dst*4+j] = 0; }
-    for (int j = 0; j < 3; j++) { adam_ea3[dst*3+j] = 0; adam_es3[dst*3+j] = 0; }
-    for (int j = 0; j < fr_stride; j++) { adam_ea4[dst*fr_stride+j] = 0; adam_es4[dst*fr_stride+j] = 0; }
-    adam_ea5[dst] = 0; adam_es5[dst] = 0;
-}
-
-// Classify each post-growth gaussian as keep or cull.
-// N_old = pre-growth count. N_new = N_old + 2*nSplits + nDups (computed from prefix sums).
-// Dispatch with grid_size = worst_case (e.g. 3*N_old).
-kernel void densify_cull_classify_kernel(
-    constant int& N_old,
-    constant int* split_prefix       [[buffer(1)]],  // [N_old] inclusive
-    constant int* dup_prefix         [[buffer(2)]],  // [N_old] inclusive
-    constant int* split_flag         [[buffer(3)]],  // [N_old] — marks split parents
-    constant float* opacities_buf    [[buffer(4)]],
-    constant float* scales_buf       [[buffer(5)]],
-    constant float* max_2d_size      [[buffer(6)]],  // [N_old] only valid for idx < N_old
-    constant float& cull_alpha_thresh [[buffer(7)]],  // 0.1
-    constant float& cull_scale_thresh [[buffer(8)]],  // 0.5
-    constant float& cull_screen_size  [[buffer(9)]],  // 0.15
-    constant int& check_huge         [[buffer(10)]],
-    constant int& check_screen       [[buffer(11)]],
-    device int* keep_flag            [[buffer(12)]],
-    uint idx [[thread_position_in_grid]]
-) {
-    int nSplits = (N_old > 0) ? split_prefix[N_old - 1] : 0;
-    int nDups   = (N_old > 0) ? dup_prefix[N_old - 1] : 0;
-    int N_new = N_old + 2 * nSplits + nDups;
-
-    if (idx >= (uint)N_new) { keep_flag[idx] = 0; return; }
-
-    // Sigmoid of opacity
-    float opacity_sigmoid = 1.0f / (1.0f + exp(-opacities_buf[idx]));
-    bool cull = opacity_sigmoid < cull_alpha_thresh;
-
-    // Split parents are always culled
-    if (idx < (uint)N_old && split_flag[idx] != 0) cull = true;
-
-    // Huge gaussians
-    if (check_huge) {
-        float s0 = scales_buf[idx*3], s1 = scales_buf[idx*3+1], s2 = scales_buf[idx*3+2];
-        float max_s = max(max(exp(s0), exp(s1)), exp(s2));
-        if (max_s > cull_scale_thresh) cull = true;
-        if (check_screen && idx < (uint)N_old && max_2d_size[idx] > cull_screen_size) cull = true;
-    }
-
-    keep_flag[idx] = cull ? 0 : 1;
-}
-
-// Scatter kept elements from src to dst at compacted positions.
-// One thread per float (elem * stride + sub).
-kernel void compact_scatter_kernel(
-    constant float* src              [[buffer(0)]],
-    device float* dst                [[buffer(1)]],
-    constant int* keep_prefix        [[buffer(2)]],
-    constant int* keep_flag          [[buffer(3)]],
-    constant uint& N                 [[buffer(4)]],
-    constant uint& stride            [[buffer(5)]],
-    uint tid [[thread_position_in_grid]]
-) {
-    uint elem = tid / stride;
-    uint sub  = tid % stride;
-    if (elem >= N || keep_flag[elem] == 0) return;
-    int dst_elem = keep_prefix[elem] - 1;
-    dst[dst_elem * stride + sub] = src[elem * stride + sub];
-}
-
-// Copy compacted data from scratch back to original buffer.
-// Reads new_count from keep_prefix to determine bounds.
-kernel void compact_copy_back_kernel(
-    constant float* src              [[buffer(0)]],
-    device float* dst                [[buffer(1)]],
-    constant int* keep_prefix        [[buffer(2)]],
-    constant uint& last_prefix_idx   [[buffer(3)]],  // N_new - 1 (or worst_case - 1)
-    constant uint& stride            [[buffer(4)]],
-    uint tid [[thread_position_in_grid]]
-) {
-    int new_count = keep_prefix[last_prefix_idx];
-    uint elem = tid / stride;
-    uint sub  = tid % stride;
-    if (elem >= (uint)new_count) return;
-    dst[elem * stride + sub] = src[elem * stride + sub];
-}
-
-// ============================================================================
-// Zero buffer kernel — replaces PyTorch .zero_() MPS dispatches.
-// Writes 0 as uint32, which is the zero bit-pattern for float32, int32, etc.
-// ============================================================================
-kernel void zero_buffer_kernel(
-    device uint* buf           [[buffer(0)]],
-    constant uint& count       [[buffer(1)]],
-    uint idx [[thread_position_in_grid]]
-) {
-    if (idx < count) buf[idx] = 0;
-}

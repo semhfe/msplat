@@ -20,13 +20,12 @@ struct Config {
     float ssimWeight = 0.2f;
     int numDownscales = 2;
     int resolutionSchedule = 3000;
-    int refineEvery = 100;
-    int warmupLength = 500;
-    int resetAlphaEvery = 30;
-    float densifyGradThresh = 0.0002f;
-    float densifySizeThresh = 0.01f;
-    int stopScreenSizeAt = 4000;
-    float splitScreenSize = 0.05f;
+    // MCMC parameters
+    int capMax = 1000000;        // Fixed Gaussian budget
+    float noiseLr = 5e5f;        // SGLD noise learning rate
+    float opacityReg = 0.01f;    // Opacity regularization weight
+    float scaleReg = 0.01f;      // Scale regularization weight
+    float cullRadius = 3.0f;     // Cull splats with ||mean|| > cullRadius (0 = off)
     bool keepCrs = false;
     float downscaleFactor = 1.0f;
     float bgColor[3] = {0.6130f, 0.0101f, 0.3984f};  // magenta — high contrast for debugging
