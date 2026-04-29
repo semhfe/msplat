@@ -3565,9 +3565,19 @@ kernel void mcmc_regularization_kernel(
         scales[idx*3 + i] -= lr * sc_reg * exp(s);
     }
 
-    // Anisotropy regularization: hinge on max(s)-min(s) ratio
+    // Anisotropy regularization: L1 hinge in log-space.
+    //
+    // Penalty:    aniso_reg * max(0, (s_max - s_min) - ln(10))   (10:1 cap)
+    // Subgrad:    +1 on s_max, -1 on s_min when the hinge is active.
+    //
+    // Crucially the subgradient is bounded (±1), independent of how elongated
+    // the Gaussian has become. Earlier we used `exp(s_max - s_min)` as the
+    // subgradient — when scales drifted to s_max - s_min ≈ 18 mid-training the
+    // per-step nudge `lr * aniso_reg * exp(18) ≈ 100` overflowed log-scales,
+    // exp(scales) hit +Inf, SGLD covariance went infinite, and means were
+    // poisoned to NaN/Inf across the whole model.
     if (aniso_reg > 0.0f) {
-        constexpr float ANISO_THRESHOLD = 10.0f;  // 10:1 elongation cap
+        constexpr float LOG_THRESHOLD = 2.302585f;  // ln(10)
         float s0 = scales[idx*3 + 0];
         float s1 = scales[idx*3 + 1];
         float s2 = scales[idx*3 + 2];
@@ -3577,9 +3587,8 @@ kernel void mcmc_regularization_kernel(
         if (s2 > s_max) { s_max = s2; i_max = 2; }
         if (s1 < s_min) { s_min = s1; i_min = 1; }
         if (s2 < s_min) { s_min = s2; i_min = 2; }
-        float ratio = exp(s_max - s_min);
-        if (ratio > ANISO_THRESHOLD) {
-            float g = lr * aniso_reg * ratio;   // hinge subgradient × ratio
+        if ((s_max - s_min) > LOG_THRESHOLD) {
+            float g = lr * aniso_reg;
             scales[idx*3 + i_max] -= g;
             scales[idx*3 + i_min] += g;
         }
