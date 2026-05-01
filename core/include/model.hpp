@@ -12,7 +12,7 @@ float l1_loss(const MTensor& rendered, const MTensor& gt);
 struct Model{
   Model(const InputData &inputData, int numCameras,
         int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,
-        int capMax, float noiseLr, float opacityReg, float scaleReg, float anisoReg,
+        int capMax, float noiseLr, float opacityReg, float scaleReg,
         int maxSteps, bool keepCrs,
         const float* bgColor = nullptr);
 
@@ -89,10 +89,6 @@ struct Model{
   float noise_lr;
   float opacity_reg;
   float scale_reg;
-  // Anisotropy regularization: hinge on per-Gaussian max(scale)/min(scale)
-  // ratio above 10:1 — pushes elongated needle Gaussians back toward
-  // reasonable shapes. 0 disables.
-  float aniso_reg = 0.0f;
   // MCMC: cull Gaussians whose normalized-space position ||mean|| > cull_radius.
   // 0 (or negative) disables the cull. Default 3.0 = 3× the scene's unit-sphere.
   float cull_radius = 0.0f;

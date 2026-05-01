@@ -42,14 +42,13 @@ float l1_loss(const MTensor& rendered, const MTensor& gt) {
 // Model constructor
 Model::Model(const InputData &inputData, int numCameras,
     int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,
-    int capMax, float noiseLr, float opacityReg, float scaleReg, float anisoReg,
+    int capMax, float noiseLr, float opacityReg, float scaleReg,
     int maxSteps, bool keepCrs,
     const float* bgColor)
     : numCameras(numCameras), numDownscales(numDownscales), resolutionSchedule(resolutionSchedule),
       shDegree(shDegree), shDegreeInterval(shDegreeInterval),
       maxSteps(maxSteps), keepCrs(keepCrs),
-      cap_max(capMax), noise_lr(noiseLr),
-      opacity_reg(opacityReg), scale_reg(scaleReg), aniso_reg(anisoReg) {
+      cap_max(capMax), noise_lr(noiseLr), opacity_reg(opacityReg), scale_reg(scaleReg) {
 
     int64_t numPoints = inputData.points.count;
     scale = inputData.scale;
@@ -685,5 +684,5 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
     msplat_sgld_noise(num_active, means, scales, quats, opacities,
                       sgld_noise_buf, noise_lr, adam_lr[0]);
     msplat_mcmc_regularization(num_active, opacities, scales,
-                               adam_lr[0], opacity_reg, scale_reg, aniso_reg);
+                               adam_lr[0], opacity_reg, scale_reg);
 }

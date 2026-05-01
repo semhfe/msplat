@@ -80,10 +80,6 @@ int main(int argc, char *argv[]) {
     app.add_option("--opacity-reg", opacityReg, "Opacity regularization weight");
     float scaleReg = 0.01f;
     app.add_option("--scale-reg", scaleReg, "Scale regularization weight");
-    float anisoReg = 0.01f;
-    app.add_option("--aniso-reg", anisoReg,
-                   "Anisotropy regularization weight (hinge above 10:1 scale ratio)")
-        ->check(CLI::Range(0.0f, 1.0f));
     float cullRadius = 3.0f;
     app.add_option("--cull-radius", cullRadius, "Cull splats with ||mean|| > r in normalized space (0 = off)")
         ->check(CLI::Range(0.0f, 100.0f));
@@ -122,7 +118,7 @@ int main(int argc, char *argv[]) {
 
         Model model(inputData, cams.size(),
                      numDownscales, resolutionSchedule, shDegree, shDegreeInterval,
-                     capMax, noiseLr, opacityReg, scaleReg, anisoReg,
+                     capMax, noiseLr, opacityReg, scaleReg,
                      numIters, keepCrs,
                      bgColor.data());
         model.cull_radius = cullRadius;

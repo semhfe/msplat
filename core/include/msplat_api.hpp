@@ -25,7 +25,6 @@ struct Config {
     float noiseLr = 5e5f;        // SGLD noise learning rate
     float opacityReg = 0.01f;    // Opacity regularization weight
     float scaleReg = 0.01f;      // Scale regularization weight
-    float anisoReg = 0.01f;      // Anisotropy reg (hinge above 10:1 scale ratio); 0 = off
     float cullRadius = 3.0f;     // Cull splats with ||mean|| > cullRadius (0 = off)
     bool keepCrs = false;
     float downscaleFactor = 1.0f;

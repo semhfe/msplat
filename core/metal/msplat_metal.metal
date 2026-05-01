@@ -3534,14 +3534,9 @@ kernel void sgld_noise_kernel(
     means[idx*3+2] += v2;
 }
 
-// MCMC regularization: post-Adam nudge for opacity, scale, and anisotropy.
-// Opacity term:    loss = opacity_reg * |sigmoid(op)|
-// Scale term:      loss = scale_reg   * |exp(s)|
-// Anisotropy term: loss = aniso_reg   * max(0, exp(s_max - s_min) - ANISO_THRESHOLD)
-//   The hinge fires only when the largest principal axis is more than
-//   ANISO_THRESHOLD× longer than the shortest — pushing s_max down and
-//   s_min up. Suppresses needle artifacts where Gaussians elongate along
-//   under-constrained view rays without affecting reasonably-shaped splats.
+// MCMC regularization: post-Adam nudge for opacity and scale.
+// Equivalent to one SGD step on: loss_reg = opacity_reg * |sigmoid(op)| + scale_reg * |exp(s)|
+// Gradients: d/d_logit(sigmoid(x)) = sigmoid(x)*(1-sigmoid(x)),  d/d_log_s(exp(s)) = exp(s)
 kernel void mcmc_regularization_kernel(
     device float* opacities   [[buffer(0)]],   // [N, 1] logit-opacity
     device float* scales      [[buffer(1)]],   // [N, 3] log-scale
@@ -3549,7 +3544,6 @@ kernel void mcmc_regularization_kernel(
     constant float& lr        [[buffer(3)]],   // learning rate (mean of position LR)
     constant float& op_reg    [[buffer(4)]],   // opacity regularization weight
     constant float& sc_reg    [[buffer(5)]],   // scale regularization weight
-    constant float& aniso_reg [[buffer(6)]],   // anisotropy regularization weight
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= (uint)N) return;
@@ -3563,35 +3557,6 @@ kernel void mcmc_regularization_kernel(
     for (int i = 0; i < 3; i++) {
         float s = scales[idx*3 + i];
         scales[idx*3 + i] -= lr * sc_reg * exp(s);
-    }
-
-    // Anisotropy regularization: L1 hinge in log-space.
-    //
-    // Penalty:    aniso_reg * max(0, (s_max - s_min) - ln(10))   (10:1 cap)
-    // Subgrad:    +1 on s_max, -1 on s_min when the hinge is active.
-    //
-    // Crucially the subgradient is bounded (±1), independent of how elongated
-    // the Gaussian has become. Earlier we used `exp(s_max - s_min)` as the
-    // subgradient — when scales drifted to s_max - s_min ≈ 18 mid-training the
-    // per-step nudge `lr * aniso_reg * exp(18) ≈ 100` overflowed log-scales,
-    // exp(scales) hit +Inf, SGLD covariance went infinite, and means were
-    // poisoned to NaN/Inf across the whole model.
-    if (aniso_reg > 0.0f) {
-        constexpr float LOG_THRESHOLD = 2.302585f;  // ln(10)
-        float s0 = scales[idx*3 + 0];
-        float s1 = scales[idx*3 + 1];
-        float s2 = scales[idx*3 + 2];
-        int i_max = 0, i_min = 0;
-        float s_max = s0, s_min = s0;
-        if (s1 > s_max) { s_max = s1; i_max = 1; }
-        if (s2 > s_max) { s_max = s2; i_max = 2; }
-        if (s1 < s_min) { s_min = s1; i_min = 1; }
-        if (s2 < s_min) { s_min = s2; i_min = 2; }
-        if ((s_max - s_min) > LOG_THRESHOLD) {
-            float g = lr * aniso_reg;
-            scales[idx*3 + i_max] -= g;
-            scales[idx*3 + i_min] += g;
-        }
     }
 }
 
