@@ -6,6 +6,7 @@
 #include "kdtree_tensor.hpp"
 #include "msplat.hpp"
 #include "loaders.hpp"
+#include <mach/mach.h>
 
 namespace fs = std::filesystem;
 
@@ -39,13 +40,42 @@ float l1_loss(const MTensor& rendered, const MTensor& gt) {
     return (float)(sum / n);
 }
 
+MTensor dequantize_gt(const MTensor& gt) {
+    if (gt.dtype() == DType::Float32) return gt.cpu();
+    // uint8 → float [0,1] on CPU
+    MTensor out(gt.shape(), DType::Float32);
+    const uint8_t* src = gt.data<uint8_t>();
+    float* dst = out.data<float>();
+    int64_t n = gt.numel();
+    for (int64_t i = 0; i < n; i++)
+        dst[i] = (float)src[i] * (1.0f / 255.0f);
+    return out;
+}
+
+// In-process memory diagnostics (Apple Silicon).
+// Uses phys_footprint which includes Metal GPU allocations (IOKit-mapped),
+// unlike resident_size which misses them on UMA.
+void log_memory(const char* label) {
+    struct task_vm_info info;
+    mach_msg_type_number_t size = TASK_VM_INFO_COUNT;
+    kern_return_t kr = task_info(mach_task_self(), TASK_VM_INFO,
+                                 (task_info_t)&info, &size);
+    if (kr == KERN_SUCCESS) {
+        fprintf(stderr, "[MEM] %s: phys=%.1f MB  internal=%.1f MB  compressed=%.1f MB\n",
+                label,
+                info.phys_footprint / 1048576.0,
+                info.internal / 1048576.0,
+                info.compressed / 1048576.0);
+    }
+}
+
 // Model constructor
 Model::Model(const InputData &inputData, int numCameras,
-    int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,
+    int shDegree, int shDegreeInterval,
     int capMax, float noiseLr, float opacityReg, float scaleReg,
     int maxSteps, bool keepCrs,
     const float* bgColor)
-    : numCameras(numCameras), numDownscales(numDownscales), resolutionSchedule(resolutionSchedule),
+    : numCameras(numCameras),
       shDegree(shDegree), shDegreeInterval(shDegreeInterval),
       maxSteps(maxSteps), keepCrs(keepCrs),
       cap_max(capMax), noise_lr(noiseLr), opacity_reg(opacityReg), scale_reg(scaleReg) {
@@ -179,7 +209,10 @@ void Model::releaseOptimizers(){
 }
 
 void Model::schedulersStep(int step){
-    float t = std::clamp((float)step / (float)maxSteps, 0.f, 1.f);
+    // Reference: position_lr_max_steps = 30000 (fixed, independent of total iterations).
+    // The position LR schedule completes at 30K steps; beyond that it stays at lr_final.
+    static constexpr int position_lr_max_steps = 30000;
+    float t = std::clamp((float)step / (float)position_lr_max_steps, 0.f, 1.f);
     adam_lr[0] = std::exp(std::log(means_lr_init) * (1.f - t) + std::log(means_lr_final) * t);
 }
 
@@ -197,8 +230,11 @@ void Model::refreshViews(){
 }
 
 int Model::getDownscaleFactor(int step) {
-    int remaining = numDownscales - step / resolutionSchedule;
-    return 1 << std::max(remaining, 0);
+    // Progressive downscale removed — always train at the loaded image resolution.
+    // The reference 3DGS-MCMC implementation (ubc-vision/3dgs-mcmc) does not use
+    // progressive resolution scheduling; MCMC's SGLD noise provides sufficient
+    // exploration without coarse-to-fine training.
+    return 1;
 }
 
 // ── MCMC helpers ────────────────────────────────────────────────────────────
@@ -360,6 +396,9 @@ int Model::addNewGaussians() {
 
 void Model::mcmcAfterTrain(int step) {
     if (step < 500 || step % 100 != 0) return;
+    // Reference MCMC: densify_until_iter = 25000 out of 30000 (83.3%).
+    // Stop relocation/growth in the final steps for pure fine-tuning.
+    if (step >= (int)(maxSteps * 0.833f)) return;
     msplat_gpu_sync();
 
     const float *op = opacities.data<float>();

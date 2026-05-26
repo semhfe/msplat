@@ -58,10 +58,6 @@ int main(int argc, char *argv[]) {
     float downScaleFactor = 1.0f;
     app.add_option("-d,--downscale-factor", downScaleFactor, "Image downscale factor")
         ->check(CLI::Range(1.0f, 32.0f));
-    int numDownscales = 2;
-    app.add_option("--num-downscales", numDownscales, "Progressive downscale levels");
-    int resolutionSchedule = 3000;
-    app.add_option("--resolution-schedule", resolutionSchedule, "Double resolution every N steps");
     int shDegree = 3;
     app.add_option("--sh-degree", shDegree, "Max spherical harmonics degree")
         ->check(CLI::Range(0, 4));
@@ -103,6 +99,9 @@ int main(int argc, char *argv[]) {
         for (auto &cam : inputData.cameras)
             cam.loadImage(downScaleFactor);
 
+        extern void log_memory(const char* label);
+        log_memory("images loaded");
+
         std::vector<Camera> cams;
         std::vector<Camera> testCams;
         Camera *valCam = nullptr;
@@ -117,11 +116,13 @@ int main(int argc, char *argv[]) {
         }
 
         Model model(inputData, cams.size(),
-                     numDownscales, resolutionSchedule, shDegree, shDegreeInterval,
+                     shDegree, shDegreeInterval,
                      capMax, noiseLr, opacityReg, scaleReg,
                      numIters, keepCrs,
                      bgColor.data());
         model.cull_radius = cullRadius;
+
+        log_memory("model init");
 
         std::vector<size_t> camIndices(cams.size());
         std::iota(camIndices.begin(), camIndices.end(), 0);
@@ -145,13 +146,17 @@ int main(int argc, char *argv[]) {
             Camera &cam = cams[camsIter.next()];
 
             auto iter_start = cpu_now();
-            MTensor gt = cam.getGPUImage(model.getDownscaleFactor(step));
+            MTensor gt = cam.getGPUImage();
             model.fullIteration(cam, step, gt, ssimWeight);
             model.schedulersStep(step);
             model.mcmcAfterTrain(step);
             msplat_commit();
 
             // Progress output for GUI integration (every 1000 steps)
+            if (step % 5000 == 0) {
+                char buf[64]; snprintf(buf, sizeof(buf), "step %zu", step);
+                log_memory(buf);
+            }
             if (step % 1000 == 0 || step == 1) {
                 auto iter_end_time = cpu_now();
                 double ms = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -284,7 +289,7 @@ int main(int argc, char *argv[]) {
                 MTensor rgb = model.render(testCams[i], numIters);
                 msplat_gpu_sync();
                 MTensor rgb_cpu = rgb.cpu();
-                MTensor gt_cpu = testCams[i].getGPUImage(model.getDownscaleFactor(numIters)).cpu();
+                MTensor gt_cpu = dequantize_gt(testCams[i].getGPUImage());
 
                 float p = psnr(rgb_cpu, gt_cpu);
                 float s = ssim_eval(rgb_cpu, gt_cpu);
@@ -306,7 +311,7 @@ int main(int argc, char *argv[]) {
             MTensor rgb = model.render(*valCam, numIters);
             msplat_gpu_sync();
             MTensor rgb_cpu = rgb.cpu();
-            MTensor gt_cpu = valCam->getGPUImage(model.getDownscaleFactor(numIters)).cpu();
+            MTensor gt_cpu = dequantize_gt(valCam->getGPUImage());
 
             std::cout << "\n=== Validation (" << valCam->filePath << ") ===" << std::endl;
             std::cout << "  PSNR:  " << psnr(rgb_cpu, gt_cpu)

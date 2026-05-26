@@ -2302,7 +2302,7 @@ kernel void block_scan_propagate_kernel(
 
 kernel void fused_loss_forward_kernel(
     constant float* rendered,       // (H, W, 3) HWC
-    constant float* gt,             // (H, W, 3) HWC
+    constant uchar* gt,             // (H, W, 3) HWC — uint8, cast to float on read
     constant float* window,         // (121,) precomputed 2D Gaussian window
     constant uint2& img_size,       // (W, H)
     constant float& ssim_weight,
@@ -2337,7 +2337,7 @@ kernel void fused_loss_forward_kernel(
                 for (int dx = dx_min; dx <= dx_max; dx++) {
                     int nx = (int)px + dx;
                     float w = window[(dy + SSIM_HALF_WIN) * SSIM_WIN + (dx + SSIM_HALF_WIN)];
-                    float x_val = gt[(ny * W + nx) * 3 + c];
+                    float x_val = (float)gt[(ny * W + nx) * 3 + c] * (1.0f/255.0f);
                     float y_val = rendered[(ny * W + nx) * 3 + c];
                     mu_x += w * x_val;
                     mu_y += w * y_val;
@@ -2365,7 +2365,7 @@ kernel void fused_loss_forward_kernel(
 
             ssim_sum += (A * B) / (C_d * D);
 
-            float gt_val = gt[(py * W + px) * 3 + c];
+            float gt_val = (float)gt[(py * W + px) * 3 + c] * (1.0f/255.0f);
             float rend_val = rendered[(py * W + px) * 3 + c];
             l1_sum += fabs(gt_val - rend_val);
         }
@@ -2389,7 +2389,7 @@ kernel void fused_loss_forward_kernel(
 
 kernel void fused_loss_backward_kernel(
     constant float* rendered,       // (H, W, 3) HWC
-    constant float* gt,             // (H, W, 3) HWC
+    constant uchar* gt,             // (H, W, 3) HWC — uint8, cast to float on read
     constant float* window,         // (121,) 2D Gaussian window
     constant uint2& img_size,       // (W, H)
     constant float* intermediates,  // (H, W, 15) from forward
@@ -2412,7 +2412,7 @@ kernel void fused_loss_backward_kernel(
 
     for (uint c = 0; c < 3; c++) {
         float rend_val = rendered[(py * W + px) * 3 + c];
-        float gt_val = gt[(py * W + px) * 3 + c];
+        float gt_val = (float)gt[(py * W + px) * 3 + c] * (1.0f/255.0f);
 
         // L1 gradient: d|gt-rend|/d(rend) = -sign(gt-rend)
         float v_l1 = (gt_val > rend_val) ? -1.0f : ((gt_val < rend_val) ? 1.0f : 0.0f);
@@ -2904,7 +2904,7 @@ constant float GAUSS_1D[11] = {
 // Output: ssim_h_buf (H, W, 15) — 5 values × 3 channels
 kernel void ssim_h_fwd_kernel(
     constant float* rendered,       // (H, W, 3) HWC
-    constant float* gt,             // (H, W, 3) HWC
+    constant uchar* gt,             // (H, W, 3) HWC — uint8, cast to float on read
     constant uint2& img_size,       // (W, H)
     device float* ssim_h_buf,       // (H, W, 15)
     uint2 gid [[thread_position_in_grid]],
@@ -2934,7 +2934,7 @@ kernel void ssim_h_fwd_kernel(
             float gv = 0.0f, rv = 0.0f;
             if (gx >= 0 && gx < (int)W && gy >= 0 && gy < (int)H) {
                 uint idx = (gy * W + gx) * 3 + c;
-                gv = gt[idx];
+                gv = (float)gt[idx] * (1.0f/255.0f);
                 rv = rendered[idx];
             }
             tg_gt[c][sy][sx] = gv;
@@ -2971,7 +2971,7 @@ kernel void ssim_h_fwd_kernel(
 // Output: intermediates (H, W, 15) — same format as fused_loss_forward_kernel
 kernel void ssim_v_fwd_kernel(
     constant float* rendered,       // (H, W, 3) for L1
-    constant float* gt,             // (H, W, 3) for L1
+    constant uchar* gt,             // (H, W, 3) for L1 — uint8, cast to float on read
     constant float* ssim_h_buf,     // (H, W, 15)
     constant uint2& img_size,       // (W, H)
     constant float& ssim_weight,
@@ -3046,7 +3046,7 @@ kernel void ssim_v_fwd_kernel(
             ssim_sum += (A * B) / (Cd * D);
 
             // L1 for this channel
-            float gt_v  = gt[(py * W + px) * 3 + c];
+            float gt_v  = (float)gt[(py * W + px) * 3 + c] * (1.0f/255.0f);
             float rd_v  = rendered[(py * W + px) * 3 + c];
             l1_sum += fabs(gt_v - rd_v);
         }
@@ -3076,7 +3076,7 @@ kernel void ssim_v_fwd_kernel(
 // computes loss + derivative fields, then H convs derivatives to output buffer.
 // Eliminates loss_intermediates round-trip (130 MB/iter bandwidth saved).
 kernel void ssim_fused_v_fwd_h_bwd_kernel(
-    constant float* rendered, constant float* gt,
+    constant float* rendered, constant uchar* gt,
     constant float* ssim_h_buf, constant uint2& img_size,
     constant float& ssim_weight, constant float& inv_n,
     device float* deriv_h_buf, device atomic_float* loss_sum,
@@ -3134,7 +3134,7 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
                 int gpx = base_gx + (int)dx, gpy = base_gy + (int)(dy + SSIM_HALF_WIN);
                 if (gpx >= 0 && gpx < (int)W && gpy >= 0 && gpy < (int)H) {
                     ssim_sum += (A * B) / (Cd * D);
-                    l1_sum += fabs(gt[(gpy*W+gpx)*3+c] - rendered[(gpy*W+gpx)*3+c]);
+                    l1_sum += fabs((float)gt[(gpy*W+gpx)*3+c] * (1.0f/255.0f) - rendered[(gpy*W+gpx)*3+c]);
                 }
             }
         }
@@ -3247,7 +3247,7 @@ kernel void ssim_h_bwd_kernel(
 // Output: v_rendered (H, W, 3)
 kernel void ssim_v_bwd_kernel(
     constant float* rendered,       // (H, W, 3)
-    constant float* gt,             // (H, W, 3)
+    constant uchar* gt,             // (H, W, 3) — uint8, cast to float on read
     constant float* ssim_h_buf,     // (H, W, 15)
     constant uint2& img_size,       // (W, H)
     constant float& ssim_weight,
@@ -3303,7 +3303,7 @@ kernel void ssim_v_bwd_kernel(
             }
 
             float rend_val = rendered[(py * W + px) * 3 + c];
-            float gt_val = gt[(py * W + px) * 3 + c];
+            float gt_val = (float)gt[(py * W + px) * 3 + c] * (1.0f/255.0f);
 
             float v_ssim = conv_f1 + rend_val * conv_f2 + gt_val * conv_f3;
             float v_l1 = (gt_val > rend_val) ? -1.0f : ((gt_val < rend_val) ? 1.0f : 0.0f);
@@ -3368,12 +3368,12 @@ kernel void sgld_noise_kernel(
 ) {
     if (idx >= (uint)N) return;
 
-    // 1. Opacity weight: apply noise to low/mid-opacity (exploring) Gaussians;
-    // suppress noise for high-opacity (settled surface) Gaussians.
-    // Transition at op_sig=0.5 — previously had the sigmoid inverted
-    // (was applying max noise to fully-opaque Gaussians, destroying surfaces).
+    // 1. Opacity weight: reference MCMC applies noise only to near-dead Gaussians.
+    // op_sigmoid(1 - sigmoid(opacity), k=100, x0=0.995):
+    //   opacity < 0.005 → weight ≈ 0.5 (noise applied)
+    //   opacity > 0.01  → weight ≈ 0   (no noise, converging surface)
     float op_sig = 1.0f / (1.0f + exp(-opacities[idx]));
-    float weight = 1.0f / (1.0f + exp(100.0f * (op_sig - 0.5f)));
+    float weight = 1.0f / (1.0f + exp(-100.0f * ((1.0f - op_sig) - 0.995f)));
 
     // 2. Scale noise
     float noise_scale = noise_lr * xyz_lr * weight;

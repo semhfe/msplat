@@ -87,7 +87,6 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
     impl->model = std::make_unique<Model>(
         impl->ds->data,
         (int)impl->ds->trainCams.size(),
-        config.numDownscales, config.resolutionSchedule,
         config.shDegree, config.shDegreeInterval,
         config.capMax, config.noiseLr, config.opacityReg, config.scaleReg,
         config.iterations, config.keepCrs,
@@ -108,7 +107,7 @@ Stats Trainer::step() {
     Camera& cam = impl->ds->trainCams[camIdx];
 
     int ds = impl->model->getDownscaleFactor(impl->currentStep);
-    MTensor& gt = cam.getGPUImage(ds);
+    MTensor& gt = cam.getGPUImage();
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
@@ -149,7 +148,7 @@ EvalMetrics Trainer::evaluate() {
         msplat_gpu_sync();
         MTensor rgbCpu = rgb.cpu();
         int dsf = impl->model->getDownscaleFactor(impl->config.iterations);
-        MTensor gtCpu = cam.getGPUImage(dsf).cpu();
+        MTensor gtCpu = dequantize_gt(cam.getGPUImage());
 
         sumPsnr += psnr(rgbCpu, gtCpu);
         sumSsim += ssim_eval(rgbCpu, gtCpu);
@@ -281,8 +280,6 @@ static msplat::Config configFromC(MsplatConfig c) {
     cfg.shDegree = c.shDegree;
     cfg.shDegreeInterval = c.shDegreeInterval;
     cfg.ssimWeight = c.ssimWeight;
-    cfg.numDownscales = c.numDownscales;
-    cfg.resolutionSchedule = c.resolutionSchedule;
     cfg.capMax = c.capMax;
     cfg.noiseLr = c.noiseLr;
     cfg.opacityReg = c.opacityReg;

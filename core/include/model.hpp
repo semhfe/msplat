@@ -9,9 +9,14 @@ int numShBases(int degree);
 float psnr(const MTensor& rendered, const MTensor& gt);
 float l1_loss(const MTensor& rendered, const MTensor& gt);
 
+// Dequantize a uint8 MTensor to float [0,1]. Used at metric evaluation sites
+// where psnr/ssim_eval/l1_loss expect float data but GT is stored as uint8.
+// Returns the input unchanged if it's already Float32.
+MTensor dequantize_gt(const MTensor& gt);
+
 struct Model{
   Model(const InputData &inputData, int numCameras,
-        int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,
+        int shDegree, int shDegreeInterval,
         int capMax, float noiseLr, float opacityReg, float scaleReg,
         int maxSteps, bool keepCrs,
         const float* bgColor = nullptr);
@@ -77,8 +82,6 @@ struct Model{
   MTensor window2d;  // SSIM window (11,11) f32
 
   int numCameras;
-  int numDownscales;
-  int resolutionSchedule;
   int shDegree;
   int shDegreeInterval;
   int maxSteps;

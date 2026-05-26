@@ -12,7 +12,12 @@
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
-// ── Image loading ───────────────────────────────────────────────────────────
+// ── Image loading (single-allocation UMA pipeline) ──────────────────────────
+//
+// On Apple Silicon, MTLResourceStorageModeShared buffers share the same physical
+// memory between CPU and GPU. We decode the image into a temporary CPU vector,
+// copy into a Metal buffer, and immediately discard the temporary. Only one
+// allocation persists per camera: the gpuBaseImage MTensor.
 
 void Camera::loadImage(float downscaleFactor) {
     Image raw = imreadRGB(filePath);
@@ -48,30 +53,22 @@ void Camera::loadImage(float downscaleFactor) {
         k1 = k2 = k3 = p1 = p2 = 0;
     }
 
-    image = std::move(raw);
+    // Quantize float→uint8 after all geometric transforms (resize, undistort)
+    // have been applied in full float precision. Source images are 8-bit JPG/MP4
+    // so the ±0.5/255 round-trip error is below PSNR-meaningful precision.
+    // Cuts per-pixel GT storage from 12 bytes (Float32×3) to 3 bytes (uint8×3).
+    // Metal loss/SSIM kernels cast back to float on-the-fly at read time.
+    size_t N = (size_t)raw.width * (size_t)raw.height;
+    gpuBaseImage = gpu_empty({raw.height, raw.width, 3}, DType::UInt8);
+    uint8_t* dst = static_cast<uint8_t*>(gpuBaseImage.data_ptr());
+    const float* src = raw.ptr();
+    for (size_t i = 0; i < N * 3; ++i)
+        dst[i] = (uint8_t)std::clamp(std::round(src[i] * 255.0f), 0.0f, 255.0f);
+    // raw goes out of scope here → std::vector<float> freed immediately
 }
 
-Image Camera::getImage(int downscaleFactor) {
-    if (downscaleFactor <= 1) return image;
-
-    auto it = imagePyramids.find(downscaleFactor);
-    if (it != imagePyramids.end()) return it->second;
-
-    int newW = image.width / downscaleFactor;
-    int newH = image.height / downscaleFactor;
-    Image scaled = resizeArea(image, newW, newH);
-    imagePyramids[downscaleFactor] = scaled;
-    return scaled;
-}
-
-MTensor& Camera::getGPUImage(int downscaleFactor) {
-    auto it = mtensorImageCache.find(downscaleFactor);
-    if (it != mtensorImageCache.end()) return it->second;
-    Image img = getImage(downscaleFactor);
-    MTensor mt = gpu_empty({img.height, img.width, 3}, DType::Float32);
-    memcpy(mt.data_ptr(), img.ptr(), img.width * img.height * 3 * sizeof(float));
-    mtensorImageCache[downscaleFactor] = mt;
-    return mtensorImageCache[downscaleFactor];
+MTensor& Camera::getGPUImage() {
+    return gpuBaseImage;
 }
 
 // ── Scale & center ──────────────────────────────────────────────────────────
