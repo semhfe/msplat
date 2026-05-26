@@ -1,5 +1,6 @@
 #include "loaders.hpp"
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <algorithm>
 #include <stdexcept>
@@ -59,21 +60,36 @@ Image imreadRGB(const std::string &path) {
 void imwriteRGB(const std::string &path, const Image &img) {
     int w = img.width, h = img.height;
 
-    // float32 RGB → uint8 RGB
-    std::vector<uint8_t> rgb8(w * h * 3);
-    for (int i = 0; i < w * h * 3; i++) {
-        float v = std::clamp(img.data[i] * 255.0f, 0.0f, 255.0f);
-        rgb8[i] = (uint8_t)(v + 0.5f);
+    // float32 RGB → uint8 RGBA (CGBitmapContext does not support 24-bit RGB on macOS;
+    // it requires 32-bit with an alpha channel or RGBA-skipped).
+    std::vector<uint8_t> rgba8(w * h * 4);
+    for (int i = 0; i < w * h; i++) {
+        float r = std::clamp(img.data[i*3+0] * 255.0f, 0.0f, 255.0f);
+        float g = std::clamp(img.data[i*3+1] * 255.0f, 0.0f, 255.0f);
+        float b = std::clamp(img.data[i*3+2] * 255.0f, 0.0f, 255.0f);
+        rgba8[i*4+0] = (uint8_t)(r + 0.5f);
+        rgba8[i*4+1] = (uint8_t)(g + 0.5f);
+        rgba8[i*4+2] = (uint8_t)(b + 0.5f);
+        rgba8[i*4+3] = 0xFF;
     }
 
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
     CGContextRef ctx = CGBitmapContextCreate(
-        rgb8.data(), w, h, 8, w * 3, colorSpace,
-        kCGImageAlphaNone | kCGBitmapByteOrderDefault
+        rgba8.data(), w, h, 8, w * 4, colorSpace,
+        kCGImageAlphaNoneSkipLast | kCGBitmapByteOrderDefault
     );
+    if (!ctx) {
+        CGColorSpaceRelease(colorSpace);
+        std::fprintf(stderr, "imwriteRGB: CGBitmapContextCreate failed for %s (%dx%d)\n", path.c_str(), w, h);
+        return;
+    }
     CGImageRef cgImage = CGBitmapContextCreateImage(ctx);
     CGContextRelease(ctx);
     CGColorSpaceRelease(colorSpace);
+    if (!cgImage) {
+        std::fprintf(stderr, "imwriteRGB: CGBitmapContextCreateImage failed for %s\n", path.c_str());
+        return;
+    }
 
     CFStringRef cfPath = CFStringCreateWithCString(nullptr, path.c_str(), kCFStringEncodingUTF8);
     CFURLRef url = CFURLCreateWithFileSystemPath(nullptr, cfPath, kCFURLPOSIXPathStyle, false);
@@ -81,8 +97,14 @@ void imwriteRGB(const std::string &path, const Image &img) {
 
     CGImageDestinationRef dest = CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, nullptr);
     CFRelease(url);
+    if (!dest) {
+        CGImageRelease(cgImage);
+        std::fprintf(stderr, "imwriteRGB: CGImageDestinationCreateWithURL failed for %s\n", path.c_str());
+        return;
+    }
     CGImageDestinationAddImage(dest, cgImage, nullptr);
-    CGImageDestinationFinalize(dest);
+    bool ok = CGImageDestinationFinalize(dest);
+    if (!ok) std::fprintf(stderr, "imwriteRGB: CGImageDestinationFinalize failed for %s\n", path.c_str());
 
     CFRelease(dest);
     CGImageRelease(cgImage);
