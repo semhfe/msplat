@@ -19,7 +19,8 @@ struct Model{
         int shDegree, int shDegreeInterval,
         int capMax, float noiseLr, float opacityReg, float scaleReg,
         int maxSteps, bool keepCrs,
-        const float* bgColor = nullptr);
+        const float* bgColor = nullptr,
+        int positionLrMaxSteps = 30000);
 
   ~Model(){ releaseOptimizers(); }
 
@@ -95,6 +96,9 @@ struct Model{
   // MCMC: cull Gaussians whose normalized-space position ||mean|| > cull_radius.
   // 0 (or negative) disables the cull. Default 3.0 = 3× the scene's unit-sphere.
   float cull_radius = 0.0f;
+  // Position LR schedule endpoint: LR decays from lr_init to lr_final over this many steps.
+  // Default 30000 (reference MCMC). Partitioned training sets this to the cell's iteration count.
+  int position_lr_max_steps_ = 30000;
 
   float scale;
   float translation[3] = {};

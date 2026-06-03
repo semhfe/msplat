@@ -86,6 +86,9 @@ int main(int argc, char *argv[]) {
         ->expected(3);
     std::string colmapImagePath;
     app.add_option("--colmap-image-path", colmapImagePath, "Override COLMAP image directory");
+    int positionLrMaxSteps = 30000;
+    app.add_option("--position-lr-max-steps", positionLrMaxSteps, "Step where position LR reaches its final value")
+        ->check(CLI::Range(1, 1000000));
 
     CLI11_PARSE(app, argc, argv);
 
@@ -119,7 +122,8 @@ int main(int argc, char *argv[]) {
                      shDegree, shDegreeInterval,
                      capMax, noiseLr, opacityReg, scaleReg,
                      numIters, keepCrs,
-                     bgColor.data());
+                     bgColor.data(),
+                     positionLrMaxSteps);
         model.cull_radius = cullRadius;
 
         log_memory("model init");

@@ -74,11 +74,13 @@ Model::Model(const InputData &inputData, int numCameras,
     int shDegree, int shDegreeInterval,
     int capMax, float noiseLr, float opacityReg, float scaleReg,
     int maxSteps, bool keepCrs,
-    const float* bgColor)
+    const float* bgColor,
+    int positionLrMaxSteps)
     : numCameras(numCameras),
       shDegree(shDegree), shDegreeInterval(shDegreeInterval),
       maxSteps(maxSteps), keepCrs(keepCrs),
-      cap_max(capMax), noise_lr(noiseLr), opacity_reg(opacityReg), scale_reg(scaleReg) {
+      cap_max(capMax), noise_lr(noiseLr), opacity_reg(opacityReg), scale_reg(scaleReg),
+      position_lr_max_steps_(positionLrMaxSteps) {
 
     int64_t numPoints = inputData.points.count;
     scale = inputData.scale;
@@ -209,10 +211,9 @@ void Model::releaseOptimizers(){
 }
 
 void Model::schedulersStep(int step){
-    // Reference: position_lr_max_steps = 30000 (fixed, independent of total iterations).
-    // The position LR schedule completes at 30K steps; beyond that it stays at lr_final.
-    static constexpr int position_lr_max_steps = 30000;
-    float t = std::clamp((float)step / (float)position_lr_max_steps, 0.f, 1.f);
+    // Position LR schedule: decays from lr_init to lr_final over position_lr_max_steps_ steps.
+    // Beyond that it stays at lr_final. Defaults to 30000 if not set at construction.
+    float t = std::clamp((float)step / (float)position_lr_max_steps_, 0.f, 1.f);
     adam_lr[0] = std::exp(std::log(means_lr_init) * (1.f - t) + std::log(means_lr_final) * t);
 }
 
