@@ -131,14 +131,19 @@ struct MetalContext {
     // Forward pipeline kernels
     id<MTLComputePipelineState> project_and_sh_forward_kernel_cpso;
     id<MTLComputePipelineState> nd_rasterize_forward_kernel_cpso;
-    // Global radix sort pipeline
+    // Hybrid per-tile sort pipeline (replaces global radix sort)
+    id<MTLComputePipelineState> count_intersections_kernel_cpso;
+    id<MTLComputePipelineState> prefix_sum_tiles_kernel_cpso;
+    id<MTLComputePipelineState> scatter_intersections_kernel_cpso;
+    id<MTLComputePipelineState> hybrid_sort_pack_kernel_cpso;
+    // Legacy radix sort PSOs (kept for reference, no longer dispatched)
     id<MTLComputePipelineState> map_gaussian_to_intersects_kernel_cpso;
     id<MTLComputePipelineState> get_tile_bin_edges_kernel_cpso;
     id<MTLComputePipelineState> pack_sorted_gaussians_kernel_cpso;
     id<MTLComputePipelineState> radix_sort_histogram_kernel_cpso;
     id<MTLComputePipelineState> radix_sort_scan_kernel_cpso;
     id<MTLComputePipelineState> radix_sort_scatter_kernel_cpso;
-    // Prefix sum
+    // Prefix sum (for per-Gaussian prefix sum, now unused by sort but kept)
     id<MTLComputePipelineState> prefix_sum_kernel_cpso;
     id<MTLComputePipelineState> block_reduce_kernel_cpso;
     id<MTLComputePipelineState> block_scan_propagate_kernel_cpso;
@@ -234,14 +239,28 @@ MetalContext* init_msplat_metal_context() {
     // Forward pipeline
     ctx->project_and_sh_forward_kernel_cpso       = load(@"project_and_sh_forward_kernel");
     ctx->nd_rasterize_forward_kernel_cpso         = load(@"nd_rasterize_forward_kernel");
-    // Global radix sort pipeline
+    // Hybrid per-tile sort pipeline
+    ctx->count_intersections_kernel_cpso          = load(@"count_intersections_kernel");
+    ctx->prefix_sum_tiles_kernel_cpso             = load(@"prefix_sum_tiles_kernel");
+    ctx->scatter_intersections_kernel_cpso        = load(@"scatter_intersections_kernel");
+    ctx->hybrid_sort_pack_kernel_cpso             = load(@"hybrid_sort_pack_kernel");
+    // Runtime safety check: threadgroup memory for bitonic sort
+    {
+        NSUInteger tg_mem_needed = 2048 * sizeof(uint64_t);  // BITONIC_TG_CAP * 8
+        NSCAssert(device.maxThreadgroupMemoryLength >= tg_mem_needed,
+                  @"This device's max threadgroup memory (%lu) is below the configured "
+                  @"BITONIC_TG_CAP (2048 × 8 = %lu bytes). Lower BITONIC_TG_CAP.",
+                  (unsigned long)device.maxThreadgroupMemoryLength,
+                  (unsigned long)tg_mem_needed);
+    }
+    // Legacy radix sort pipeline (kept loadable, no longer dispatched)
     ctx->map_gaussian_to_intersects_kernel_cpso   = load(@"map_gaussian_to_intersects_kernel");
     ctx->get_tile_bin_edges_kernel_cpso           = load(@"get_tile_bin_edges_kernel");
     ctx->pack_sorted_gaussians_kernel_cpso        = load(@"pack_sorted_gaussians_kernel");
     ctx->radix_sort_histogram_kernel_cpso         = load(@"radix_sort_histogram_kernel");
     ctx->radix_sort_scan_kernel_cpso              = load(@"radix_sort_scan_kernel");
     ctx->radix_sort_scatter_kernel_cpso           = load(@"radix_sort_scatter_kernel");
-    // Prefix sum
+    // Prefix sum (legacy, no longer dispatched by sort pipeline)
     ctx->prefix_sum_kernel_cpso                   = load(@"prefix_sum_kernel");
     ctx->block_reduce_kernel_cpso                 = load(@"block_reduce_kernel");
     ctx->block_scan_propagate_kernel_cpso         = load(@"block_scan_propagate_kernel");
@@ -358,18 +377,13 @@ struct FusedTensorCache {
     MTensor ssim_h_buf;
     MTensor tile_bins, loss_sum;
 
-    // Global radix sort buffers
-    MTensor cum_tiles_hit;          // [num_points] int32 — prefix sum of num_tiles_hit
-    MTensor isect_ids;              // [capacity] int64 — (tile_id<<16 | depth_16) keys
-    MTensor isect_ids_b;            // [capacity] int64 — radix sort double-buffer for keys
-    MTensor gaussian_ids_b;         // [capacity] int32 — radix sort double-buffer for values
-    MTensor radix_counts;           // [num_radix_blocks * 256] uint32 — radix histogram
+    // Hybrid per-tile sort buffers
+    MTensor tile_counts;            // [num_tiles] uint32 — per-tile intersection counts
+    MTensor tile_write_counters;    // [num_tiles] uint32 — atomic write positions per tile
+    MTensor exact_offsets;          // [num_tiles] uint32 — exact start offset per tile
+    MTensor sort_offsets;           // [num_tiles+1] uint32 — padded start offset per tile
+    MTensor isect_keys_unsorted;    // [capacity] uint64 — unsorted per-tile sort keys
 
-    // Multi-threadgroup prefix sum temp buffer
-    MTensor block_totals;
-
-    // Intersection overflow detection
-    MTensor overflow_flag;
     int64_t capacity_multiplier = 16;
 
     // Depth-chunked rasterization buffers
@@ -392,21 +406,13 @@ struct FusedTensorCache {
             radii_out = mtensor_empty(dev, {np}, DType::Int32);
             conics = mtensor_empty(dev, {np, 3}, DType::Float32);
             num_tiles_hit = mtensor_empty(dev, {np}, DType::Int32);
-            cum_tiles_hit = mtensor_empty(dev, {np}, DType::Int32);
             colors = mtensor_empty(dev, {np, 3}, DType::Float32);
             aabb = mtensor_empty(dev, {np, 2}, DType::Float32);
-            block_totals = mtensor_empty(dev, {(np + 1023) / 1024}, DType::Int32);
         }
         if (cap != capacity) {
             capacity = cap;
             gaussian_ids = mtensor_empty(dev, {cap}, DType::Int32);
-            isect_ids = mtensor_empty(dev, {cap}, DType::Int64);
-            // Double-buffers for radix sort (keys_out, vals_out)
-            isect_ids_b = mtensor_empty(dev, {cap}, DType::Int64);
-            gaussian_ids_b = mtensor_empty(dev, {cap}, DType::Int32);
-            // Radix histogram: ceil(capacity/256) blocks × 256 bins
-            int64_t num_radix_blocks = (cap + 255) / 256;
-            radix_counts = mtensor_empty(dev, {num_radix_blocks * 256}, DType::Int32);
+            isect_keys_unsorted = mtensor_empty(dev, {cap}, DType::Int64);
             packed_xy_opac = mtensor_empty(dev, {cap, 3}, DType::Float32);
             packed_conic = mtensor_empty(dev, {cap, 3}, DType::Float32);
             packed_rgb = mtensor_empty(dev, {cap, 3}, DType::Float32);
@@ -423,12 +429,13 @@ struct FusedTensorCache {
         if (nt != num_tiles) {
             num_tiles = nt;
             tile_bins = mtensor_empty(dev, {nt, 2}, DType::Int32);
+            tile_counts = mtensor_empty(dev, {(int64_t)nt}, DType::Int32);
+            tile_write_counters = mtensor_empty(dev, {(int64_t)nt}, DType::Int32);
+            exact_offsets = mtensor_empty(dev, {(int64_t)nt}, DType::Int32);
+            sort_offsets = mtensor_empty(dev, {(int64_t)(nt + 1)}, DType::Int32);
         }
         if (!loss_sum.defined()) {
             loss_sum = mtensor_empty(dev, {1}, DType::Float32);
-        }
-        if (!overflow_flag.defined()) {
-            overflow_flag = mtensor_empty(dev, {1}, DType::Int32);
         }
     }
 
@@ -484,24 +491,6 @@ static void forward_pipeline(
     int tile_bounds_y = std::get<1>(tile_bounds);
     int num_tiles = tile_bounds_x * tile_bounds_y;
 
-    // --- Overflow check: detect intersection capacity overflow ---
-    // The global intersection array is sized at num_points * capacity_multiplier.
-    // If this overflows, some gaussian-tile intersections were dropped.
-    static bool overflow_warned = false;
-    static int iter_count_oc = 0;
-    iter_count_oc++;
-    bool num_points_changed = (num_points != g_tcache.fwd_num_points && g_tcache.fwd_num_points > 0);
-    if (!overflow_warned && g_tcache.overflow_flag.defined() && g_tcache.fwd_num_points > 0
-        && (num_points_changed || (iter_count_oc % 100) == 1)) {
-        ctx->syncCB();
-        int32_t flag_val = *g_tcache.overflow_flag.data<int32_t>();
-        if (flag_val > 0) {
-            fprintf(stderr, "WARNING: intersection capacity overflow (num_points * %lld exceeded). "
-                    "Increase capacity_multiplier or reduce gaussian count.\n",
-                    (long long)g_tcache.capacity_multiplier);
-            overflow_warned = true;
-        }
-    }
     int64_t capacity = (int64_t)num_points * g_tcache.capacity_multiplier;
     uint32_t channels = 3;
 
@@ -536,8 +525,6 @@ static void forward_pipeline(
     });
     auto cam_pos_arr = std::make_shared<std::array<float, 4>>(std::array<float, 4>{cam_pos[0], cam_pos[1], cam_pos[2], 0.0f});
     uint32_t num_points_u32 = (uint32_t)num_points;
-    uint32_t capacity_u32 = (uint32_t)capacity;
-    uint32_t prefix_N = (uint32_t)num_points;
     auto img_size_dim3 = std::make_shared<std::array<uint32_t, 4>>(std::array<uint32_t, 4>{img_width, img_height, 1, 0xDEAD});
     auto block_size_dim2 = std::make_shared<std::array<int32_t, 2>>(std::array<int32_t, 2>{RAST_BLOCK_X, RAST_BLOCK_Y});
 
@@ -553,8 +540,8 @@ static void forward_pipeline(
             fprintf(stderr, "  SH degree:      %u (bases: %u)\n", degree, (degree + 1) * (degree + 1));
             fprintf(stderr, "  features_rest:  [%lld x %lld x %lld]\n",
                 (long long)features_rest.size(0), (long long)features_rest.size(1), (long long)features_rest.size(2));
-            fprintf(stderr, "  sort:           global radix sort (no per-tile limit)\n");
-            fprintf(stderr, "  sort buffer:    %.1f MB (isect_ids + double-buffer)\n", (double)capacity * 20.0 / 1e6);
+            fprintf(stderr, "  sort:           hybrid per-tile bitonic (BITONIC_TG_CAP=2048)\n");
+            fprintf(stderr, "  sort buffer:    %.1f MB (isect_keys_unsorted)\n", (double)capacity * 8.0 / 1e6);
             fprintf(stderr, "  opacities:      [%lld]\n", (long long)opacities.size(0));
             fprintf(stderr, "===========================\n\n");
     }
@@ -585,108 +572,57 @@ static void forward_pipeline(
 
     auto encode_prefix_sort_pack = [&](id<MTLComputeCommandEncoder> enc) {
         uint32_t num_tiles_u32 = (uint32_t)num_tiles;
-        // 1. prefix_sum(num_tiles_hit → cum_tiles_hit)
-        //    Determines each Gaussian's write offset in the global intersection array.
-        if (num_points <= 1024) {
-            NSUInteger tg2 = MIN(ctx->prefix_sum_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)1024);
-            [enc setComputePipelineState:ctx->prefix_sum_kernel_cpso];
-            ENC_SCALAR(enc, prefix_N, 0); ENC_BUF(enc, num_tiles_hit, 1); ENC_BUF(enc, g_tcache.cum_tiles_hit, 2);
-            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg2, 1, 1)];
-        } else {
-            // Multi-threadgroup prefix sum: reduce → scan block totals → propagate
-            NSUInteger tg2 = 1024;
-            uint32_t num_blocks_ps = (prefix_N + 1023) / 1024;
-            [enc setComputePipelineState:ctx->block_reduce_kernel_cpso];
-            ENC_SCALAR(enc, prefix_N, 0); ENC_BUF(enc, num_tiles_hit, 1);
-            ENC_BUF(enc, g_tcache.block_totals, 2);
-            [enc dispatchThreadgroups:MTLSizeMake(num_blocks_ps, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg2, 1, 1)];
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            [enc setComputePipelineState:ctx->block_scan_propagate_kernel_cpso];
-            ENC_SCALAR(enc, prefix_N, 0); ENC_BUF(enc, num_tiles_hit, 1);
-            ENC_BUF(enc, g_tcache.cum_tiles_hit, 2); ENC_BUF(enc, g_tcache.block_totals, 3);
-            [enc dispatchThreadgroups:MTLSizeMake(num_blocks_ps, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg2, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-        // 2. map_gaussian_to_intersects — scatter (tile_id, depth) keys into global array
+        // 1. count_intersections — per-tile atomic counts
         {
-            NSUInteger tpg = MIN(ctx->map_gaussian_to_intersects_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
-            [enc setComputePipelineState:ctx->map_gaussian_to_intersects_kernel_cpso];
-            ENC_SCALAR(enc, num_points_u32, 0); ENC_BUF(enc, xys, 1); ENC_BUF(enc, depths, 2);
-            ENC_BUF(enc, radii_out, 3); ENC_BUF(enc, g_tcache.cum_tiles_hit, 4);
-            [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:5];
-            ENC_SCALAR(enc, capacity_u32, 6);
-            ENC_BUF(enc, g_tcache.isect_ids, 7); ENC_BUF(enc, gaussian_ids, 8);
-            ENC_BUF(enc, aabb, 9); ENC_BUF(enc, g_tcache.overflow_flag, 10);
+            NSUInteger tpg = MIN(ctx->count_intersections_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
+            [enc setComputePipelineState:ctx->count_intersections_kernel_cpso];
+            ENC_BUF(enc, xys, 0); ENC_BUF(enc, radii_out, 1); ENC_BUF(enc, depths, 2);
+            [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:3];
+            ENC_BUF(enc, g_tcache.tile_counts, 4);
+            ENC_SCALAR(enc, num_points_u32, 5); ENC_BUF(enc, aabb, 6);
             [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         }
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-        // 3. Radix sort — 4 passes (8 bits each, covering 32 effective key bits)
-        //    Sorts isect_ids (keys) and gaussian_ids (values) globally.
-        //    After sort, isect_ids are grouped by tile_id then ordered by depth.
+        // 2. prefix_sum_tiles — cooperative scan over tile_counts
         {
-            uint32_t num_radix_blocks = (capacity_u32 + 255) / 256;
-            // Pointers for double-buffering: swap after each pass
-            // Use isect_ids/gaussian_ids as input A, isect_ids_b/gaussian_ids_b as output B
-            // 4 passes = even number of swaps, so result ends in buffer A
-            MTensor* keys_in = &g_tcache.isect_ids;
-            MTensor* keys_out = &g_tcache.isect_ids_b;
-            MTensor* vals_in = &gaussian_ids;
-            MTensor* vals_out = &g_tcache.gaussian_ids_b;
-
-            for (uint32_t pass = 0; pass < 4; pass++) {
-                uint32_t shift = pass * 8;
-                // 3a. Histogram
-                [enc setComputePipelineState:ctx->radix_sort_histogram_kernel_cpso];
-                ENC_SCALAR(enc, capacity_u32, 0); ENC_BUF(enc, *keys_in, 1);
-                ENC_BUF(enc, g_tcache.radix_counts, 2); ENC_SCALAR(enc, shift, 3);
-                ENC_BUF(enc, g_tcache.cum_tiles_hit, 4); ENC_SCALAR(enc, num_points_u32, 5);
-                [enc dispatchThreadgroups:MTLSizeMake(num_radix_blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                // 3b. Scan (single threadgroup — scans histogram across all blocks)
-                [enc setComputePipelineState:ctx->radix_sort_scan_kernel_cpso];
-                ENC_BUF(enc, g_tcache.radix_counts, 0); ENC_SCALAR(enc, num_radix_blocks, 1);
-                ENC_BUF(enc, g_tcache.cum_tiles_hit, 2); ENC_SCALAR(enc, capacity_u32, 3);
-                ENC_SCALAR(enc, num_points_u32, 4);
-                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                // 3c. Scatter
-                [enc setComputePipelineState:ctx->radix_sort_scatter_kernel_cpso];
-                ENC_SCALAR(enc, capacity_u32, 0); ENC_BUF(enc, *keys_in, 1); ENC_BUF(enc, *vals_in, 2);
-                ENC_BUF(enc, *keys_out, 3); ENC_BUF(enc, *vals_out, 4);
-                ENC_BUF(enc, g_tcache.radix_counts, 5); ENC_SCALAR(enc, shift, 6);
-                ENC_BUF(enc, g_tcache.cum_tiles_hit, 7); ENC_SCALAR(enc, num_points_u32, 8);
-                [enc dispatchThreadgroups:MTLSizeMake(num_radix_blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                // Swap buffers for next pass
-                std::swap(keys_in, keys_out);
-                std::swap(vals_in, vals_out);
-            }
-            // After 4 passes (even), keys_in points back to isect_ids, vals_in to gaussian_ids
-        }
-
-        // 4. get_tile_bin_edges — find start/end indices per tile in sorted array
-        {
-            NSUInteger tpg = MIN(ctx->get_tile_bin_edges_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)capacity_u32);
-            [enc setComputePipelineState:ctx->get_tile_bin_edges_kernel_cpso];
-            ENC_SCALAR(enc, capacity_u32, 0); ENC_BUF(enc, g_tcache.isect_ids, 1);
-            ENC_BUF(enc, tile_bins, 2); ENC_BUF(enc, g_tcache.cum_tiles_hit, 3);
-            ENC_SCALAR(enc, num_points_u32, 4);
-            [enc dispatchThreads:MTLSizeMake(capacity_u32, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+            [enc setComputePipelineState:ctx->prefix_sum_tiles_kernel_cpso];
+            ENC_BUF(enc, g_tcache.tile_counts, 0);
+            ENC_BUF(enc, g_tcache.exact_offsets, 1);
+            ENC_BUF(enc, g_tcache.sort_offsets, 2);
+            ENC_BUF(enc, tile_bins, 3);
+            ENC_SCALAR(enc, num_tiles_u32, 4);
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
         }
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-        // 5. pack_sorted_gaussians — reorder per-Gaussian data into sorted order
+        // 3. scatter_intersections — write sort keys into per-tile buckets
         {
-            NSUInteger tpg = MIN(ctx->pack_sorted_gaussians_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)capacity_u32);
-            [enc setComputePipelineState:ctx->pack_sorted_gaussians_kernel_cpso];
-            ENC_BUF(enc, gaussian_ids, 0); ENC_BUF(enc, xys, 1); ENC_BUF(enc, conics, 2);
-            ENC_BUF(enc, colors, 3); ENC_BUF(enc, opacities, 4);
-            ENC_BUF(enc, packed_xy_opac, 5); ENC_BUF(enc, packed_conic, 6); ENC_BUF(enc, packed_rgb, 7);
-            ENC_SCALAR(enc, capacity_u32, 8); ENC_BUF(enc, g_tcache.cum_tiles_hit, 9);
-            ENC_SCALAR(enc, num_points_u32, 10);
-            [enc dispatchThreads:MTLSizeMake(capacity_u32, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+            NSUInteger tpg = MIN(ctx->scatter_intersections_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
+            [enc setComputePipelineState:ctx->scatter_intersections_kernel_cpso];
+            ENC_BUF(enc, xys, 0); ENC_BUF(enc, depths, 1); ENC_BUF(enc, radii_out, 2);
+            [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:3];
+            ENC_BUF(enc, g_tcache.sort_offsets, 4);
+            ENC_BUF(enc, g_tcache.tile_write_counters, 5);
+            ENC_BUF(enc, g_tcache.isect_keys_unsorted, 6);
+            ENC_SCALAR(enc, num_points_u32, 7); ENC_BUF(enc, aabb, 8);
+            [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        }
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // 4. hybrid_sort_pack — per-tile bitonic sort + pack into rasterizer buffers
+        {
+            [enc setComputePipelineState:ctx->hybrid_sort_pack_kernel_cpso];
+            ENC_BUF(enc, g_tcache.tile_counts, 0);
+            ENC_BUF(enc, g_tcache.sort_offsets, 1);
+            ENC_BUF(enc, g_tcache.exact_offsets, 2);
+            ENC_BUF(enc, g_tcache.isect_keys_unsorted, 3);
+            ENC_BUF(enc, xys, 4); ENC_BUF(enc, conics, 5);
+            ENC_BUF(enc, opacities, 6); ENC_BUF(enc, colors, 7);
+            ENC_BUF(enc, packed_xy_opac, 8); ENC_BUF(enc, packed_conic, 9);
+            ENC_BUF(enc, packed_rgb, 10); ENC_BUF(enc, gaussian_ids, 11);
+
+            [enc dispatchThreadgroups:MTLSizeMake(num_tiles, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
         }
     };
 
@@ -802,10 +738,10 @@ static void forward_pipeline(
             // Blit-zero buffers that accumulate across gaussians (must be GPU-side
             // to avoid racing with previous CB's reads on pipelined execution)
             id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
-            // tile_bins written by sort kernel, tile_counts no longer used
             [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
-            [blit fillBuffer:g_tcache.overflow_flag.buffer() range:NSMakeRange(0, g_tcache.overflow_flag.nbytes()) value:0];
-            [blit fillBuffer:tile_bins.buffer() range:NSMakeRange(0, tile_bins.nbytes()) value:0];
+            // tile_counts and tile_write_counters are atomically incremented by kernels 1 and 3
+            [blit fillBuffer:g_tcache.tile_counts.buffer() range:NSMakeRange(0, g_tcache.tile_counts.nbytes()) value:0];
+            [blit fillBuffer:g_tcache.tile_write_counters.buffer() range:NSMakeRange(0, g_tcache.tile_write_counters.nbytes()) value:0];
             [blit endEncoding];
 
             id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
@@ -868,22 +804,6 @@ std::tuple<MTensor, float> msplat_train_step(
     int tile_bounds_y = std::get<1>(tile_bounds);
     int num_tiles = tile_bounds_x * tile_bounds_y;
 
-    // --- Overflow check: detect intersection capacity overflow ---
-    static bool overflow_warned = false;
-    static int iter_count_oc = 0;
-    iter_count_oc++;
-    bool num_points_changed = (num_points != g_tcache.fwd_num_points && g_tcache.fwd_num_points > 0);
-    if (!overflow_warned && g_tcache.overflow_flag.defined() && g_tcache.fwd_num_points > 0
-        && (num_points_changed || (iter_count_oc % 100) == 1)) {
-        ctx->syncCB();
-        int32_t flag_val = *g_tcache.overflow_flag.data<int32_t>();
-        if (flag_val > 0) {
-            fprintf(stderr, "WARNING: intersection capacity overflow (num_points * %lld exceeded). "
-                    "Increase capacity_multiplier or reduce gaussian count.\n",
-                    (long long)g_tcache.capacity_multiplier);
-            overflow_warned = true;
-        }
-    }
     int64_t capacity = (int64_t)num_points * g_tcache.capacity_multiplier;
     uint32_t channels = 3;
 
@@ -935,8 +855,6 @@ std::tuple<MTensor, float> msplat_train_step(
     });
     auto cam_pos_arr = std::make_shared<std::array<float, 4>>(std::array<float, 4>{cam_pos[0], cam_pos[1], cam_pos[2], 0.0f});
     uint32_t num_points_u32 = (uint32_t)num_points;
-    uint32_t capacity_u32 = (uint32_t)capacity;
-    uint32_t prefix_N = (uint32_t)num_points;
     auto img_size_dim3 = std::make_shared<std::array<uint32_t, 4>>(std::array<uint32_t, 4>{img_width, img_height, 1, 0xDEAD});
     auto block_size_dim2 = std::make_shared<std::array<int32_t, 2>>(std::array<int32_t, 2>{RAST_BLOCK_X, RAST_BLOCK_Y});
     // tile_bounds for rasterize kernels must be 16x16 tile counts (tile_bins granularity)
@@ -995,91 +913,56 @@ std::tuple<MTensor, float> msplat_train_step(
 
     auto encode_prefix_sort_pack = [&](id<MTLComputeCommandEncoder> enc) {
         uint32_t num_tiles_u32 = (uint32_t)num_tiles;
-        // 1. prefix_sum(num_tiles_hit → cum_tiles_hit)
-        if (num_points <= 1024) {
-            NSUInteger tg2 = MIN(ctx->prefix_sum_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)1024);
-            [enc setComputePipelineState:ctx->prefix_sum_kernel_cpso];
-            ENC_SCALAR(enc, prefix_N, 0); ENC_BUF(enc, num_tiles_hit, 1); ENC_BUF(enc, g_tcache.cum_tiles_hit, 2);
-            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg2, 1, 1)];
-        } else {
-            NSUInteger tg2 = 1024;
-            uint32_t num_blocks_ps = (prefix_N + 1023) / 1024;
-            [enc setComputePipelineState:ctx->block_reduce_kernel_cpso];
-            ENC_SCALAR(enc, prefix_N, 0); ENC_BUF(enc, num_tiles_hit, 1);
-            ENC_BUF(enc, g_tcache.block_totals, 2);
-            [enc dispatchThreadgroups:MTLSizeMake(num_blocks_ps, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg2, 1, 1)];
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            [enc setComputePipelineState:ctx->block_scan_propagate_kernel_cpso];
-            ENC_SCALAR(enc, prefix_N, 0); ENC_BUF(enc, num_tiles_hit, 1);
-            ENC_BUF(enc, g_tcache.cum_tiles_hit, 2); ENC_BUF(enc, g_tcache.block_totals, 3);
-            [enc dispatchThreadgroups:MTLSizeMake(num_blocks_ps, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg2, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        // 2. map_gaussian_to_intersects
+        // 1. count_intersections — per-tile atomic counts
         {
-            NSUInteger tpg = MIN(ctx->map_gaussian_to_intersects_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
-            [enc setComputePipelineState:ctx->map_gaussian_to_intersects_kernel_cpso];
-            ENC_SCALAR(enc, num_points_u32, 0); ENC_BUF(enc, xys, 1); ENC_BUF(enc, depths, 2);
-            ENC_BUF(enc, radii_out, 3); ENC_BUF(enc, g_tcache.cum_tiles_hit, 4);
-            [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:5];
-            ENC_SCALAR(enc, capacity_u32, 6);
-            ENC_BUF(enc, g_tcache.isect_ids, 7); ENC_BUF(enc, gaussian_ids, 8);
-            ENC_BUF(enc, aabb, 9); ENC_BUF(enc, g_tcache.overflow_flag, 10);
+            NSUInteger tpg = MIN(ctx->count_intersections_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
+            [enc setComputePipelineState:ctx->count_intersections_kernel_cpso];
+            ENC_BUF(enc, xys, 0); ENC_BUF(enc, radii_out, 1); ENC_BUF(enc, depths, 2);
+            [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:3];
+            ENC_BUF(enc, g_tcache.tile_counts, 4);
+            ENC_SCALAR(enc, num_points_u32, 5); ENC_BUF(enc, aabb, 6);
             [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         }
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        // 3. Radix sort — 4 passes
+
+        // 2. prefix_sum_tiles — cooperative scan over tile_counts
         {
-            uint32_t num_radix_blocks = (capacity_u32 + 255) / 256;
-            MTensor* keys_in = &g_tcache.isect_ids;
-            MTensor* keys_out = &g_tcache.isect_ids_b;
-            MTensor* vals_in = &gaussian_ids;
-            MTensor* vals_out = &g_tcache.gaussian_ids_b;
-            for (uint32_t pass = 0; pass < 4; pass++) {
-                uint32_t shift = pass * 8;
-                [enc setComputePipelineState:ctx->radix_sort_histogram_kernel_cpso];
-                ENC_SCALAR(enc, capacity_u32, 0); ENC_BUF(enc, *keys_in, 1);
-                ENC_BUF(enc, g_tcache.radix_counts, 2); ENC_SCALAR(enc, shift, 3);
-                ENC_BUF(enc, g_tcache.cum_tiles_hit, 4); ENC_SCALAR(enc, num_points_u32, 5);
-                [enc dispatchThreadgroups:MTLSizeMake(num_radix_blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                [enc setComputePipelineState:ctx->radix_sort_scan_kernel_cpso];
-                ENC_BUF(enc, g_tcache.radix_counts, 0); ENC_SCALAR(enc, num_radix_blocks, 1);
-                ENC_BUF(enc, g_tcache.cum_tiles_hit, 2); ENC_SCALAR(enc, capacity_u32, 3);
-                ENC_SCALAR(enc, num_points_u32, 4);
-                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                [enc setComputePipelineState:ctx->radix_sort_scatter_kernel_cpso];
-                ENC_SCALAR(enc, capacity_u32, 0); ENC_BUF(enc, *keys_in, 1); ENC_BUF(enc, *vals_in, 2);
-                ENC_BUF(enc, *keys_out, 3); ENC_BUF(enc, *vals_out, 4);
-                ENC_BUF(enc, g_tcache.radix_counts, 5); ENC_SCALAR(enc, shift, 6);
-                ENC_BUF(enc, g_tcache.cum_tiles_hit, 7); ENC_SCALAR(enc, num_points_u32, 8);
-                [enc dispatchThreadgroups:MTLSizeMake(num_radix_blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                std::swap(keys_in, keys_out);
-                std::swap(vals_in, vals_out);
-            }
-        }
-        // 4. get_tile_bin_edges
-        {
-            NSUInteger tpg = MIN(ctx->get_tile_bin_edges_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)capacity_u32);
-            [enc setComputePipelineState:ctx->get_tile_bin_edges_kernel_cpso];
-            ENC_SCALAR(enc, capacity_u32, 0); ENC_BUF(enc, g_tcache.isect_ids, 1);
-            ENC_BUF(enc, tile_bins, 2); ENC_BUF(enc, g_tcache.cum_tiles_hit, 3);
-            ENC_SCALAR(enc, num_points_u32, 4);
-            [enc dispatchThreads:MTLSizeMake(capacity_u32, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+            [enc setComputePipelineState:ctx->prefix_sum_tiles_kernel_cpso];
+            ENC_BUF(enc, g_tcache.tile_counts, 0);
+            ENC_BUF(enc, g_tcache.exact_offsets, 1);
+            ENC_BUF(enc, g_tcache.sort_offsets, 2);
+            ENC_BUF(enc, tile_bins, 3);
+            ENC_SCALAR(enc, num_tiles_u32, 4);
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
         }
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        // 5. pack_sorted_gaussians
+
+        // 3. scatter_intersections — write sort keys into per-tile buckets
         {
-            NSUInteger tpg = MIN(ctx->pack_sorted_gaussians_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)capacity_u32);
-            [enc setComputePipelineState:ctx->pack_sorted_gaussians_kernel_cpso];
-            ENC_BUF(enc, gaussian_ids, 0); ENC_BUF(enc, xys, 1); ENC_BUF(enc, conics, 2);
-            ENC_BUF(enc, colors, 3); ENC_BUF(enc, opacities, 4);
-            ENC_BUF(enc, packed_xy_opac, 5); ENC_BUF(enc, packed_conic, 6); ENC_BUF(enc, packed_rgb, 7);
-            ENC_SCALAR(enc, capacity_u32, 8); ENC_BUF(enc, g_tcache.cum_tiles_hit, 9);
-            ENC_SCALAR(enc, num_points_u32, 10);
-            [enc dispatchThreads:MTLSizeMake(capacity_u32, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+            NSUInteger tpg = MIN(ctx->scatter_intersections_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
+            [enc setComputePipelineState:ctx->scatter_intersections_kernel_cpso];
+            ENC_BUF(enc, xys, 0); ENC_BUF(enc, depths, 1); ENC_BUF(enc, radii_out, 2);
+            [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:3];
+            ENC_BUF(enc, g_tcache.sort_offsets, 4);
+            ENC_BUF(enc, g_tcache.tile_write_counters, 5);
+            ENC_BUF(enc, g_tcache.isect_keys_unsorted, 6);
+            ENC_SCALAR(enc, num_points_u32, 7); ENC_BUF(enc, aabb, 8);
+            [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        }
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // 4. hybrid_sort_pack — per-tile bitonic sort + pack into rasterizer buffers
+        {
+            [enc setComputePipelineState:ctx->hybrid_sort_pack_kernel_cpso];
+            ENC_BUF(enc, g_tcache.tile_counts, 0);
+            ENC_BUF(enc, g_tcache.sort_offsets, 1);
+            ENC_BUF(enc, g_tcache.exact_offsets, 2);
+            ENC_BUF(enc, g_tcache.isect_keys_unsorted, 3);
+            ENC_BUF(enc, xys, 4); ENC_BUF(enc, conics, 5);
+            ENC_BUF(enc, opacities, 6); ENC_BUF(enc, colors, 7);
+            ENC_BUF(enc, packed_xy_opac, 8); ENC_BUF(enc, packed_conic, 9);
+            ENC_BUF(enc, packed_rgb, 10); ENC_BUF(enc, gaussian_ids, 11);
+            [enc dispatchThreadgroups:MTLSizeMake(num_tiles, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
         }
     };
 
@@ -1275,8 +1158,9 @@ std::tuple<MTensor, float> msplat_train_step(
     auto do_blit_zero = [&](id<MTLCommandBuffer> cb) {
         id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
         [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
-        [blit fillBuffer:g_tcache.overflow_flag.buffer() range:NSMakeRange(0, g_tcache.overflow_flag.nbytes()) value:0];
-        [blit fillBuffer:tile_bins.buffer() range:NSMakeRange(0, tile_bins.nbytes()) value:0];
+        // tile_counts and tile_write_counters are atomically incremented by kernels 1 and 3
+        [blit fillBuffer:g_tcache.tile_counts.buffer() range:NSMakeRange(0, g_tcache.tile_counts.nbytes()) value:0];
+        [blit fillBuffer:g_tcache.tile_write_counters.buffer() range:NSMakeRange(0, g_tcache.tile_write_counters.nbytes()) value:0];
         [blit fillBuffer:v_xy.buffer() range:NSMakeRange(0, v_xy.nbytes()) value:0];
         [blit fillBuffer:v_conic.buffer() range:NSMakeRange(0, v_conic.nbytes()) value:0];
         [blit fillBuffer:v_colors_rast.buffer() range:NSMakeRange(0, v_colors_rast.nbytes()) value:0];

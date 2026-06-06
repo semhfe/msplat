@@ -2153,6 +2153,321 @@ kernel void radix_sort_scatter_kernel(
     }
 }
 
+// ===== Hybrid Per-Tile Bitonic Sort Kernels =====
+// Replaces the 16-dispatch global radix sort with a 4-dispatch group-then-sort pipeline.
+// Architecture: count → prefix_sum → scatter → hybrid_sort_pack
+// MSPLAT_SORT_KERNELS_VERSION = "hybrid-v2-2026-06"
+constant constexpr int MSPLAT_SORT_KERNELS_VERSION = 0x20260600;
+
+#define BITONIC_TG_CAP 2048u
+#define HYBRID_SORT_TG_THREADS 1024u
+constant constexpr uint64_t SORT_KEY_SENTINEL = 0xFFFFFFFFFFFFFFFFULL;
+
+// --- Helper functions ---
+
+inline uint next_pow2(uint x) {
+    if (x <= 1u) return 1u;  // explicit: avoids clz(0) which is undefined
+    return 1u << (32u - clz(x - 1u));
+}
+
+inline uint pad_count(uint c) {
+    if (c == 0u) return 0u;  // empty tiles stay empty — no padding, no slot
+    return next_pow2(max(c, 32u));
+}
+
+inline uint64_t make_sort_key(float depth, uint gaussian_id) {
+    // Reinterpreting a positive IEEE float as uint preserves ordering.
+    // (smaller float → smaller uint for non-negative values)
+    uint depth_u = as_type<uint>(depth);
+    return (uint64_t(depth_u) << 32) | uint64_t(gaussian_id);
+}
+
+// Shared filter: must be identical in count and scatter kernels to avoid
+// count mismatches. Uses aabb extents (matching project_and_sh_forward_kernel).
+inline bool gaussian_is_active(
+    uint gid,
+    constant int* radii,
+    constant float* depths
+) {
+    if (radii[gid] <= 0) return false;
+    float d = depths[gid];
+    if (!isfinite(d) || d <= 0.0f) return false;
+    return true;
+}
+
+// Hillis-Steele exclusive scan over threadgroup memory.
+// Operates on exactly HYBRID_SORT_TG_THREADS (1024) elements.
+inline void exclusive_scan_hillis_steele(
+    threadgroup uint* data,
+    uint tid
+) {
+    // Convert inclusive → exclusive at the end.
+    // First, compute inclusive scan (Hillis-Steele up-sweep).
+    for (uint offset = 1; offset < HYBRID_SORT_TG_THREADS; offset <<= 1) {
+        uint val = 0;
+        if (tid >= offset) {
+            val = data[tid - offset];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid >= offset) {
+            data[tid] += val;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // Convert inclusive to exclusive: shift right by 1, slot 0 = 0.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint prev = (tid == 0) ? 0u : data[tid - 1];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    data[tid] = prev;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// Bitonic sort in threadgroup memory. n must be a power of 2.
+inline void bitonic_sort_tg(threadgroup uint64_t* a, uint n, uint tid) {
+    for (uint k = 2; k <= n; k <<= 1) {
+        for (uint j = k >> 1; j > 0; j >>= 1) {
+            for (uint idx = tid; idx < n; idx += HYBRID_SORT_TG_THREADS) {
+                uint ixj = idx ^ j;
+                if (ixj > idx) {
+                    bool ascending = ((idx & k) == 0);
+                    uint64_t va = a[idx], vb = a[ixj];
+                    if ((va > vb) == ascending) { a[idx] = vb; a[ixj] = va; }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+// Bitonic sort in device memory. n must be a power of 2.
+inline void bitonic_sort_device(device uint64_t* a, uint n, uint tid) {
+    for (uint k = 2; k <= n; k <<= 1) {
+        for (uint j = k >> 1; j > 0; j >>= 1) {
+            for (uint idx = tid; idx < n; idx += HYBRID_SORT_TG_THREADS) {
+                uint ixj = idx ^ j;
+                if (ixj > idx) {
+                    bool ascending = ((idx & k) == 0);
+                    uint64_t va = a[idx], vb = a[ixj];
+                    if ((va > vb) == ascending) { a[idx] = vb; a[ixj] = va; }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_device);
+        }
+    }
+}
+
+// --- Kernel 1: count_intersections_kernel ---
+// One thread per Gaussian. Atomically counts per-tile intersections.
+
+kernel void count_intersections_kernel(
+    constant float*       xys            [[buffer(0)]],    // float2, packed
+    constant int*         radii          [[buffer(1)]],
+    constant float*       depths         [[buffer(2)]],
+    constant uint3&       tile_bounds    [[buffer(3)]],
+    device   atomic_uint* tile_counts    [[buffer(4)]],
+    constant uint&        num_points     [[buffer(5)]],
+    constant float*       aabb           [[buffer(6)]],    // float2: per-axis pixel extents
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= num_points) return;
+    if (!gaussian_is_active(gid, radii, depths)) return;
+
+    float2 center = read_packed_float2(xys, gid);
+    uint2 tile_min, tile_max;
+    get_tile_bbox(center, read_packed_float2(aabb, gid), (int3)tile_bounds, tile_min, tile_max);
+
+    for (uint y = tile_min.y; y < tile_max.y; ++y) {
+        for (uint x = tile_min.x; x < tile_max.x; ++x) {
+            uint tile_id = y * tile_bounds.x + x;
+            atomic_fetch_add_explicit(&tile_counts[tile_id], 1u, memory_order_relaxed);
+        }
+    }
+}
+
+// --- Kernel 2: prefix_sum_tiles_kernel ---
+// Single threadgroup, 1024 threads. Cooperative strided scan over tile_counts.
+// Handles up to 1024 * MAX_STRIDE tiles (practically unlimited).
+
+kernel void prefix_sum_tiles_kernel(
+    constant uint*   tile_counts_in     [[buffer(0)]],   // size num_tiles
+    device   uint*   exact_offsets      [[buffer(1)]],   // size num_tiles
+    device   uint*   sort_offsets       [[buffer(2)]],   // size num_tiles + 1
+    device   int*    tile_bins          [[buffer(3)]],   // int2, size num_tiles
+    constant uint&   num_tiles          [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    // Allocate threadgroup memory for the scan.
+    threadgroup uint tg_exact_scan[HYBRID_SORT_TG_THREADS];
+    threadgroup uint tg_padded_scan[HYBRID_SORT_TG_THREADS];
+
+    // Stride: each thread covers ceil(num_tiles / 1024) tiles.
+    uint stride = (num_tiles + HYBRID_SORT_TG_THREADS - 1) / HYBRID_SORT_TG_THREADS;
+
+    // Phase A: each thread sums its strided chunk (exact and padded).
+    uint local_sum_exact  = 0;
+    uint local_sum_padded = 0;
+    for (uint s = 0; s < stride; ++s) {
+        uint t = tid + s * HYBRID_SORT_TG_THREADS;
+        if (t < num_tiles) {
+            uint c = tile_counts_in[t];
+            local_sum_exact  += c;
+            local_sum_padded += pad_count(c);
+        }
+    }
+    tg_exact_scan[tid]  = local_sum_exact;
+    tg_padded_scan[tid] = local_sum_padded;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase B: exclusive scan over the 1024 chunk-sums (Hillis-Steele).
+    exclusive_scan_hillis_steele(tg_exact_scan, tid);
+    exclusive_scan_hillis_steele(tg_padded_scan, tid);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase C: each thread walks its chunk again, writing out the final offsets.
+    uint carry_exact  = tg_exact_scan[tid];
+    uint carry_padded = tg_padded_scan[tid];
+    for (uint s = 0; s < stride; ++s) {
+        uint t = tid + s * HYBRID_SORT_TG_THREADS;
+        if (t < num_tiles) {
+            uint c = tile_counts_in[t];
+            exact_offsets[t] = carry_exact;
+            sort_offsets[t]  = carry_padded;
+            write_packed_int2(tile_bins, t, int2(int(carry_exact), int(carry_exact + c)));
+            carry_exact  += c;
+            carry_padded += pad_count(c);
+        }
+    }
+
+    // Write trailing slot: sort_offsets[num_tiles] = grand total of padded sizes.
+    // The last-active thread (tid holding the final tile) writes its carry.
+    // Use threadgroup-shared variable for deterministic write.
+    threadgroup uint grand_total_padded;
+    threadgroup uint grand_total_exact;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Thread that owns the last tile writes the grand total.
+    uint last_tile = num_tiles - 1;
+    uint owner_tid = last_tile % HYBRID_SORT_TG_THREADS;
+    if (tid == owner_tid && num_tiles > 0) {
+        grand_total_padded = carry_padded;
+        grand_total_exact  = carry_exact;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        sort_offsets[num_tiles] = (num_tiles > 0) ? grand_total_padded : 0;
+    }
+}
+
+// --- Kernel 3: scatter_intersections_kernel ---
+// One thread per Gaussian. Scatters sort keys into per-tile buckets.
+
+kernel void scatter_intersections_kernel(
+    constant float*       xys            [[buffer(0)]],    // float2, packed
+    constant float*       depths         [[buffer(1)]],
+    constant int*         radii          [[buffer(2)]],
+    constant uint3&       tile_bounds    [[buffer(3)]],
+    constant uint*        sort_offsets   [[buffer(4)]],
+    device   atomic_uint* tile_write_counters [[buffer(5)]],
+    device   uint64_t*    isect_keys_unsorted [[buffer(6)]],
+    constant uint&        num_points     [[buffer(7)]],
+    constant float*       aabb           [[buffer(8)]],    // float2: per-axis pixel extents
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= num_points) return;
+    if (!gaussian_is_active(gid, radii, depths)) return;
+
+    float d = depths[gid];
+    uint64_t key = make_sort_key(d, gid);
+
+    float2 center = read_packed_float2(xys, gid);
+    uint2 tile_min, tile_max;
+    get_tile_bbox(center, read_packed_float2(aabb, gid), (int3)tile_bounds, tile_min, tile_max);
+
+    for (uint y = tile_min.y; y < tile_max.y; ++y) {
+        for (uint x = tile_min.x; x < tile_max.x; ++x) {
+            uint tile_id = y * tile_bounds.x + x;
+            uint pos = atomic_fetch_add_explicit(&tile_write_counters[tile_id], 1u, memory_order_relaxed);
+            isect_keys_unsorted[sort_offsets[tile_id] + pos] = key;
+        }
+    }
+}
+
+// --- Kernel 4: hybrid_sort_pack_kernel ---
+// One threadgroup per tile. Bitonic sort (threadgroup mem for sparse, device mem for dense),
+// then pack results into rasterizer-consumed output arrays.
+
+kernel void hybrid_sort_pack_kernel(
+    constant uint*      tile_counts_in       [[buffer(0)]],
+    constant uint*      sort_offsets         [[buffer(1)]],   // size num_tiles+1
+    constant uint*      exact_offsets        [[buffer(2)]],
+    device   uint64_t*  isect_keys_unsorted  [[buffer(3)]],
+    constant float*     xys_in               [[buffer(4)]],   // float2, packed
+    constant float*     conics_in            [[buffer(5)]],   // float3, packed
+    constant float*     opacities_in         [[buffer(6)]],
+    constant float*     colors_in            [[buffer(7)]],   // float3, packed (raw SH)
+    device   float*     packed_xy_opac       [[buffer(8)]],   // float3, packed
+    device   float*     packed_conic         [[buffer(9)]],   // float3, packed
+    device   float*     packed_rgb           [[buffer(10)]],  // float3, packed
+    device   int*       gaussian_ids         [[buffer(11)]],
+    uint tg_id [[threadgroup_position_in_grid]],
+    uint tid   [[thread_position_in_threadgroup]]
+) {
+    uint count  = tile_counts_in[tg_id];
+    if (count == 0) return;
+    uint padded = sort_offsets[tg_id + 1] - sort_offsets[tg_id];
+    uint src    = sort_offsets[tg_id];
+    uint dst    = exact_offsets[tg_id];
+
+    if (count <= BITONIC_TG_CAP) {
+        // ----- Sparse path: bitonic in threadgroup memory -----
+        threadgroup uint64_t tg_data[BITONIC_TG_CAP];
+
+        // Load keys into threadgroup memory, padding with UINT64_MAX
+        for (uint i = tid; i < padded; i += HYBRID_SORT_TG_THREADS) {
+            tg_data[i] = (i < count) ? isect_keys_unsorted[src + i] : SORT_KEY_SENTINEL;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        bitonic_sort_tg(tg_data, padded, tid);
+
+        // Pack sorted results into output arrays
+        for (uint i = tid; i < count; i += HYBRID_SORT_TG_THREADS) {
+            uint gidx = uint(tg_data[i] & 0xFFFFFFFFu);
+            uint d = dst + i;
+            gaussian_ids[d] = int(gidx);
+            float2 xy = read_packed_float2(xys_in, gidx);
+            float opac = 1.f / (1.f + exp(-opacities_in[gidx]));
+            write_packed_float3(packed_xy_opac, d, float3(xy.x, xy.y, opac));
+            write_packed_float3(packed_conic, d, read_packed_float3(conics_in, gidx));
+            write_packed_float3(packed_rgb, d, read_packed_float3(colors_in, gidx));
+        }
+    } else {
+        // ----- Dense path: bitonic in device memory -----
+        device uint64_t* arr = isect_keys_unsorted + src;
+
+        // Initialize padding slots with UINT64_MAX
+        for (uint i = tid + count; i < padded; i += HYBRID_SORT_TG_THREADS) {
+            arr[i] = SORT_KEY_SENTINEL;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+
+        bitonic_sort_device(arr, padded, tid);
+
+        // Pack sorted results into output arrays
+        for (uint i = tid; i < count; i += HYBRID_SORT_TG_THREADS) {
+            uint gidx = uint(arr[i] & 0xFFFFFFFFu);
+            uint d = dst + i;
+            gaussian_ids[d] = int(gidx);
+            float2 xy = read_packed_float2(xys_in, gidx);
+            float opac = 1.f / (1.f + exp(-opacities_in[gidx]));
+            write_packed_float3(packed_xy_opac, d, float3(xy.x, xy.y, opac));
+            write_packed_float3(packed_conic, d, read_packed_float3(conics_in, gidx));
+            write_packed_float3(packed_rgb, d, read_packed_float3(colors_in, gidx));
+        }
+    }
+}
+
 // ===== Prefix Sum Kernel =====
 // Single-dispatch inclusive prefix sum (cumsum) for int32 arrays.
 // Uses one threadgroup: each thread serially sums its chunk, thread 0 scans
