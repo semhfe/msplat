@@ -12,6 +12,7 @@
 #include "loaders.hpp"
 #include "msplat.hpp"
 #include "bindings.h"
+#import <Foundation/Foundation.h>
 
 namespace fs = std::filesystem;
 
@@ -147,6 +148,7 @@ int main(int argc, char *argv[]) {
 
         auto bench_start = cpu_now();
         for (; step <= (size_t)numIters; step++) {
+            @autoreleasepool {
             Camera &cam = cams[camsIter.next()];
 
             auto iter_start = cpu_now();
@@ -162,13 +164,14 @@ int main(int argc, char *argv[]) {
                 log_memory(buf);
             }
             if (step % 1000 == 0 || step == 1) {
+                msplat_gpu_sync();          // make this one print-step a true single-iteration timing
                 auto iter_end_time = cpu_now();
                 double ms = std::chrono::duration_cast<std::chrono::microseconds>(
                     iter_end_time - iter_start).count() / 1000.0;
                 std::cout << "step=" << step
                           << " splats=" << model.means.size(0)
                           << " " << std::fixed << std::setprecision(1)
-                          << ms << "ms/step" << std::endl;
+                          << ms << "ms/step (single-iter, gpu-synced)" << std::endl;
             }
 
             if (benchmarking && step > (size_t)bench_warmup) {
@@ -199,6 +202,7 @@ int main(int argc, char *argv[]) {
                 memcpy(valImg.ptr(), rgb_cpu.data_ptr(), valImg.data.size() * sizeof(float));
                 imwriteRGB((fs::path(valRender) / (std::to_string(step) + ".png")).string(), valImg);
             }
+            } // @autoreleasepool
         }
 
         if (benchmarking && !bench_iter_ms.empty()) {
