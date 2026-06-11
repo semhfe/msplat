@@ -98,12 +98,35 @@ void autoScaleAndCenter(InputData &data) {
     }
 
     // Compute scale from max absolute camera position
-    float maxAbs = 0;
+    float maxAbsCam = 0;
     for (auto &cam : data.cameras) {
-        maxAbs = std::max(maxAbs, std::abs(cam.camToWorld[3]));
-        maxAbs = std::max(maxAbs, std::abs(cam.camToWorld[7]));
-        maxAbs = std::max(maxAbs, std::abs(cam.camToWorld[11]));
+        maxAbsCam = std::max(maxAbsCam, std::abs(cam.camToWorld[3]));
+        maxAbsCam = std::max(maxAbsCam, std::abs(cam.camToWorld[7]));
+        maxAbsCam = std::max(maxAbsCam, std::abs(cam.camToWorld[11]));
     }
+
+    // Phase 2.2: Content-anchored training scale in msplat
+    // Compute robust point-cloud extent (95th-percentile distance of SfM points from camera centroid)
+    float maxAbsPts = maxAbsCam;
+    if (data.points.count > 0) {
+        std::vector<float> ptDists;
+        ptDists.reserve(data.points.count);
+        for (int64_t i = 0; i < data.points.count; i++) {
+            float dx = std::abs(data.points.xyz[i*3+0] - mean[0]);
+            float dy = std::abs(data.points.xyz[i*3+1] - mean[1]);
+            float dz = std::abs(data.points.xyz[i*3+2] - mean[2]);
+            float maxD = std::max({dx, dy, dz});
+            ptDists.push_back(maxD);
+        }
+        std::sort(ptDists.begin(), ptDists.end());
+        int p95_idx = std::min((int)(data.points.count * 0.95), (int)data.points.count - 1);
+        float p95_dist = ptDists[p95_idx];
+        
+        // Clamped to <= the current camera max-abs (so forward-facing unchanged)
+        maxAbsPts = std::min(maxAbsCam, p95_dist);
+    }
+
+    float maxAbs = maxAbsPts;
     data.scale = (maxAbs > 0) ? (1.0f / maxAbs) : 1.0f;
 
     // Apply scale to camera positions

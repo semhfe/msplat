@@ -142,6 +142,9 @@ Model::Model(const InputData &inputData, int numCameras,
     backgroundColor = gpu_empty({3}, DType::Float32);
     static const float defaultBg[3] = {0.6130f, 0.0101f, 0.3984f};
     memcpy(backgroundColor.data_ptr(), bgColor ? bgColor : defaultBg, 3 * sizeof(float));
+    // Training uses per-step random background (reference MCMC behavior).
+    // Prevents Gaussians from baking the fixed bg color into opacity.
+    trainBgColor = gpu_empty({3}, DType::Float32);
     setupOptimizers();
 }
 
@@ -155,7 +158,20 @@ void Model::setupOptimizers(){
     // Bug fix: when COLMAP produces more 3D points than cap_max, clamp so the
     // memcpy in allocBuf never writes past the cap_max-sized buffer.
     int64_t rows_to_copy = std::min((int64_t)num_active, (int64_t)cap_max);
-    if (num_active > cap_max) {
+    std::vector<int64_t> keep_indices;
+    if (num_active > cap_max * 0.75) {
+        std::cerr << "[mcmc] init points (" << num_active
+                  << ") > 75% of cap_max=" << cap_max
+                  << "; randomly subsampling to 50% cap_max for growth headroom\n";
+        rows_to_copy = cap_max * 0.5;
+        keep_indices.resize(num_active);
+        for(int i=0; i<num_active; ++i) keep_indices[i] = i;
+        std::mt19937 rng(42);
+        std::shuffle(keep_indices.begin(), keep_indices.end(), rng);
+        keep_indices.resize(rows_to_copy);
+        std::sort(keep_indices.begin(), keep_indices.end());
+        num_active = rows_to_copy;
+    } else if (num_active > cap_max) {
         std::cerr << "[mcmc] init points (" << num_active
                   << ") exceed cap_max=" << cap_max
                   << "; truncating to cap_max\n";
@@ -166,9 +182,16 @@ void Model::setupOptimizers(){
         auto shape = param.shape();
         shape[0] = buf_capacity;
         buf = gpu_zeros(shape, DType::Float32);
-        // Copy only rows_to_copy rows (param may have more rows than cap_max).
         size_t row_bytes = param.nbytes() / (size_t)param.size(0);
-        memcpy(buf.data_ptr(), param.data_ptr(), (size_t)rows_to_copy * row_bytes);
+        if (keep_indices.empty()) {
+            memcpy(buf.data_ptr(), param.data_ptr(), (size_t)rows_to_copy * row_bytes);
+        } else {
+            const char* src = (const char*)param.data_ptr();
+            char* dst = (char*)buf.data_ptr();
+            for (int64_t i = 0; i < rows_to_copy; i++) {
+                memcpy(dst + i * row_bytes, src + keep_indices[i] * row_bytes, row_bytes);
+            }
+        }
     };
     allocBuf(means_buf, means);
     allocBuf(scales_buf, scales);
@@ -686,6 +709,19 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
         memcpy(window2d.data_ptr(), w.data(), w.size() * sizeof(float));
     }
 
+    // Per-step random background (reference 3DGS-MCMC behavior).
+    // Forces Gaussians to learn proper transparency at edges rather than
+    // blending to match a fixed background color in their opacity.
+    {
+        float rgb[3];
+        uint32_t seed = (uint32_t)step * 0x9E3779B9u;
+        for (int i = 0; i < 3; i++) {
+            seed ^= seed >> 16; seed *= 0x45d9f3bu; seed ^= seed >> 16;
+            rgb[i] = (float)(seed & 0xFFFF) / 65535.0f;
+        }
+        memcpy(trainBgColor.data_ptr(), rgb, 3 * sizeof(float));
+    }
+
     adam_step_count++;
     float bc1 = 1.0f - std::pow(adam_beta1, adam_step_count);
     float bc2 = 1.0f - std::pow(adam_beta2, adam_step_count);
@@ -708,7 +744,7 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
         quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
         s.height, s.width, s.tileBounds, 0.01f,
         s.degree, s.degreesToUse, s.cam_pos, featuresDc, featuresRest,
-        opacities, backgroundColor, gt, window2d, ssimWeight,
+        opacities, trainBgColor, gt, window2d, ssimWeight,
         lossInvN, (int)featuresRest.size(-2),
         N_ADAM_GROUPS,
         adam_p, adam_ea, adam_eas,
