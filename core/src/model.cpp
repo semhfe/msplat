@@ -2,6 +2,7 @@
 #include <fstream>
 #include <iostream>
 #include <random>
+#include <cmath>
 #include "model.hpp"
 #include "kdtree_tensor.hpp"
 #include "msplat.hpp"
@@ -294,9 +295,17 @@ void Model::relocate(const std::vector<int>& dead, const std::vector<int>& alive
     };
 
     // Weighted sample of source alive-indices, one per dead slot.
+    // Non-finite weights are UB for std::discrete_distribution. After A.1 all
+    // alive entries should be finite; this is a cheap invariant guard.
     scratch_probs_.resize(alive.size());
-    for (size_t i = 0; i < alive.size(); i++)
-        scratch_probs_[i] = 1.0f / (1.0f + std::exp(-obuf[alive[i]]));
+    double probSum = 0.0;
+    for (size_t i = 0; i < alive.size(); i++) {
+        float p = 1.0f / (1.0f + std::exp(-obuf[alive[i]]));
+        if (!std::isfinite(p)) p = 0.0f;
+        scratch_probs_[i] = p;
+        probSum += p;
+    }
+    if (probSum <= 0.0) return;  // no usable sources — skip this relocation pass
 
     std::mt19937 rng((unsigned)(0x9E3779B9u ^ (unsigned)(++mcmc_relocation_count)));
     std::discrete_distribution<int> dist(scratch_probs_.begin(), scratch_probs_.end());
@@ -368,8 +377,14 @@ int Model::addNewGaussians() {
     };
 
     scratch_probs_.resize(num_active);
-    for (int i = 0; i < num_active; i++)
-        scratch_probs_[i] = 1.0f / (1.0f + std::exp(-obuf[i]));
+    double probSum = 0.0;
+    for (int i = 0; i < num_active; i++) {
+        float p = 1.0f / (1.0f + std::exp(-obuf[i]));
+        if (!std::isfinite(p)) p = 0.0f;
+        scratch_probs_[i] = p;
+        probSum += p;
+    }
+    if (probSum <= 0.0) return 0;  // no usable sources to clone from
 
     std::mt19937 rng((unsigned)(0xA24BAED4u ^ (unsigned)(++mcmc_relocation_count)));
     std::discrete_distribution<int> dist(scratch_probs_.begin(), scratch_probs_.end());
@@ -425,16 +440,36 @@ void Model::mcmcAfterTrain(int step) {
     if (step >= (int)(maxSteps * 0.833f)) return;
     msplat_gpu_sync();
 
-    const float *op = opacities.data<float>();
-    const float *mn = means.data<float>();
+    const float *op  = opacities.data<float>();
+    const float *mn  = means.data<float>();
+    const float *sc  = scales.data<float>();
+    const float *qt  = quats.data<float>();
+    const float *fdc = featuresDc.data<float>();
+    const float *fr  = featuresRest.data<float>();
+    const int64_t fr_stride = featuresRest.stride0();
     const float r2 = cull_radius > 0.0f ? cull_radius * cull_radius : -1.0f;
     std::vector<int> dead, alive;
     dead.reserve(num_active / 8);
     alive.reserve(num_active);
     int culled = 0;
+    int nonfinite = 0;
     for (int i = 0; i < num_active; i++) {
+        // Any non-finite parameter poisons gradients for every Gaussian sharing
+        // a tile, and NaN always fails the <= comparison below — so without this
+        // check a NaN Gaussian becomes an immortal zombie that relocate() then
+        // copies into every dead slot (the NaN epidemic, 2026-06-11).
+        bool finite = std::isfinite(op[i])
+            && std::isfinite(mn[i*3+0]) && std::isfinite(mn[i*3+1]) && std::isfinite(mn[i*3+2])
+            && std::isfinite(sc[i*3+0]) && std::isfinite(sc[i*3+1]) && std::isfinite(sc[i*3+2])
+            && std::isfinite(qt[i*4+0]) && std::isfinite(qt[i*4+1])
+            && std::isfinite(qt[i*4+2]) && std::isfinite(qt[i*4+3])
+            && std::isfinite(fdc[i*3+0]) && std::isfinite(fdc[i*3+1]) && std::isfinite(fdc[i*3+2]);
+        for (int64_t j = 0; finite && j < fr_stride; j++)
+            finite = std::isfinite(fr[i*fr_stride + j]);
+        if (!finite) nonfinite++;
+
         float sig = 1.0f / (1.0f + std::exp(-op[i]));
-        bool is_dead = (sig <= 0.005f);
+        bool is_dead = !finite || (sig <= 0.005f);
         if (!is_dead && r2 > 0.0f) {
             float x = mn[i*3 + 0], y = mn[i*3 + 1], z = mn[i*3 + 2];
             if (x*x + y*y + z*z > r2) { is_dead = true; culled++; }
@@ -455,6 +490,7 @@ void Model::mcmcAfterTrain(int step) {
                   << " active=" << num_active
                   << " dead=" << dead_count
                   << " culled=" << culled
+                  << " nonfinite=" << nonfinite
                   << " grown=" << grown << std::endl;
     }
 }
