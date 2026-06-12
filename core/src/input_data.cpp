@@ -97,36 +97,21 @@ void autoScaleAndCenter(InputData &data) {
         cam.camToWorld[11] -= mean[2];
     }
 
-    // Compute scale from max absolute camera position
-    float maxAbsCam = 0;
+    // Compute scale from max absolute camera position.
+    // CONTRACT: this camera-anchored convention is load-bearing. The fixed
+    // position LR, the SGLD noise_lr default (5e5), and cull_radius default
+    // (3.0) all assume cameras span ≈[-1, 1] after this transform. Anchoring
+    // the scale to point-cloud extent instead (tried 2026-06-11) enlarges the
+    // frame by λ and makes relative SGLD noise λ× stronger (noise ∝ s²),
+    // which produced a 96%-NaN model on the park dataset. It also breaks the
+    // downstream assumption that training space == partitioner-normalized
+    // space (keepCrs=false PLY export feeds SeamlessMerger directly).
+    float maxAbs = 0;
     for (auto &cam : data.cameras) {
-        maxAbsCam = std::max(maxAbsCam, std::abs(cam.camToWorld[3]));
-        maxAbsCam = std::max(maxAbsCam, std::abs(cam.camToWorld[7]));
-        maxAbsCam = std::max(maxAbsCam, std::abs(cam.camToWorld[11]));
+        maxAbs = std::max(maxAbs, std::abs(cam.camToWorld[3]));
+        maxAbs = std::max(maxAbs, std::abs(cam.camToWorld[7]));
+        maxAbs = std::max(maxAbs, std::abs(cam.camToWorld[11]));
     }
-
-    // Phase 2.2: Content-anchored training scale in msplat
-    // Compute robust point-cloud extent (95th-percentile distance of SfM points from camera centroid)
-    float maxAbsPts = maxAbsCam;
-    if (data.points.count > 0) {
-        std::vector<float> ptDists;
-        ptDists.reserve(data.points.count);
-        for (int64_t i = 0; i < data.points.count; i++) {
-            float dx = std::abs(data.points.xyz[i*3+0] - mean[0]);
-            float dy = std::abs(data.points.xyz[i*3+1] - mean[1]);
-            float dz = std::abs(data.points.xyz[i*3+2] - mean[2]);
-            float maxD = std::max({dx, dy, dz});
-            ptDists.push_back(maxD);
-        }
-        std::sort(ptDists.begin(), ptDists.end());
-        int p95_idx = std::min((int)(data.points.count * 0.95), (int)data.points.count - 1);
-        float p95_dist = ptDists[p95_idx];
-        
-        // Clamped to <= the current camera max-abs (so forward-facing unchanged)
-        maxAbsPts = std::min(maxAbsCam, p95_dist);
-    }
-
-    float maxAbs = maxAbsPts;
     data.scale = (maxAbs > 0) ? (1.0f / maxAbs) : 1.0f;
 
     // Apply scale to camera positions
