@@ -2300,19 +2300,18 @@ kernel void prefix_sum_tiles_kernel(
     threadgroup uint tg_exact_scan[HYBRID_SORT_TG_THREADS];
     threadgroup uint tg_padded_scan[HYBRID_SORT_TG_THREADS];
 
-    // Stride: each thread covers ceil(num_tiles / 1024) tiles.
-    uint stride = (num_tiles + HYBRID_SORT_TG_THREADS - 1) / HYBRID_SORT_TG_THREADS;
+    // Contiguous block: each thread covers a contiguous chunk of tiles.
+    uint chunk = (num_tiles + HYBRID_SORT_TG_THREADS - 1) / HYBRID_SORT_TG_THREADS;
+    uint start = tid * chunk;
+    uint end   = min(start + chunk, num_tiles);
 
-    // Phase A: each thread sums its strided chunk (exact and padded).
+    // Phase A: each thread sums its contiguous chunk (exact and padded).
     uint local_sum_exact  = 0;
     uint local_sum_padded = 0;
-    for (uint s = 0; s < stride; ++s) {
-        uint t = tid + s * HYBRID_SORT_TG_THREADS;
-        if (t < num_tiles) {
-            uint c = tile_counts_in[t];
-            local_sum_exact  += c;
-            local_sum_padded += pad_count(c);
-        }
+    for (uint t = start; t < end; ++t) {
+        uint c = tile_counts_in[t];
+        local_sum_exact  += c;
+        local_sum_padded += pad_count(c);
     }
     tg_exact_scan[tid]  = local_sum_exact;
     tg_padded_scan[tid] = local_sum_padded;
@@ -2326,36 +2325,25 @@ kernel void prefix_sum_tiles_kernel(
     // Phase C: each thread walks its chunk again, writing out the final offsets.
     uint carry_exact  = tg_exact_scan[tid];
     uint carry_padded = tg_padded_scan[tid];
-    for (uint s = 0; s < stride; ++s) {
-        uint t = tid + s * HYBRID_SORT_TG_THREADS;
-        if (t < num_tiles) {
-            uint c = tile_counts_in[t];
-            exact_offsets[t] = carry_exact;
-            sort_offsets[t]  = carry_padded;
-            write_packed_int2(tile_bins, t, int2(int(carry_exact), int(carry_exact + c)));
-            carry_exact  += c;
-            carry_padded += pad_count(c);
-        }
+    for (uint t = start; t < end; ++t) {
+        uint c = tile_counts_in[t];
+        exact_offsets[t] = carry_exact;
+        sort_offsets[t]  = carry_padded;
+        write_packed_int2(tile_bins, t, int2(int(carry_exact), int(carry_exact + c)));
+        carry_exact  += c;
+        carry_padded += pad_count(c);
     }
 
     // Write trailing slot: sort_offsets[num_tiles] = grand total of padded sizes.
-    // The last-active thread (tid holding the final tile) writes its carry.
-    // Use threadgroup-shared variable for deterministic write.
+    // Thread 1023's carry_padded after its loop holds the grand total.
     threadgroup uint grand_total_padded;
-    threadgroup uint grand_total_exact;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Thread that owns the last tile writes the grand total.
-    uint last_tile = num_tiles - 1;
-    uint owner_tid = last_tile % HYBRID_SORT_TG_THREADS;
-    if (tid == owner_tid && num_tiles > 0) {
+    if (tid == HYBRID_SORT_TG_THREADS - 1) {
         grand_total_padded = carry_padded;
-        grand_total_exact  = carry_exact;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (tid == 0) {
-        sort_offsets[num_tiles] = (num_tiles > 0) ? grand_total_padded : 0;
+        sort_offsets[num_tiles] = grand_total_padded;
     }
 }
 
@@ -2415,7 +2403,7 @@ kernel void hybrid_sort_pack_kernel(
 ) {
     uint count  = tile_counts_in[tg_id];
     if (count == 0) return;
-    uint padded = sort_offsets[tg_id + 1] - sort_offsets[tg_id];
+    uint padded = pad_count(count);
     uint src    = sort_offsets[tg_id];
     uint dst    = exact_offsets[tg_id];
 
@@ -3719,7 +3707,21 @@ kernel void sgld_noise_kernel(
     float v1 = 2*(qx*qy+qw*qz)*rt0 + (1-2*(qx*qx+qz*qz))*rt1 + 2*(qy*qz-qw*qx)*rt2;
     float v2 = 2*(qx*qz-qw*qy)*rt0 + 2*(qy*qz+qw*qx)*rt1 + (1-2*(qx*qx+qy*qy))*rt2;
 
-    // 4. Add to position
+    // 4. Bound the displacement and reject non-finite values.
+    // The Σ-weighted noise is quadratic in splat scale (diag(s²)): a near-dead
+    // Gaussian with an inflated scale would otherwise be teleported tens of
+    // units per pass, diverge to inf, and turn NaN in the gradient path.
+    // Cameras span ≈[-1,1] by the autoScaleAndCenter convention, so 0.05 units
+    // is still generous exploration noise.
+    const float kMaxNoiseStep = 0.05f;
+    float len2 = v0*v0 + v1*v1 + v2*v2;
+    if (!isfinite(len2)) return;            // s² overflowed — skip this perturbation
+    if (len2 > kMaxNoiseStep * kMaxNoiseStep) {
+        float inv = kMaxNoiseStep / sqrt(len2);
+        v0 *= inv; v1 *= inv; v2 *= inv;
+    }
+
+    // 5. Add to position
     means[idx*3]   += v0;
     means[idx*3+1] += v1;
     means[idx*3+2] += v2;
