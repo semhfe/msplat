@@ -384,7 +384,13 @@ struct FusedTensorCache {
     MTensor sort_offsets;           // [num_tiles+1] uint32 — padded start offset per tile
     MTensor isect_keys_unsorted;    // [capacity] uint64 — unsorted per-tile sort keys
 
-    int64_t capacity_multiplier = 16;
+    // NOTE (2026-06-18): The hybrid per-tile bitonic sort indexes isect_keys_unsorted
+    // by PADDED per-tile offsets (each tile rounded up to next_pow2(max(count,32))),
+    // which can be up to ~2x the exact intersection total. The old radix sort indexed
+    // by EXACT offsets, so 16x sufficed. With padding, dense scenes (e.g. cağlar at
+    // 300K) overflow a 16x buffer → unguarded OOB scatter writes → corrupted
+    // gaussian_ids → OOB param reads → NaN epidemic. 48x covers the padding headroom.
+    int64_t capacity_multiplier = 48;
 
     // Depth-chunked rasterization buffers
     uint32_t current_K_max = 1;
