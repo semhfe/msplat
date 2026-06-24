@@ -18,8 +18,6 @@ typedef struct {
     int shDegree;
     int shDegreeInterval;
     float ssimWeight;
-    int numDownscales;
-    int resolutionSchedule;
     // MCMC parameters
     int capMax;
     float noiseLr;
@@ -37,8 +35,6 @@ static inline MsplatConfig msplat_default_config(void) {
     c.shDegree = 3;
     c.shDegreeInterval = 1000;
     c.ssimWeight = 0.2f;
-    c.numDownscales = 2;
-    c.resolutionSchedule = 3000;
     c.capMax = 1000000;
     c.noiseLr = 5e5f;
     c.opacityReg = 0.01f;

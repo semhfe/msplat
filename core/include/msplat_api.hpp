@@ -18,8 +18,6 @@ struct Config {
     int shDegree = 3;
     int shDegreeInterval = 1000;
     float ssimWeight = 0.2f;
-    int numDownscales = 2;
-    int resolutionSchedule = 3000;
     // MCMC parameters
     int capMax = 1000000;        // Fixed Gaussian budget
     float noiseLr = 5e5f;        // SGLD noise learning rate

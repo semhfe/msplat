@@ -16,9 +16,43 @@ void saveGaussianPly(const std::string &path, GaussianParams &p, int step) {
     int frBases = (int)p.featuresRest.size(-2);
     int numFr = frBases * 3;
 
+    const float *mp = p.means.data<float>(), *sp = p.scales.data<float>(), *qp = p.quats.data<float>();
+    const float *dp = p.featuresDc.data<float>(), *op = p.opacities.data<float>();
+    const float *frp = p.featuresRest.data<float>();
+
+    // First pass: keep only fully-finite Gaussians. A single NaN/Inf in any
+    // parameter renders as a floater and corrupts downstream PLY loads. This is the
+    // definitive backstop for positions that diverge after the in-training NaN cull
+    // stops (it halts at 83.3% of steps while SGLD noise keeps running) — measured
+    // at 4.3% non-finite leaking into the bicycle scene's output.ply.
+    auto isFiniteGaussian = [&](int64_t i) -> bool {
+        if (!std::isfinite(op[i])) return false;
+        for (int j = 0; j < 3; j++)
+            if (!std::isfinite(mp[i*3+j]) || !std::isfinite(sp[i*3+j])) return false;
+        for (int j = 0; j < 4; j++)
+            if (!std::isfinite(qp[i*4+j])) return false;
+        for (int j = 0; j < numDc; j++)
+            if (!std::isfinite(dp[i*numDc+j])) return false;
+        for (int j = 0; j < numFr; j++)
+            if (!std::isfinite(frp[i*numFr+j])) return false;
+        return true;
+    };
+
+    std::vector<int64_t> keep;
+    keep.reserve(N);
+    for (int64_t i = 0; i < N; i++)
+        if (isFiniteGaussian(i)) keep.push_back(i);
+
+    int64_t dropped = N - (int64_t)keep.size();
+    if (dropped > 0)
+        fprintf(stderr, "savePly: dropped %lld non-finite Gaussian(s) of %lld (%.2f%%)\n",
+                (long long)dropped, (long long)N, 100.0 * (double)dropped / (double)std::max<int64_t>(N, 1));
+
+    int64_t Nkeep = (int64_t)keep.size();
+
     o << "ply\nformat binary_little_endian 1.0\n";
     o << "comment msplat v" << step << "\n";
-    o << "element vertex " << N << "\n";
+    o << "element vertex " << Nkeep << "\n";
     o << "property float x\nproperty float y\nproperty float z\n";
     o << "property float nx\nproperty float ny\nproperty float nz\n";
     for (int i = 0; i < numDc; i++) o << "property float f_dc_" << i << "\n";
@@ -30,11 +64,9 @@ void saveGaussianPly(const std::string &path, GaussianParams &p, int step) {
 
     int floatsPerRow = 3 + 3 + numDc + numFr + 1 + 3 + 4;
     std::vector<float> row(floatsPerRow);
-    const float *mp = p.means.data<float>(), *sp = p.scales.data<float>(), *qp = p.quats.data<float>();
-    const float *dp = p.featuresDc.data<float>(), *op = p.opacities.data<float>();
-    const float *frp = p.featuresRest.data<float>();
 
-    for (int64_t i = 0; i < N; i++) {
+    for (int64_t k = 0; k < Nkeep; k++) {
+        int64_t i = keep[k];
         int c = 0;
         for (int j = 0; j < 3; j++)
             row[c++] = p.keepCrs ? (mp[i*3+j] / p.scale + p.translation[j]) : mp[i*3+j];
@@ -61,18 +93,26 @@ void saveGaussianSplat(const std::string &path, GaussianParams &p) {
     const float *mp = p.means.data<float>(), *sp = p.scales.data<float>(), *qp = p.quats.data<float>();
     const float *dp = p.featuresDc.data<float>(), *op = p.opacities.data<float>();
 
-    // Sort by size/opacity (largest first)
-    std::vector<float> order(N);
+    // Sort by size/opacity (largest first). Skip non-finite Gaussians: a NaN sort
+    // key violates strict-weak-ordering (UB in std::sort) and must not reach output.
+    std::vector<float> order(N, 0.0f);
+    std::vector<size_t> idx;
+    idx.reserve(N);
     for (int64_t i = 0; i < N; i++) {
+        bool finite = std::isfinite(op[i]);
+        for (int j = 0; finite && j < 3; j++)
+            finite = std::isfinite(mp[i*3+j]) && std::isfinite(sp[i*3+j]);
+        for (int j = 0; finite && j < 4; j++)
+            finite = std::isfinite(qp[i*4+j]);
+        if (!finite) continue;
         float s = std::exp(sp[i*3]) + std::exp(sp[i*3+1]) + std::exp(sp[i*3+2]);
         if (p.keepCrs) s /= p.scale;
         order[i] = s / (1.0f + std::exp(-op[i]));
+        idx.push_back((size_t)i);
     }
-    std::vector<size_t> idx(N);
-    std::iota(idx.begin(), idx.end(), 0);
     std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b){ return order[a] > order[b]; });
 
-    for (int64_t ii = 0; ii < N; ii++) {
+    for (size_t ii = 0; ii < idx.size(); ii++) {
         size_t i = idx[ii];
         float m[3];
         for (int j = 0; j < 3; j++) m[j] = p.keepCrs ? (mp[i*3+j] / p.scale + p.translation[j]) : mp[i*3+j];

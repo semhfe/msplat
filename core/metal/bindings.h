@@ -71,7 +71,7 @@ void msplat_sgld_noise_gen(int N, MTensor &noise, uint32_t seed);
 void msplat_sgld_noise(
     int N, MTensor &means, MTensor &scales, MTensor &quats,
     MTensor &opacities, MTensor &noise,
-    float noise_lr, float xyz_lr
+    float noise_lr, float xyz_lr, float max_disp
 );
 
 // MCMC: Apply opacity and scale regularization as post-Adam parameter nudge

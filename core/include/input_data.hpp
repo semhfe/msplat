@@ -4,7 +4,6 @@
 #include <string>
 #include <vector>
 #include <tuple>
-#include <unordered_map>
 #include "metal_tensor.hpp"
 
 // Simple float32 RGB image — replaces cv::Mat
@@ -24,16 +23,15 @@ struct Camera {
     float camToWorld[16] = {};  // 4x4 row-major, camera-to-world (OpenGL: Y-up, Z-back)
     std::string filePath;
 
-    Image image;
-    std::unordered_map<int, Image> imagePyramids;
-    std::unordered_map<int, MTensor> mtensorImageCache;
+    // Single GPU image buffer (UMA shared storage — CPU & GPU read the same memory).
+    // Replaces the previous dual-copy design (CPU std::vector + Metal MTensor).
+    MTensor gpuBaseImage;
     MTensor cachedViewMat, cachedProjViewMat;
     float cachedCamPos[3] = {};
     float cachedFovX = 0, cachedFovY = 0;
 
     void loadImage(float downscaleFactor);
-    Image getImage(int downscaleFactor);
-    MTensor& getGPUImage(int downscaleFactor);
+    MTensor& getGPUImage();
     bool hasDistortion() const { return k1 != 0 || k2 != 0 || k3 != 0 || p1 != 0 || p2 != 0; }
 };
 

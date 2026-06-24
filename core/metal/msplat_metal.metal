@@ -2299,51 +2299,51 @@ kernel void prefix_sum_tiles_kernel(
     // Allocate threadgroup memory for the scan.
     threadgroup uint tg_exact_scan[HYBRID_SORT_TG_THREADS];
     threadgroup uint tg_padded_scan[HYBRID_SORT_TG_THREADS];
+    
+    threadgroup uint block_total_exact;
+    threadgroup uint block_total_padded;
 
-    // Contiguous block: each thread covers a contiguous chunk of tiles.
-    uint chunk = (num_tiles + HYBRID_SORT_TG_THREADS - 1) / HYBRID_SORT_TG_THREADS;
-    uint start = tid * chunk;
-    uint end   = min(start + chunk, num_tiles);
+    uint running_exact = 0;
+    uint running_padded = 0;
 
-    // Phase A: each thread sums its contiguous chunk (exact and padded).
-    uint local_sum_exact  = 0;
-    uint local_sum_padded = 0;
-    for (uint t = start; t < end; ++t) {
-        uint c = tile_counts_in[t];
-        local_sum_exact  += c;
-        local_sum_padded += pad_count(c);
+    uint num_chunks = (num_tiles + HYBRID_SORT_TG_THREADS - 1) / HYBRID_SORT_TG_THREADS;
+
+    for (uint c = 0; c < num_chunks; ++c) {
+        uint t = c * HYBRID_SORT_TG_THREADS + tid;
+        
+        uint val = (t < num_tiles) ? tile_counts_in[t] : 0;
+        uint pad_val = pad_count(val);
+
+        tg_exact_scan[tid] = val;
+        tg_padded_scan[tid] = pad_val;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Exclusive scan over the 1024 elements
+        exclusive_scan_hillis_steele(tg_exact_scan, tid);
+        exclusive_scan_hillis_steele(tg_padded_scan, tid);
+
+        if (t < num_tiles) {
+            uint ex = running_exact + tg_exact_scan[tid];
+            uint pd = running_padded + tg_padded_scan[tid];
+
+            exact_offsets[t] = ex;
+            sort_offsets[t] = pd;
+            write_packed_int2(tile_bins, t, int2(int(ex), int(ex + val)));
+        }
+
+        // Thread 1023 has the last exclusive prefix and the last value
+        if (tid == HYBRID_SORT_TG_THREADS - 1) {
+            block_total_exact = tg_exact_scan[tid] + val;
+            block_total_padded = tg_padded_scan[tid] + pad_val;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        running_exact += block_total_exact;
+        running_padded += block_total_padded;
     }
-    tg_exact_scan[tid]  = local_sum_exact;
-    tg_padded_scan[tid] = local_sum_padded;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Phase B: exclusive scan over the 1024 chunk-sums (Hillis-Steele).
-    exclusive_scan_hillis_steele(tg_exact_scan, tid);
-    exclusive_scan_hillis_steele(tg_padded_scan, tid);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Phase C: each thread walks its chunk again, writing out the final offsets.
-    uint carry_exact  = tg_exact_scan[tid];
-    uint carry_padded = tg_padded_scan[tid];
-    for (uint t = start; t < end; ++t) {
-        uint c = tile_counts_in[t];
-        exact_offsets[t] = carry_exact;
-        sort_offsets[t]  = carry_padded;
-        write_packed_int2(tile_bins, t, int2(int(carry_exact), int(carry_exact + c)));
-        carry_exact  += c;
-        carry_padded += pad_count(c);
-    }
-
-    // Write trailing slot: sort_offsets[num_tiles] = grand total of padded sizes.
-    // Thread 1023's carry_padded after its loop holds the grand total.
-    threadgroup uint grand_total_padded;
-    if (tid == HYBRID_SORT_TG_THREADS - 1) {
-        grand_total_padded = carry_padded;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (tid == 0) {
-        sort_offsets[num_tiles] = grand_total_padded;
+        sort_offsets[num_tiles] = running_padded;
     }
 }
 
@@ -2403,7 +2403,7 @@ kernel void hybrid_sort_pack_kernel(
 ) {
     uint count  = tile_counts_in[tg_id];
     if (count == 0) return;
-    uint padded = pad_count(count);
+    uint padded = sort_offsets[tg_id + 1] - sort_offsets[tg_id];
     uint src    = sort_offsets[tg_id];
     uint dst    = exact_offsets[tg_id];
 
@@ -3667,6 +3667,7 @@ kernel void sgld_noise_kernel(
     constant int& N           [[buffer(5)]],
     constant float& noise_lr  [[buffer(6)]],
     constant float& xyz_lr    [[buffer(7)]],   // current position learning rate
+    constant float& max_disp  [[buffer(8)]],   // per-step displacement cap (scene-relative)
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= (uint)N) return;
@@ -3708,16 +3709,18 @@ kernel void sgld_noise_kernel(
     float v2 = 2*(qx*qz-qw*qy)*rt0 + 2*(qy*qz+qw*qx)*rt1 + (1-2*(qx*qx+qy*qy))*rt2;
 
     // 4. Bound the displacement and reject non-finite values.
-    // The Σ-weighted noise is quadratic in splat scale (diag(s²)): a near-dead
-    // Gaussian with an inflated scale would otherwise be teleported tens of
-    // units per pass, diverge to inf, and turn NaN in the gradient path.
-    // Cameras span ≈[-1,1] by the autoScaleAndCenter convention, so 0.05 units
-    // is still generous exploration noise.
-    const float kMaxNoiseStep = 0.05f;
+    //    The Σ-weighted noise is quadratic in splat scale (diag(s²)): a near-dead
+    //    Gaussian with an inflated scale (common on sparse-SfM / low-density scenes)
+    //    would otherwise random-walk its position toward ±∞ over many steps, going
+    //    NaN and producing the floaters/PSNR-collapse measured on the bicycle scene
+    //    (4.3% non-finite Gaussians vs 0.0% on dense scenes). max_disp is computed on
+    //    the CPU relative to the scene's cull_radius, so the bound is correct under
+    //    any normalization (no scene bounding box is needed inside the kernel).
+    if (!isfinite(v0) || !isfinite(v1) || !isfinite(v2)) return;
     float len2 = v0*v0 + v1*v1 + v2*v2;
-    if (!isfinite(len2)) return;            // s² overflowed — skip this perturbation
-    if (len2 > kMaxNoiseStep * kMaxNoiseStep) {
-        float inv = kMaxNoiseStep / sqrt(len2);
+    if (!isfinite(len2)) return;              // s² overflowed — skip this perturbation
+    if (len2 > max_disp * max_disp) {
+        float inv = max_disp / sqrt(len2);
         v0 *= inv; v1 *= inv; v2 *= inv;
     }
 

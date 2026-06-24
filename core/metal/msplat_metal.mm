@@ -1354,7 +1354,7 @@ void msplat_sgld_noise_gen(int N, MTensor &noise, uint32_t seed) {
 void msplat_sgld_noise(
     int N, MTensor &means, MTensor &scales, MTensor &quats,
     MTensor &opacities, MTensor &noise,
-    float noise_lr, float xyz_lr
+    float noise_lr, float xyz_lr, float max_disp
 ) {
     MetalContext* ctx = get_global_context();
     dispatch_sync(ctx->d_queue, ^(){
@@ -1370,6 +1370,7 @@ void msplat_sgld_noise(
         ENC_SCALAR(enc, N, 5);
         ENC_SCALAR(enc, noise_lr, 6);
         ENC_SCALAR(enc, xyz_lr, 7);
+        ENC_SCALAR(enc, max_disp, 8);
         [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         [enc endEncoding];
     });

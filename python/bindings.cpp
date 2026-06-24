@@ -27,8 +27,6 @@ struct TrainingConfig {
     int sh_degree = 3;
     int sh_degree_interval = 1000;
     float ssim_weight = 0.2f;
-    int num_downscales = 2;
-    int resolution_schedule = 3000;
     int refine_every = 100;
     int warmup_length = 500;
     int reset_alpha_every = 30;
@@ -116,7 +114,6 @@ public:
         model = std::make_unique<Model>(
             dataset.data,
             dataset.train_cams.size(),
-            cfg.num_downscales, cfg.resolution_schedule,
             cfg.sh_degree, cfg.sh_degree_interval,
             cfg.refine_every, cfg.warmup_length, cfg.reset_alpha_every,
             cfg.densify_grad_thresh, cfg.densify_size_thresh,
@@ -147,7 +144,7 @@ public:
         Camera &cam = dataset_ptr->train_cams[cam_idx];
 
         int ds = model->getDownscaleFactor(current_step);
-        MTensor &gt = cam.getGPUImage(ds);
+        MTensor &gt = cam.getGPUImage();
 
         auto t0 = std::chrono::high_resolution_clock::now();
 
@@ -192,7 +189,7 @@ public:
 
             MTensor rgb_cpu = rgb.cpu();
             int ds = model->getDownscaleFactor(config.iterations);
-            MTensor gt_cpu = cam.getGPUImage(ds).cpu();
+            MTensor gt_cpu = cam.getGPUImage().cpu();
 
             sum_psnr += psnr(rgb_cpu, gt_cpu);
             sum_ssim += ssim_eval(rgb_cpu, gt_cpu);
@@ -301,8 +298,6 @@ NB_MODULE(_core, m) {
             cfg->sh_degree = sh_degree;
             cfg->sh_degree_interval = sh_degree_interval;
             cfg->ssim_weight = ssim_weight;
-            cfg->num_downscales = num_downscales;
-            cfg->resolution_schedule = resolution_schedule;
             cfg->refine_every = refine_every;
             cfg->warmup_length = warmup_length;
             cfg->reset_alpha_every = reset_alpha_every;
@@ -322,8 +317,6 @@ NB_MODULE(_core, m) {
             "sh_degree"_a = 3,
             "sh_degree_interval"_a = 1000,
             "ssim_weight"_a = 0.2f,
-            "num_downscales"_a = 2,
-            "resolution_schedule"_a = 3000,
             "refine_every"_a = 100,
             "warmup_length"_a = 500,
             "reset_alpha_every"_a = 30,
@@ -340,8 +333,6 @@ NB_MODULE(_core, m) {
         .def_rw("sh_degree", &TrainingConfig::sh_degree)
         .def_rw("sh_degree_interval", &TrainingConfig::sh_degree_interval)
         .def_rw("ssim_weight", &TrainingConfig::ssim_weight)
-        .def_rw("num_downscales", &TrainingConfig::num_downscales)
-        .def_rw("resolution_schedule", &TrainingConfig::resolution_schedule)
         .def_rw("refine_every", &TrainingConfig::refine_every)
         .def_rw("warmup_length", &TrainingConfig::warmup_length)
         .def_rw("reset_alpha_every", &TrainingConfig::reset_alpha_every)

@@ -143,9 +143,6 @@ Model::Model(const InputData &inputData, int numCameras,
     backgroundColor = gpu_empty({3}, DType::Float32);
     static const float defaultBg[3] = {0.6130f, 0.0101f, 0.3984f};
     memcpy(backgroundColor.data_ptr(), bgColor ? bgColor : defaultBg, 3 * sizeof(float));
-    // Training uses per-step random background (reference MCMC behavior).
-    // Prevents Gaussians from baking the fixed bg color into opacity.
-    trainBgColor = gpu_empty({3}, DType::Float32);
     setupOptimizers();
 }
 
@@ -745,18 +742,6 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
         memcpy(window2d.data_ptr(), w.data(), w.size() * sizeof(float));
     }
 
-    // Per-step random background (reference 3DGS-MCMC behavior).
-    // Forces Gaussians to learn proper transparency at edges rather than
-    // blending to match a fixed background color in their opacity.
-    {
-        float rgb[3];
-        uint32_t seed = (uint32_t)step * 0x9E3779B9u;
-        for (int i = 0; i < 3; i++) {
-            seed ^= seed >> 16; seed *= 0x45d9f3bu; seed ^= seed >> 16;
-            rgb[i] = (float)(seed & 0xFFFF) / 65535.0f;
-        }
-        memcpy(trainBgColor.data_ptr(), rgb, 3 * sizeof(float));
-    }
 
     adam_step_count++;
     float bc1 = 1.0f - std::pow(adam_beta1, adam_step_count);
@@ -780,7 +765,7 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
         quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
         s.height, s.width, s.tileBounds, 0.01f,
         s.degree, s.degreesToUse, s.cam_pos, featuresDc, featuresRest,
-        opacities, trainBgColor, gt, window2d, ssimWeight,
+        opacities, backgroundColor, gt, window2d, ssimWeight,
         lossInvN, (int)featuresRest.size(-2),
         N_ADAM_GROUPS,
         adam_p, adam_ea, adam_eas,
@@ -792,9 +777,16 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
     // MCMC: SGLD noise perturbation, then post-Adam opacity/scale regularization.
     // Noise is generated on GPU (PCG+Box-Muller, seeded by step) — previously this
     // was a CPU mt19937 loop costing ~10–50 ms/iter at 1M splats.
+    // Per-step SGLD displacement cap, relative to the scene's valid region
+    // (cull_radius). The noise is quadratic in splat scale, so low-density scenes
+    // (large near-dead scales) need a bound or their positions random-walk to ±∞.
+    // ~1.67% of cull_radius reproduces the validated 0.05 bound at the default
+    // cull_radius=3.0, and adapts to any normalization. Falls back to 0.05 when
+    // culling is disabled (cull_radius == 0).
+    const float max_disp = (cull_radius > 0.0f) ? (cull_radius * 0.0167f) : 0.05f;
     msplat_sgld_noise_gen(num_active, sgld_noise_buf, (uint32_t)step);
     msplat_sgld_noise(num_active, means, scales, quats, opacities,
-                      sgld_noise_buf, noise_lr, adam_lr[0]);
+                      sgld_noise_buf, noise_lr, adam_lr[0], max_disp);
     msplat_mcmc_regularization(num_active, opacities, scales,
                                adam_lr[0], opacity_reg, scale_reg);
 }
