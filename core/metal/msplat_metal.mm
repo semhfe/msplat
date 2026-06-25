@@ -578,6 +578,7 @@ static void forward_pipeline(
 
     auto encode_prefix_sort_pack = [&](id<MTLComputeCommandEncoder> enc) {
         uint32_t num_tiles_u32 = (uint32_t)num_tiles;
+        uint32_t capacity_u32 = (uint32_t)capacity;
         // 1. count_intersections — per-tile atomic counts
         {
             NSUInteger tpg = MIN(ctx->count_intersections_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
@@ -598,6 +599,7 @@ static void forward_pipeline(
             ENC_BUF(enc, g_tcache.sort_offsets, 2);
             ENC_BUF(enc, tile_bins, 3);
             ENC_SCALAR(enc, num_tiles_u32, 4);
+            ENC_SCALAR(enc, capacity_u32, 5);
             [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
         }
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -612,6 +614,7 @@ static void forward_pipeline(
             ENC_BUF(enc, g_tcache.tile_write_counters, 5);
             ENC_BUF(enc, g_tcache.isect_keys_unsorted, 6);
             ENC_SCALAR(enc, num_points_u32, 7); ENC_BUF(enc, aabb, 8);
+            ENC_SCALAR(enc, capacity_u32, 9);
             [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         }
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -627,6 +630,7 @@ static void forward_pipeline(
             ENC_BUF(enc, opacities, 6); ENC_BUF(enc, colors, 7);
             ENC_BUF(enc, packed_xy_opac, 8); ENC_BUF(enc, packed_conic, 9);
             ENC_BUF(enc, packed_rgb, 10); ENC_BUF(enc, gaussian_ids, 11);
+            ENC_SCALAR(enc, capacity_u32, 12); ENC_SCALAR(enc, num_points_u32, 13);
 
             [enc dispatchThreadgroups:MTLSizeMake(num_tiles, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
         }
@@ -919,6 +923,7 @@ std::tuple<MTensor, float> msplat_train_step(
 
     auto encode_prefix_sort_pack = [&](id<MTLComputeCommandEncoder> enc) {
         uint32_t num_tiles_u32 = (uint32_t)num_tiles;
+        uint32_t capacity_u32 = (uint32_t)capacity;
         // 1. count_intersections — per-tile atomic counts
         {
             NSUInteger tpg = MIN(ctx->count_intersections_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
@@ -939,6 +944,7 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_BUF(enc, g_tcache.sort_offsets, 2);
             ENC_BUF(enc, tile_bins, 3);
             ENC_SCALAR(enc, num_tiles_u32, 4);
+            ENC_SCALAR(enc, capacity_u32, 5);
             [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
         }
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -953,6 +959,7 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_BUF(enc, g_tcache.tile_write_counters, 5);
             ENC_BUF(enc, g_tcache.isect_keys_unsorted, 6);
             ENC_SCALAR(enc, num_points_u32, 7); ENC_BUF(enc, aabb, 8);
+            ENC_SCALAR(enc, capacity_u32, 9);
             [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         }
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -968,6 +975,7 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_BUF(enc, opacities, 6); ENC_BUF(enc, colors, 7);
             ENC_BUF(enc, packed_xy_opac, 8); ENC_BUF(enc, packed_conic, 9);
             ENC_BUF(enc, packed_rgb, 10); ENC_BUF(enc, gaussian_ids, 11);
+            ENC_SCALAR(enc, capacity_u32, 12); ENC_SCALAR(enc, num_points_u32, 13);
             [enc dispatchThreadgroups:MTLSizeMake(num_tiles, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
         }
     };

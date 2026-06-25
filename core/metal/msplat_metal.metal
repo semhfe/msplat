@@ -2294,6 +2294,7 @@ kernel void prefix_sum_tiles_kernel(
     device   uint*   sort_offsets       [[buffer(2)]],   // size num_tiles + 1
     device   int*    tile_bins          [[buffer(3)]],   // int2, size num_tiles
     constant uint&   num_tiles          [[buffer(4)]],
+    constant uint&   capacity           [[buffer(5)]],   // isect/packed buffer size (clamp target)
     uint tid [[thread_position_in_threadgroup]]
 ) {
     // Allocate threadgroup memory for the scan.
@@ -2360,6 +2361,7 @@ kernel void scatter_intersections_kernel(
     device   uint64_t*    isect_keys_unsorted [[buffer(6)]],
     constant uint&        num_points     [[buffer(7)]],
     constant float*       aabb           [[buffer(8)]],    // float2: per-axis pixel extents
+    constant uint&        capacity       [[buffer(9)]],    // isect_keys_unsorted size (bounds guard)
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= num_points) return;
@@ -2376,7 +2378,13 @@ kernel void scatter_intersections_kernel(
         for (uint x = tile_min.x; x < tile_max.x; ++x) {
             uint tile_id = y * tile_bounds.x + x;
             uint pos = atomic_fetch_add_explicit(&tile_write_counters[tile_id], 1u, memory_order_relaxed);
-            isect_keys_unsorted[sort_offsets[tile_id] + pos] = key;
+            // Durable hardening: drop intersections that would overflow the buffer
+            // instead of writing out of bounds (which faults the GPU). Healthy scenes
+            // never reach capacity, so this is a no-op there.
+            uint dst_idx = sort_offsets[tile_id] + pos;
+            if (dst_idx < capacity) {
+                isect_keys_unsorted[dst_idx] = key;
+            }
         }
     }
 }
@@ -2398,6 +2406,8 @@ kernel void hybrid_sort_pack_kernel(
     device   float*     packed_conic         [[buffer(9)]],   // float3, packed
     device   float*     packed_rgb           [[buffer(10)]],  // float3, packed
     device   int*       gaussian_ids         [[buffer(11)]],
+    constant uint&      capacity             [[buffer(12)]],  // isect/packed buffer size
+    constant uint&      num_points           [[buffer(13)]],  // decoded-id bounds guard
     uint tg_id [[threadgroup_position_in_grid]],
     uint tid   [[thread_position_in_threadgroup]]
 ) {
@@ -2406,6 +2416,26 @@ kernel void hybrid_sort_pack_kernel(
     uint padded = sort_offsets[tg_id + 1] - sort_offsets[tg_id];
     uint src    = sort_offsets[tg_id];
     uint dst    = exact_offsets[tg_id];
+
+    // Durable hardening: if this tile's padded sort region would spill past the key
+    // buffer, the bitonic networks below would read/write out of bounds. Emit
+    // transparent splats for the tile's output range so the rasterizer reads valid
+    // invisible data instead of stale garbage. region_ok is uniform across the
+    // threadgroup (sort_offsets[tg_id+1] == src + padded), so all threads return
+    // together — no barrier divergence. No-op on healthy scenes.
+    bool region_ok = (sort_offsets[tg_id + 1] <= capacity);
+    if (!region_ok) {
+        for (uint i = tid; i < count; i += HYBRID_SORT_TG_THREADS) {
+            uint d = dst + i;
+            if (d < capacity) {
+                gaussian_ids[d] = 0;
+                write_packed_float3(packed_xy_opac, d, float3(0.0f, 0.0f, 0.0f)); // opac 0 → invisible
+                write_packed_float3(packed_conic, d, float3(0.0f, 0.0f, 0.0f));
+                write_packed_float3(packed_rgb, d, float3(0.0f, 0.0f, 0.0f));
+            }
+        }
+        return;
+    }
 
     if (count <= BITONIC_TG_CAP) {
         // ----- Sparse path: bitonic in threadgroup memory -----
@@ -2423,6 +2453,14 @@ kernel void hybrid_sort_pack_kernel(
         for (uint i = tid; i < count; i += HYBRID_SORT_TG_THREADS) {
             uint gidx = uint(tg_data[i] & 0xFFFFFFFFu);
             uint d = dst + i;
+            // Defense-in-depth: a stale/garbage key decodes out of range → transparent.
+            if (gidx >= num_points) {
+                gaussian_ids[d] = 0;
+                write_packed_float3(packed_xy_opac, d, float3(0.0f, 0.0f, 0.0f));
+                write_packed_float3(packed_conic, d, float3(0.0f, 0.0f, 0.0f));
+                write_packed_float3(packed_rgb, d, float3(0.0f, 0.0f, 0.0f));
+                continue;
+            }
             gaussian_ids[d] = int(gidx);
             float2 xy = read_packed_float2(xys_in, gidx);
             float opac = 1.f / (1.f + exp(-opacities_in[gidx]));
@@ -2446,6 +2484,14 @@ kernel void hybrid_sort_pack_kernel(
         for (uint i = tid; i < count; i += HYBRID_SORT_TG_THREADS) {
             uint gidx = uint(arr[i] & 0xFFFFFFFFu);
             uint d = dst + i;
+            // Defense-in-depth: a stale/garbage key decodes out of range → transparent.
+            if (gidx >= num_points) {
+                gaussian_ids[d] = 0;
+                write_packed_float3(packed_xy_opac, d, float3(0.0f, 0.0f, 0.0f));
+                write_packed_float3(packed_conic, d, float3(0.0f, 0.0f, 0.0f));
+                write_packed_float3(packed_rgb, d, float3(0.0f, 0.0f, 0.0f));
+                continue;
+            }
             gaussian_ids[d] = int(gidx);
             float2 xy = read_packed_float2(xys_in, gidx);
             float opac = 1.f / (1.f + exp(-opacities_in[gidx]));
