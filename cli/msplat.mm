@@ -90,6 +90,13 @@ int main(int argc, char *argv[]) {
     int positionLrMaxSteps = 30000;
     app.add_option("--position-lr-max-steps", positionLrMaxSteps, "Step where position LR reaches its final value")
         ->check(CLI::Range(1, 1000000));
+    // Quality-gated early stop. Measured iteration curves: outdoor/sparse scenes
+    // saturate by ~30k (30k->45k = +0.0-0.13 dB) while dense indoor scenes keep
+    // gaining — so a fixed ceiling both wastes and starves. Requires --eval.
+    float earlyStopDelta = 0.0f;
+    app.add_option("--early-stop", earlyStopDelta,
+                   "Stop when test-subset PSNR improves less than this (dB) over 5000 steps (requires --eval; 0 = off)")
+        ->check(CLI::Range(0.0f, 10.0f));
 
     CLI11_PARSE(app, argc, argv);
 
@@ -135,6 +142,9 @@ int main(int argc, char *argv[]) {
 
         size_t step = 1;
         if (!resume.empty()) step = model.loadPly(resume) + 1;
+
+        double lastGatePsnr = -1e9;   // early-stop: previous 5k-step subset PSNR
+        size_t stoppedAt = 0;         // early-stop: step we stopped at (0 = ran to numIters)
 
         bool benchmarking = std::getenv("BENCHMARK") != nullptr;
         int bench_warmup = 50;
@@ -190,6 +200,36 @@ int main(int argc, char *argv[]) {
                 fs::path p(outputScene);
                 model.save(p.replace_filename(fs::path(p.stem().string() + "_" + std::to_string(step) + p.extension().string())).string(), step);
             }
+
+            // Quality gate: cheap test-subset eval every 5000 steps. Stops the
+            // fine-tuning tail once it pays less than earlyStopDelta dB per 5k
+            // (outdoor scenes saturate ~30k; dense indoor keeps earning).
+            if (earlyStopDelta > 0.0f && evalMode && !testCams.empty()
+                && step >= 10000 && step % 5000 == 0 && step < (size_t)numIters) {
+                size_t nSub = std::min((size_t)10, testCams.size());
+                size_t stride = testCams.size() / nSub;
+                double sum = 0;
+                for (size_t i = 0; i < nSub; i++) {
+                    Camera &tc = testCams[i * stride];
+                    MTensor rgb = model.render(tc, step);
+                    msplat_gpu_sync();
+                    MTensor rgb_cpu = rgb.cpu();
+                    MTensor gt_cpu = dequantize_gt(tc.getGPUImage());
+                    sum += psnr(rgb_cpu, gt_cpu);
+                }
+                double gatePsnr = sum / nSub;
+                std::cout << "gate step=" << step
+                          << " subsetPSNR=" << gatePsnr
+                          << " delta=" << (gatePsnr - lastGatePsnr) << std::endl;
+                if (lastGatePsnr > -1e8 && gatePsnr - lastGatePsnr < earlyStopDelta) {
+                    std::cout << "early-stop: +" << (gatePsnr - lastGatePsnr)
+                              << " dB over last 5000 steps < " << earlyStopDelta
+                              << "; stopping at step " << step << std::endl;
+                    stoppedAt = step;
+                }
+                lastGatePsnr = gatePsnr;
+            }
+            if (stoppedAt) break;
 
             if (!valRender.empty() && step % 10 == 0) {
                 MTensor rgb = model.render(*valCam, step);
@@ -284,8 +324,11 @@ int main(int argc, char *argv[]) {
             std::cout << "\n";
         }
 
+        // Stamp the step actually reached (early stop may end before numIters).
+        int finalStep = stoppedAt ? (int)stoppedAt : numIters;
+
         inputData.saveCameras((fs::path(outputScene).parent_path() / "cameras.json").string(), keepCrs);
-        model.save(outputScene, numIters);
+        model.save(outputScene, finalStep);
 
         // Evaluation
         if (evalMode && !testCams.empty()) {
@@ -294,7 +337,7 @@ int main(int argc, char *argv[]) {
 
             std::cout << "\n=== Evaluation (" << nTest << " test views) ===" << std::endl;
             for (int i = 0; i < nTest; i++) {
-                MTensor rgb = model.render(testCams[i], numIters);
+                MTensor rgb = model.render(testCams[i], finalStep);
                 msplat_gpu_sync();
                 MTensor rgb_cpu = rgb.cpu();
                 MTensor gt_cpu = dequantize_gt(testCams[i].getGPUImage());
@@ -316,7 +359,7 @@ int main(int argc, char *argv[]) {
 
         // Validation
         if (valCam) {
-            MTensor rgb = model.render(*valCam, numIters);
+            MTensor rgb = model.render(*valCam, finalStep);
             msplat_gpu_sync();
             MTensor rgb_cpu = rgb.cpu();
             MTensor gt_cpu = dequantize_gt(valCam->getGPUImage());
