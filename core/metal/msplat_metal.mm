@@ -46,6 +46,15 @@ struct MetalContext {
     // Command buffer lifecycle using MPSCommandBuffer for commitAndContinue support.
     MPSCommandBuffer* _currentCB = nil;
 
+    // Bounds committed-but-incomplete command buffers (at most 3 in flight).
+    // Unbounded commitAndContinue submission — the training loop commits every
+    // step but only truly syncs every 100 steps (and only every 1000 after the
+    // densify cutoff) — exhausts the queue's 64-buffer pool and lets driver
+    // residency thrash under memory pressure: measured 26-47 ms/step collapsing
+    // to 2000-3100 ms/step on a 24 GB machine. Waiting here restores the fast
+    // path without the full pipeline drain that BENCHMARK's per-step sync pays.
+    dispatch_semaphore_t inflight_sem;
+
     id<MTLCommandBuffer> getCommandBuffer() {
         if (!_currentCB) {
             _currentCB = [MPSCommandBuffer commandBufferFromCommandQueue:queue];
@@ -64,7 +73,12 @@ struct MetalContext {
                     }
                 }];
             }
+            dispatch_semaphore_t sem = inflight_sem;
+            [_currentCB addCompletedHandler:^(id<MTLCommandBuffer>) {
+                dispatch_semaphore_signal(sem);
+            }];
             [_currentCB commitAndContinue];
+            dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
         }
     }
     void syncCB() {
@@ -182,6 +196,10 @@ MetalContext* init_msplat_metal_context() {
     ctx->device = device;
     ctx->queue  = [ctx->device newCommandQueue];
     ctx->d_queue = dispatch_queue_create("com.msplat.metal", DISPATCH_QUEUE_SERIAL);
+    // malloc does not run member initializers — set the buffer/backpressure
+    // state explicitly (a garbage _currentCB here would crash the first commit).
+    ctx->_currentCB = nil;
+    ctx->inflight_sem = dispatch_semaphore_create(2);  // wait-after-commit ⇒ ≤3 in flight
 
     // Find precompiled metallib: explicit path (XCFramework/Python) or auto-discover
     NSError *error = nil;
