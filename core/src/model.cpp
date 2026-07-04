@@ -146,7 +146,7 @@ Model::Model(const InputData &inputData, int numCameras,
     setupOptimizers();
 }
 
-void Model::setupOptimizers(){
+void Model::setupOptimizers(bool decimateSeeds){
     releaseOptimizers();
 
 
@@ -157,7 +157,10 @@ void Model::setupOptimizers(){
     // memcpy in allocBuf never writes past the cap_max-sized buffer.
     int64_t rows_to_copy = std::min((int64_t)num_active, (int64_t)cap_max);
     std::vector<int64_t> keep_indices;
-    if (num_active > cap_max * 0.75) {
+    // Seed decimation applies to fresh SfM seeds ONLY. A resumed model routinely
+    // sits at/near cap (growth stops at cap) — subsampling it here silently threw
+    // away half of a trained model (389,173 → 194,586, PSNR 18.2 → 15.0).
+    if (decimateSeeds && num_active > cap_max * 0.75) {
         std::cerr << "[mcmc] init points (" << num_active
                   << ") > 75% of cap_max=" << cap_max
                   << "; randomly subsampling to 50% cap_max for growth headroom\n";
@@ -521,7 +524,8 @@ int Model::loadPly(const std::string &filename){
     featuresDc = g.featuresDc;
     featuresRest = g.featuresRest;
     opacities = g.opacities;
-    setupOptimizers();
+    // decimateSeeds=false: these are trained gaussians, not SfM seeds.
+    setupOptimizers(false);
     return g.step;
 }
 

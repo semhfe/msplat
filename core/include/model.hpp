@@ -24,7 +24,7 @@ struct Model{
 
   ~Model(){ releaseOptimizers(); }
 
-  void setupOptimizers();
+  void setupOptimizers(bool decimateSeeds = true);
   void releaseOptimizers();
 
   void schedulersStep(int step);
