@@ -144,6 +144,7 @@ int main(int argc, char *argv[]) {
         if (!resume.empty()) step = model.loadPly(resume) + 1;
 
         double lastGatePsnr = -1e9;   // early-stop: previous 5k-step subset PSNR
+        int gateMisses = 0;           // early-stop: consecutive sub-threshold gates
         size_t stoppedAt = 0;         // early-stop: step we stopped at (0 = ran to numIters)
 
         bool benchmarking = std::getenv("BENCHMARK") != nullptr;
@@ -204,9 +205,12 @@ int main(int argc, char *argv[]) {
             // Quality gate: cheap test-subset eval every 5000 steps. Stops the
             // fine-tuning tail once it pays less than earlyStopDelta dB per 5k
             // (outdoor scenes saturate ~30k; dense indoor keeps earning).
+            // Two consecutive sub-threshold gates are required: a 10-view probe
+            // proved too aliased on orbit captures (read 0.0 dB across a span
+            // where the full 90-view eval gained +0.24), so use 30 views + hysteresis.
             if (earlyStopDelta > 0.0f && evalMode && !testCams.empty()
                 && step >= 10000 && step % 5000 == 0 && step < (size_t)numIters) {
-                size_t nSub = std::min((size_t)10, testCams.size());
+                size_t nSub = std::min((size_t)30, testCams.size());
                 size_t stride = testCams.size() / nSub;
                 double sum = 0;
                 for (size_t i = 0; i < nSub; i++) {
@@ -218,14 +222,18 @@ int main(int argc, char *argv[]) {
                     sum += psnr(rgb_cpu, gt_cpu);
                 }
                 double gatePsnr = sum / nSub;
-                std::cout << "gate step=" << step
-                          << " subsetPSNR=" << gatePsnr
-                          << " delta=" << (gatePsnr - lastGatePsnr) << std::endl;
+                std::cout << "gate step=" << step << std::fixed << std::setprecision(3)
+                          << " subsetPSNR=" << gatePsnr;
+                if (lastGatePsnr > -1e8) std::cout << " delta=" << (gatePsnr - lastGatePsnr);
+                std::cout << std::endl;
                 if (lastGatePsnr > -1e8 && gatePsnr - lastGatePsnr < earlyStopDelta) {
-                    std::cout << "early-stop: +" << (gatePsnr - lastGatePsnr)
-                              << " dB over last 5000 steps < " << earlyStopDelta
-                              << "; stopping at step " << step << std::endl;
-                    stoppedAt = step;
+                    if (++gateMisses >= 2) {
+                        std::cout << "early-stop: two gates below " << earlyStopDelta
+                                  << " dB per 5000 steps; stopping at step " << step << std::endl;
+                        stoppedAt = step;
+                    }
+                } else {
+                    gateMisses = 0;
                 }
                 lastGatePsnr = gatePsnr;
             }
