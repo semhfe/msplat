@@ -13,6 +13,8 @@
 #include "msplat.hpp"
 #include "bindings.h"
 #import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+#include <mach/mach.h>
 
 namespace fs = std::filesystem;
 
@@ -98,6 +100,13 @@ int main(int argc, char *argv[]) {
                    "Stop when test-subset PSNR improves less than this (dB) over 5000 steps (requires --eval; 0 = off)")
         ->check(CLI::Range(0.0f, 10.0f));
 
+    // Memory characterization: grow to cap, allocate every real buffer, print the
+    // exact Metal allocation, and exit — used to fit the app's RAM estimator to the
+    // engine's actual allocator (regenerated per build). No training/eval.
+    bool probeMemory = false;
+    app.add_flag("--probe-memory", probeMemory,
+                 "Allocate all training buffers at cap, print [[PROBE]] memory line, and exit");
+
     CLI11_PARSE(app, argc, argv);
 
     if (validate || !valRender.empty()) validate = true;
@@ -139,6 +148,53 @@ int main(int argc, char *argv[]) {
         std::vector<size_t> camIndices(cams.size());
         std::iota(camIndices.begin(), camIndices.end(), 0);
         InfiniteRandomIterator<size_t> camsIter(camIndices);
+
+        // ── Memory probe: reach peak allocation (num_active = cap), then report ──
+        if (probeMemory) {
+            // MCMC grows ~5%/100 steps toward cap; run until we reach it (or a safety
+            // ceiling), touching the full forward+backward+sort path so every buffer
+            // is allocated at its peak size. Low-cap probes hit cap at init already.
+            int64_t target = (int64_t)(0.99 * capMax);
+            int safetyMax = 12000;
+            for (int step = 1; step <= safetyMax && model.num_active < target; step++) {
+                Camera &cam = cams[camsIter.next()];
+                MTensor gt = cam.getGPUImage();
+                model.fullIteration(cam, step, gt, ssimWeight);
+                model.schedulersStep(step);
+                model.mcmcAfterTrain(step);
+                msplat_commit();
+            }
+            msplat_gpu_sync();
+
+            // Exact image-buffer bytes (uint8 RGB, one resident copy per camera).
+            uint64_t imageBytes = 0;
+            int64_t pixels = 0;
+            for (auto &cam : inputData.cameras) {
+                uint64_t p = (uint64_t)cam.width * (uint64_t)cam.height;
+                imageBytes += p * 3;
+                if ((int64_t)p > pixels) pixels = (int64_t)p;  // per-image training resolution
+            }
+            uint64_t deviceAllocated = (uint64_t)[msplat_device() currentAllocatedSize];
+
+            struct task_vm_info vmInfo;
+            mach_msg_type_number_t vmCount = TASK_VM_INFO_COUNT;
+            uint64_t phys = 0;
+            if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmInfo, &vmCount) == KERN_SUCCESS)
+                phys = vmInfo.phys_footprint;
+
+            std::cout << "[[PROBE]]"
+                      << " cap=" << capMax
+                      << " active=" << model.num_active
+                      << " images=" << inputData.cameras.size()
+                      << " pixels=" << pixels
+                      << " images_bytes=" << imageBytes
+                      << " device_allocated=" << deviceAllocated
+                      << " phys=" << phys
+                      << std::endl;
+            cleanup_msplat_metal();
+            msplat_gpu_sync();
+            return 0;
+        }
 
         size_t step = 1;
         if (!resume.empty()) step = model.loadPly(resume) + 1;
