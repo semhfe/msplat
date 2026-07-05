@@ -423,40 +423,45 @@ struct FusedTensorCache {
 
     void ensure_forward(int np, int64_t cap, int ih, int iw, int nt,
                         id<MTLDevice> dev) {
+        // MTensor has no destructor/move-assign: reassigning a cached buffer
+        // orphans its retained MTLBuffer (leak). During MCMC growth these ensure_*
+        // reallocs fire repeatedly, so the leaked intermediates accumulate in
+        // proportion to the seed→cap growth path — this was the dominant,
+        // un-enumerable "residual" in the RAM model. reset() the old buffer first.
         if (np != fwd_num_points) {
             fwd_num_points = np;
-            xys = mtensor_empty(dev, {np, 2}, DType::Float32);
-            depths = mtensor_empty(dev, {np}, DType::Float32);
-            radii_out = mtensor_empty(dev, {np}, DType::Int32);
-            conics = mtensor_empty(dev, {np, 3}, DType::Float32);
-            num_tiles_hit = mtensor_empty(dev, {np}, DType::Int32);
-            colors = mtensor_empty(dev, {np, 3}, DType::Float32);
-            aabb = mtensor_empty(dev, {np, 2}, DType::Float32);
+            xys.reset();            xys = mtensor_empty(dev, {np, 2}, DType::Float32);
+            depths.reset();         depths = mtensor_empty(dev, {np}, DType::Float32);
+            radii_out.reset();      radii_out = mtensor_empty(dev, {np}, DType::Int32);
+            conics.reset();         conics = mtensor_empty(dev, {np, 3}, DType::Float32);
+            num_tiles_hit.reset();  num_tiles_hit = mtensor_empty(dev, {np}, DType::Int32);
+            colors.reset();         colors = mtensor_empty(dev, {np, 3}, DType::Float32);
+            aabb.reset();           aabb = mtensor_empty(dev, {np, 2}, DType::Float32);
         }
         if (cap != capacity) {
             capacity = cap;
-            gaussian_ids = mtensor_empty(dev, {cap}, DType::Int32);
-            isect_keys_unsorted = mtensor_empty(dev, {cap}, DType::Int64);
-            packed_xy_opac = mtensor_empty(dev, {cap, 3}, DType::Float32);
-            packed_conic = mtensor_empty(dev, {cap, 3}, DType::Float32);
-            packed_rgb = mtensor_empty(dev, {cap, 3}, DType::Float32);
+            gaussian_ids.reset();        gaussian_ids = mtensor_empty(dev, {cap}, DType::Int32);
+            isect_keys_unsorted.reset(); isect_keys_unsorted = mtensor_empty(dev, {cap}, DType::Int64);
+            packed_xy_opac.reset();      packed_xy_opac = mtensor_empty(dev, {cap, 3}, DType::Float32);
+            packed_conic.reset();        packed_conic = mtensor_empty(dev, {cap, 3}, DType::Float32);
+            packed_rgb.reset();          packed_rgb = mtensor_empty(dev, {cap, 3}, DType::Float32);
         }
         if (ih != img_height || iw != img_width) {
             img_height = ih; img_width = iw;
-            out_img = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
-            final_Ts = mtensor_empty(dev, {ih, iw}, DType::Float32);
-            final_idx = mtensor_empty(dev, {ih, iw}, DType::Int32);
-            loss_intermediates = mtensor_empty(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
-            ssim_h_buf = mtensor_empty(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
-            v_rendered = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            out_img.reset();            out_img = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            final_Ts.reset();           final_Ts = mtensor_empty(dev, {ih, iw}, DType::Float32);
+            final_idx.reset();          final_idx = mtensor_empty(dev, {ih, iw}, DType::Int32);
+            loss_intermediates.reset(); loss_intermediates = mtensor_empty(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
+            ssim_h_buf.reset();         ssim_h_buf = mtensor_empty(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
+            v_rendered.reset();         v_rendered = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
         }
         if (nt != num_tiles) {
             num_tiles = nt;
-            tile_bins = mtensor_empty(dev, {nt, 2}, DType::Int32);
-            tile_counts = mtensor_empty(dev, {(int64_t)nt}, DType::Int32);
-            tile_write_counters = mtensor_empty(dev, {(int64_t)nt}, DType::Int32);
-            exact_offsets = mtensor_empty(dev, {(int64_t)nt}, DType::Int32);
-            sort_offsets = mtensor_empty(dev, {(int64_t)(nt + 1)}, DType::Int32);
+            tile_bins.reset();           tile_bins = mtensor_empty(dev, {nt, 2}, DType::Int32);
+            tile_counts.reset();         tile_counts = mtensor_empty(dev, {(int64_t)nt}, DType::Int32);
+            tile_write_counters.reset(); tile_write_counters = mtensor_empty(dev, {(int64_t)nt}, DType::Int32);
+            exact_offsets.reset();       exact_offsets = mtensor_empty(dev, {(int64_t)nt}, DType::Int32);
+            sort_offsets.reset();        sort_offsets = mtensor_empty(dev, {(int64_t)(nt + 1)}, DType::Int32);
         }
         if (!loss_sum.defined()) {
             loss_sum = mtensor_empty(dev, {1}, DType::Float32);
@@ -466,27 +471,29 @@ struct FusedTensorCache {
     void ensure_chunks(int K, int ih, int iw, id<MTLDevice> dev) {
         if (K <= chunk_K_max && ih == img_height && iw == img_width) return;
         chunk_K_max = K;
-        chunk_T = mtensor_empty(dev, {K, ih, iw}, DType::Float32);
-        chunk_C = mtensor_empty(dev, {K, ih, iw, 3}, DType::Float32);
-        chunk_final_idx = mtensor_empty(dev, {K, ih, iw}, DType::Int32);
-        prefix_T = mtensor_empty(dev, {K, ih, iw}, DType::Float32);
-        after_C = mtensor_empty(dev, {K, ih, iw, 3}, DType::Float32);
+        // reset() before reassign — see the leak note in ensure_forward.
+        chunk_T.reset();         chunk_T = mtensor_empty(dev, {K, ih, iw}, DType::Float32);
+        chunk_C.reset();         chunk_C = mtensor_empty(dev, {K, ih, iw, 3}, DType::Float32);
+        chunk_final_idx.reset(); chunk_final_idx = mtensor_empty(dev, {K, ih, iw}, DType::Int32);
+        prefix_T.reset();        prefix_T = mtensor_empty(dev, {K, ih, iw}, DType::Float32);
+        after_C.reset();         after_C = mtensor_empty(dev, {K, ih, iw, 3}, DType::Float32);
     }
 
     void ensure_backward(int np, int frb, id<MTLDevice> dev) {
         if (np != bwd_num_points || frb != features_rest_bases || !v_xy.defined()) {
             bwd_num_points = np;
             features_rest_bases = frb;
-            v_xy = mtensor_empty(dev, {np, 2}, DType::Float32);
-            v_conic = mtensor_empty(dev, {np, 3}, DType::Float32);
-            v_colors_rast = mtensor_empty(dev, {np, 3}, DType::Float32);
-            v_opacity = mtensor_empty(dev, {np, 1}, DType::Float32);
-            v_depth = mtensor_empty(dev, {np}, DType::Float32);
-            v_mean3d = mtensor_empty(dev, {np, 3}, DType::Float32);
-            v_scale = mtensor_empty(dev, {np, 3}, DType::Float32);
-            v_quat = mtensor_empty(dev, {np, 4}, DType::Float32);
-            v_features_dc = mtensor_empty(dev, {np, 3}, DType::Float32);
-            v_features_rest = mtensor_empty(dev, {(int64_t)np, (int64_t)frb, 3}, DType::Float32);
+            // reset() before reassign — see the leak note in ensure_forward.
+            v_xy.reset();            v_xy = mtensor_empty(dev, {np, 2}, DType::Float32);
+            v_conic.reset();         v_conic = mtensor_empty(dev, {np, 3}, DType::Float32);
+            v_colors_rast.reset();   v_colors_rast = mtensor_empty(dev, {np, 3}, DType::Float32);
+            v_opacity.reset();       v_opacity = mtensor_empty(dev, {np, 1}, DType::Float32);
+            v_depth.reset();         v_depth = mtensor_empty(dev, {np}, DType::Float32);
+            v_mean3d.reset();        v_mean3d = mtensor_empty(dev, {np, 3}, DType::Float32);
+            v_scale.reset();         v_scale = mtensor_empty(dev, {np, 3}, DType::Float32);
+            v_quat.reset();          v_quat = mtensor_empty(dev, {np, 4}, DType::Float32);
+            v_features_dc.reset();   v_features_dc = mtensor_empty(dev, {np, 3}, DType::Float32);
+            v_features_rest.reset(); v_features_rest = mtensor_empty(dev, {(int64_t)np, (int64_t)frb, 3}, DType::Float32);
         }
     }
 };
