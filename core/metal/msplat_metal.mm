@@ -367,6 +367,28 @@ MetalContext* init_msplat_metal_context() {
                     p.pso ? (unsigned long)p.pso.maxTotalThreadsPerThreadgroup : 0ul);
         }
         fprintf(stderr, "\n");
+
+        // Fail fast if any kernel's static threadgroup memory exceeds this
+        // device's limit — dispatching such a PSO is undefined behavior that
+        // Release builds execute silently. Skip the abort under Metal shader
+        // validation: its instrumentation adds shadow threadgroup memory
+        // (~2x static usage), so the SSIM kernels legitimately read over the
+        // limit there while being legal in normal execution.
+        const bool shader_validation = std::getenv("MTL_SHADER_VALIDATION") != nullptr;
+        for (const auto& p : psos) {
+            if (!p.pso) continue;
+            NSUInteger tg_static = p.pso.staticThreadgroupMemoryLength;
+            if (tg_static > device.maxThreadgroupMemoryLength) {
+                fprintf(stderr,
+                        "msplat: %s: %s uses %lu bytes of threadgroup memory but %s "
+                        "allows only %lu.%s\n",
+                        shader_validation ? "WARNING (shader validation inflates this)" : "FATAL",
+                        p.name, (unsigned long)tg_static, [device.name UTF8String],
+                        (unsigned long)device.maxThreadgroupMemoryLength,
+                        shader_validation ? "" : " Dispatching it would corrupt training.");
+                if (!shader_validation) abort();
+            }
+        }
     }
 
     [metal_library release];
