@@ -301,6 +301,49 @@ MetalContext* init_msplat_metal_context() {
     ctx->sgld_noise_kernel_cpso                   = load(@"sgld_noise_kernel");
     ctx->mcmc_regularization_kernel_cpso          = load(@"mcmc_regularization_kernel");
 
+    // Device + engine provenance. Emitted once per run so every workspace log
+    // records which GPU family and per-PSO thread limits produced the result
+    // (limits are per-device compiler decisions, not properties of the metallib).
+    {
+        const char* fam = "unknown";
+        if      ([device supportsFamily:MTLGPUFamilyApple9]) fam = "apple9";
+        else if ([device supportsFamily:MTLGPUFamilyApple8]) fam = "apple8";
+        else if ([device supportsFamily:MTLGPUFamilyApple7]) fam = "apple7";
+        else if ([device supportsFamily:MTLGPUFamilyApple6]) fam = "apple6";
+        fprintf(stderr, "[engine] msplat %s | GPU: %s | family: %s | maxTGmem: %lu\n",
+                APP_VERSION, [device.name UTF8String], fam,
+                (unsigned long)device.maxThreadgroupMemoryLength);
+
+        struct PsoInfo { const char* name; id<MTLComputePipelineState> pso; };
+        const PsoInfo psos[] = {
+            {"project_fwd",      ctx->project_and_sh_forward_kernel_cpso},
+            {"count_isect",      ctx->count_intersections_kernel_cpso},
+            {"prefix_sum_tiles", ctx->prefix_sum_tiles_kernel_cpso},
+            {"scatter_isect",    ctx->scatter_intersections_kernel_cpso},
+            {"hybrid_sort_pack", ctx->hybrid_sort_pack_kernel_cpso},
+            {"rast_fwd_chunked", ctx->rasterize_forward_chunked_kernel_cpso},
+            {"rast_fwd_merge",   ctx->rasterize_forward_merge_kernel_cpso},
+            {"chunk_prefix_suffix", ctx->compute_chunk_prefix_suffix_kernel_cpso},
+            {"rast_bwd",         ctx->rasterize_backward_kernel_cpso},
+            {"rast_bwd_chunked", ctx->rasterize_backward_chunked_kernel_cpso},
+            {"ssim_h_fwd",       ctx->ssim_h_fwd_kernel_cpso},
+            {"ssim_v_fwd",       ctx->ssim_v_fwd_kernel_cpso},
+            {"ssim_fused_bwd",   ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso},
+            {"ssim_v_bwd",       ctx->ssim_v_bwd_kernel_cpso},
+            {"project_bwd",      ctx->project_and_sh_backward_kernel_cpso},
+            {"fused_adam",       ctx->fused_adam_kernel_cpso},
+            {"sgld_noise_gen",   ctx->sgld_noise_gen_kernel_cpso},
+            {"sgld_noise",       ctx->sgld_noise_kernel_cpso},
+            {"mcmc_reg",         ctx->mcmc_regularization_kernel_cpso},
+        };
+        fprintf(stderr, "[engine] PSO maxThreads:");
+        for (const auto& p : psos) {
+            fprintf(stderr, " %s=%lu", p.name,
+                    p.pso ? (unsigned long)p.pso.maxTotalThreadsPerThreadgroup : 0ul);
+        }
+        fprintf(stderr, "\n");
+    }
+
     [metal_library release];
 
     // Initialize counter sampling if PROFILE_STAGES is set
