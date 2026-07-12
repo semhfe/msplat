@@ -107,11 +107,21 @@ inline float4 transform_4x4(constant float *mat, const float3 p) {
     return out;
 }
 
+// Clamped log-scale → linear scale. |log s| ≤ 15 covers any physically
+// meaningful gaussian (e^±15) while keeping exp() finite when the optimizer
+// or SGLD noise drives a parameter out of range. Under fast-math a single
+// Inf here propagates NaN through cov3d with no downstream containment.
+inline float3 exp_scale_clamped(const float3 log_scale) {
+    return exp(clamp(log_scale, -15.f, 15.f));
+}
+
 // Normalized quaternion → 3x3 rotation matrix (column-major for Metal).
 inline float3x3 quat_to_rotmat(const float4 quat) {
-    float s = rsqrt(
-        quat.w * quat.w + quat.x * quat.x + quat.y * quat.y + quat.z * quat.z
-    );
+    // Epsilon floor: rsqrt(0) = Inf for a degenerate/zeroed quaternion.
+    float s = rsqrt(max(
+        quat.w * quat.w + quat.x * quat.x + quat.y * quat.y + quat.z * quat.z,
+        1e-8f
+    ));
     float w = quat.x * s;
     float x = quat.y * s;
     float y = quat.z * s;
@@ -287,8 +297,10 @@ inline bool compute_cov2d_bounds(
 ) {
     // Invert 2x2 covariance (upper triangle in cov2d.xyz) to get the conic,
     // and compute the gaussian's screen-space radius from eigenvalues (3-sigma).
+    // A valid (blurred) covariance has det ≥ ~0.09; reject near-zero, negative,
+    // and NaN dets (the `!(>)` form catches NaN) — 1/tiny → Inf conic under fast-math.
     float det = cov2d.x * cov2d.z - cov2d.y * cov2d.y;
-    if (det == 0.f)
+    if (!(det > 1e-6f))
         return false;
     float inv_det = 1.f / det;
 
@@ -425,7 +437,7 @@ kernel void project_gaussians_forward_kernel(
 
     // compute the projected covariance
     // scales are in log-space; exp() here to avoid a separate MPS dispatch
-    float3 scale = exp(read_packed_float3(scales, idx));
+    float3 scale = exp_scale_clamped(read_packed_float3(scales, idx));
     float4 quat = read_packed_float4(quats, idx);
     device float *cur_cov3d = &(covs3d[6 * idx]);
     scale_rot_to_cov3d(scale, glob_scale, quat, cur_cov3d);
@@ -1407,9 +1419,11 @@ void project_cov3d_ewa_vjp(
 }
 
 inline float4 quat_to_rotmat_vjp(const float4 quat, const float3x3 v_R) {
-    float s = rsqrt(
-        quat.w * quat.w + quat.x * quat.x + quat.y * quat.y + quat.z * quat.z
-    );
+    // Same epsilon floor as quat_to_rotmat: rsqrt(0) = Inf.
+    float s = rsqrt(max(
+        quat.w * quat.w + quat.x * quat.x + quat.y * quat.y + quat.z * quat.z,
+        1e-8f
+    ));
     float w = quat.x * s;
     float x = quat.y * s;
     float y = quat.z * s;
@@ -1598,7 +1612,7 @@ kernel void project_gaussians_backward_kernel(
     );
     // get v_scale and v_quat
     // scales are in log-space; exp() here and apply chain rule for dL/d(log_scale)
-    float3 exp_scale = exp(read_packed_float3(scales, idx));
+    float3 exp_scale = exp_scale_clamped(read_packed_float3(scales, idx));
     scale_rot_to_cov3d_vjp(
         exp_scale,
         glob_scale,
@@ -1709,7 +1723,7 @@ kernel void project_and_sh_forward_kernel(
         return;
     }
 
-    float3 scale = exp(read_packed_float3(scales, idx));
+    float3 scale = exp_scale_clamped(read_packed_float3(scales, idx));
     float4 quat = read_packed_float4(quats, idx);
     // Compute cov3d in thread-local registers (no device memory round-trip)
     float local_cov3d[6];
@@ -1848,7 +1862,7 @@ kernel void project_and_sh_backward_kernel(
     );
 
     // Recompute cov3d from scales+quats (avoids saving/reading 3.6MB tensor)
-    float3 exp_scale = exp(read_packed_float3(scales, idx));
+    float3 exp_scale = exp_scale_clamped(read_packed_float3(scales, idx));
     float4 quat = read_packed_float4(quats, idx);
     float local_cov3d[6];
     scale_rot_to_cov3d(exp_scale, glob_scale, quat, local_cov3d);
@@ -3740,11 +3754,16 @@ kernel void sgld_noise_kernel(
     float n2 = noise[idx*3+2] * noise_scale;
 
     // 3. Build rotation matrix from quaternion (normalize first)
+    // Epsilon floor: a zeroed quaternion would divide by 0 → NaN displacement.
     float qw = quats[idx*4], qx = quats[idx*4+1], qy = quats[idx*4+2], qz = quats[idx*4+3];
-    float qlen = sqrt(qw*qw + qx*qx + qy*qy + qz*qz);
+    float qlen = sqrt(max(qw*qw + qx*qx + qy*qy + qz*qz, 1e-8f));
     qw /= qlen; qx /= qlen; qy /= qlen; qz /= qlen;
 
-    float sx = exp(scales[idx*3]), sy = exp(scales[idx*3+1]), sz = exp(scales[idx*3+2]);
+    // Clamp log-scales (see exp_scale_clamped): s² noise amplification must stay
+    // finite — the isfinite() containment below is not guaranteed under fast-math.
+    float sx = exp(clamp(scales[idx*3],   -15.0f, 15.0f)),
+          sy = exp(clamp(scales[idx*3+1], -15.0f, 15.0f)),
+          sz = exp(clamp(scales[idx*3+2], -15.0f, 15.0f));
 
     // Σ @ noise = R @ diag(s²) @ R^T @ noise
     // Step A: R^T @ noise
@@ -3803,10 +3822,12 @@ kernel void mcmc_regularization_kernel(
     float sig = 1.0f / (1.0f + exp(-op));
     opacities[idx] -= lr * op_reg * sig * (1.0f - sig);
 
-    // Scale regularization: nudge toward smaller scale
+    // Scale regularization: nudge toward smaller scale.
+    // Clamp the exp input: this writes straight back into the parameter, so an
+    // overflowed exp(s) would turn the scale -Inf permanently (NaN epidemic seed).
     for (int i = 0; i < 3; i++) {
         float s = scales[idx*3 + i];
-        scales[idx*3 + i] -= lr * sc_reg * exp(s);
+        scales[idx*3 + i] -= lr * sc_reg * exp(clamp(s, -15.0f, 15.0f));
     }
 }
 
