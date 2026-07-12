@@ -453,6 +453,10 @@ void Model::mcmcAfterTrain(int step) {
     alive.reserve(num_active);
     int culled = 0;
     int nonfinite = 0;
+    // Per-class breakdown of nonfinite Gaussians: scale/quat-first points at
+    // kernel math (exp/rsqrt overflow), several classes at once points at sort
+    // corruption (wrong gaussian_ids). Only computed for already-bad Gaussians.
+    int nf_mean = 0, nf_scale = 0, nf_quat = 0, nf_op = 0, nf_sh = 0;
     for (int i = 0; i < num_active; i++) {
         // Any non-finite parameter poisons gradients for every Gaussian sharing
         // a tile, and NaN always fails the <= comparison below — so without this
@@ -466,7 +470,22 @@ void Model::mcmcAfterTrain(int step) {
             && std::isfinite(fdc[i*3+0]) && std::isfinite(fdc[i*3+1]) && std::isfinite(fdc[i*3+2]);
         for (int64_t j = 0; finite && j < fr_stride; j++)
             finite = std::isfinite(fr[i*fr_stride + j]);
-        if (!finite) nonfinite++;
+        if (!finite) {
+            nonfinite++;
+            if (!(std::isfinite(mn[i*3+0]) && std::isfinite(mn[i*3+1]) && std::isfinite(mn[i*3+2])))
+                nf_mean++;
+            if (!(std::isfinite(sc[i*3+0]) && std::isfinite(sc[i*3+1]) && std::isfinite(sc[i*3+2])))
+                nf_scale++;
+            if (!(std::isfinite(qt[i*4+0]) && std::isfinite(qt[i*4+1])
+                  && std::isfinite(qt[i*4+2]) && std::isfinite(qt[i*4+3])))
+                nf_quat++;
+            if (!std::isfinite(op[i]))
+                nf_op++;
+            bool sh_ok = std::isfinite(fdc[i*3+0]) && std::isfinite(fdc[i*3+1]) && std::isfinite(fdc[i*3+2]);
+            for (int64_t j = 0; sh_ok && j < fr_stride; j++)
+                sh_ok = std::isfinite(fr[i*fr_stride + j]);
+            if (!sh_ok) nf_sh++;
+        }
 
         float sig = 1.0f / (1.0f + std::exp(-op[i]));
         bool is_dead = !finite || (sig <= 0.005f);
@@ -492,6 +511,16 @@ void Model::mcmcAfterTrain(int step) {
                   << " culled=" << culled
                   << " nonfinite=" << nonfinite
                   << " grown=" << grown << std::endl;
+    }
+    // Unthrottled 100-step breakdown, but only when something is actually wrong —
+    // healthy runs emit nothing, an epidemic gets per-class 100-step resolution.
+    if (nonfinite > 0) {
+        std::cout << "MCMC nonfinite step=" << step
+                  << " mean=" << nf_mean
+                  << " scale=" << nf_scale
+                  << " quat=" << nf_quat
+                  << " opacity=" << nf_op
+                  << " sh=" << nf_sh << std::endl;
     }
 }
 
