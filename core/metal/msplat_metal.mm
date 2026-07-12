@@ -262,14 +262,39 @@ MetalContext* init_msplat_metal_context() {
     ctx->prefix_sum_tiles_kernel_cpso             = load(@"prefix_sum_tiles_kernel");
     ctx->scatter_intersections_kernel_cpso        = load(@"scatter_intersections_kernel");
     ctx->hybrid_sort_pack_kernel_cpso             = load(@"hybrid_sort_pack_kernel");
-    // Runtime safety check: threadgroup memory for bitonic sort
+    // Runtime safety checks — always on (NSCAssert is compiled out in Release,
+    // which is exactly the build TestFlight testers run). Both sort kernels are
+    // dispatched with exactly 1024 threads/threadgroup; if this device's PSO
+    // limit is lower (per-family register allocation), the dispatch is invalid
+    // and silently corrupts sort offsets → gaussian_ids → NaN epidemic.
+    // Fail fast with an actionable message instead of training garbage.
     {
         NSUInteger tg_mem_needed = 2048 * sizeof(uint64_t);  // BITONIC_TG_CAP * 8
-        NSCAssert(device.maxThreadgroupMemoryLength >= tg_mem_needed,
-                  @"This device's max threadgroup memory (%lu) is below the configured "
-                  @"BITONIC_TG_CAP (2048 × 8 = %lu bytes). Lower BITONIC_TG_CAP.",
-                  (unsigned long)device.maxThreadgroupMemoryLength,
-                  (unsigned long)tg_mem_needed);
+        if (device.maxThreadgroupMemoryLength < tg_mem_needed) {
+            fprintf(stderr,
+                    "msplat: FATAL: device max threadgroup memory (%lu) is below the "
+                    "configured BITONIC_TG_CAP (2048 x 8 = %lu bytes). Lower BITONIC_TG_CAP.\n",
+                    (unsigned long)device.maxThreadgroupMemoryLength,
+                    (unsigned long)tg_mem_needed);
+            abort();
+        }
+        struct FixedTG { const char* name; id<MTLComputePipelineState> pso; };
+        const FixedTG fixed_tg[] = {
+            {"prefix_sum_tiles_kernel", ctx->prefix_sum_tiles_kernel_cpso},
+            {"hybrid_sort_pack_kernel", ctx->hybrid_sort_pack_kernel_cpso},
+        };
+        for (const auto& k : fixed_tg) {
+            if (!k.pso || k.pso.maxTotalThreadsPerThreadgroup < 1024) {
+                fprintf(stderr,
+                        "msplat: FATAL: %s supports only %lu threads/threadgroup on %s "
+                        "but is dispatched with 1024. This device cannot run the hybrid "
+                        "sort correctly — please report this GPU model.\n",
+                        k.name,
+                        k.pso ? (unsigned long)k.pso.maxTotalThreadsPerThreadgroup : 0ul,
+                        [device.name UTF8String]);
+                abort();
+            }
+        }
     }
     // Legacy radix sort pipeline (kept loadable, no longer dispatched)
     ctx->map_gaussian_to_intersects_kernel_cpso   = load(@"map_gaussian_to_intersects_kernel");

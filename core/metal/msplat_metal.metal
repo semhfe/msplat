@@ -2288,6 +2288,11 @@ kernel void count_intersections_kernel(
 // Single threadgroup, 1024 threads. Cooperative strided scan over tile_counts.
 // Handles up to 1024 * MAX_STRIDE tiles (practically unlimited).
 
+// max_total_threads_per_threadgroup guarantees this kernel can launch all
+// HYBRID_SORT_TG_THREADS threads on every GPU family: the scan is hardwired
+// to 1024 lanes, and a per-device PSO limit below that (register pressure on
+// older families) would silently corrupt every sort offset downstream.
+[[max_total_threads_per_threadgroup(1024)]]
 kernel void prefix_sum_tiles_kernel(
     constant uint*   tile_counts_in     [[buffer(0)]],   // size num_tiles
     device   uint*   exact_offsets      [[buffer(1)]],   // size num_tiles
@@ -2393,6 +2398,9 @@ kernel void scatter_intersections_kernel(
 // One threadgroup per tile. Bitonic sort (threadgroup mem for sparse, device mem for dense),
 // then pack results into rasterizer-consumed output arrays.
 
+// Guarantees 1024 launchable threads on every GPU family (see prefix_sum_tiles_kernel).
+// This kernel is the top register-pressure suspect: 16 KB threadgroup memory + uint64 bitonic.
+[[max_total_threads_per_threadgroup(1024)]]
 kernel void hybrid_sort_pack_kernel(
     constant uint*      tile_counts_in       [[buffer(0)]],
     constant uint*      sort_offsets         [[buffer(1)]],   // size num_tiles+1
