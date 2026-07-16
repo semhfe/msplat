@@ -107,6 +107,21 @@ inline float4 transform_4x4(constant float *mat, const float3 p) {
     return out;
 }
 
+// Fast-math-proof finiteness tests. isfinite()/isnan() may legally be folded
+// to constants under fast-math (default for this metallib), and whether that
+// happens is a per-GPU-family backend decision — the M1 NaN epidemic showed
+// containment must not depend on it. A bit test on the exponent field cannot
+// be folded: exponent all-ones ⇔ Inf or NaN.
+inline bool finite_bits(float x) {
+    return (as_type<uint>(x) & 0x7F800000u) != 0x7F800000u;
+}
+inline bool finite_bits3(float3 v) {
+    return finite_bits(v.x) && finite_bits(v.y) && finite_bits(v.z);
+}
+inline bool finite_bits4(float4 v) {
+    return finite_bits(v.x) && finite_bits(v.y) && finite_bits(v.z) && finite_bits(v.w);
+}
+
 // Clamped log-scale → linear scale. |log s| ≤ 15 covers any physically
 // meaningful gaussian (e^±15) while keeping exp() finite when the optimizer
 // or SGLD noise drives a parameter out of range. Under fast-math a single
@@ -1664,11 +1679,21 @@ kernel void fused_adam_kernel(
     constant float & bc2_sqrt [[buffer(7)]],
     constant float & eps [[buffer(8)]],
     constant uint & n [[buffer(9)]],
+    device atomic_uint * nan_counts [[buffer(10)]],  // per-param-group counters
+    constant uint & group_idx [[buffer(11)]],
     uint tid [[thread_position_in_grid]]
 ) {
     if (tid >= n) return;
 
     float g = grads[tid];
+    // Adam boundary gate: a nonfinite gradient must never reach the parameter
+    // or the moment accumulators — one poisoned element becomes a permanently
+    // NaN parameter and seeds the whole-Gaussian epidemic. Skip the update,
+    // count it per group so the CPU log can localize the producing kernel.
+    if (!finite_bits(g)) {
+        atomic_fetch_add_explicit(nan_counts + group_idx, 1u, memory_order_relaxed);
+        return;
+    }
     float m = fma(beta1, exp_avg[tid], (1.0f - beta1) * g);
     float v = fma(beta2, exp_avg_sq[tid], (1.0f - beta2) * g * g);
 
@@ -1774,6 +1799,19 @@ kernel void project_and_sh_forward_kernel(
     uint rest_idx = (num_bases - 1) * num_channels * idx;
     uint idx_col = num_channels * idx;
     sh_coeffs_to_color(degrees_to_use, viewdir, &(features_dc[dc_idx]), &(features_rest[rest_idx]), &(colors[idx_col]));
+
+    // Zombie gate: parameters can be nonfinite for up to 99 steps between CPU
+    // culls, and one NaN attribute entering a tile poisons the gradients of
+    // every gaussian sharing a pixel (the whole-class NaN death signature).
+    // If any projection output is nonfinite, cull the gaussian for this step
+    // (radii=0 excludes it from count/scatter/rasterize).
+    float3 out_rgb = read_packed_float3(colors, idx);
+    if (!(finite_bits(center.x) && finite_bits(center.y) && finite_bits(p_view.z)
+          && finite_bits(aabb_x) && finite_bits(aabb_y)
+          && finite_bits3(conic) && finite_bits3(out_rgb))) {
+        radii[idx] = 0;
+        num_tiles_hit[idx] = 0;
+    }
 }
 
 // Adam update helper — applies one Adam step to a single element.
@@ -1831,6 +1869,7 @@ kernel void project_and_sh_backward_kernel(
     device float* rest_exp_avg,
     device float* rest_exp_avg_sq,
     constant SHAdamParams& adam_hp,
+    device atomic_uint* nan_counts,    // slot 3: nonfinite v_colors (SH grads skipped)
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= (uint)num_points || radii[idx] <= 0) {
@@ -1910,6 +1949,14 @@ kernel void project_and_sh_backward_kernel(
     uint idx_col = num_channels * idx;
 
     float vc[3] = { v_colors[idx_col], v_colors[idx_col + 1], v_colors[idx_col + 2] };
+
+    // Adam boundary gate for the inline SH updates: every SH grad below is a
+    // multiple of vc, so one nonfinite component would poison features_dc AND
+    // features_rest for this gaussian. Skip all SH updates this step, count it.
+    if (!(finite_bits(vc[0]) && finite_bits(vc[1]) && finite_bits(vc[2]))) {
+        atomic_fetch_add_explicit(nan_counts + 3, 1u, memory_order_relaxed);
+        return;
+    }
 
     // DC: grad = SH_C0 * v_colors[c]
     for (int c = 0; c < 3; c++) {
@@ -2205,7 +2252,7 @@ inline bool gaussian_is_active(
 ) {
     if (radii[gid] <= 0) return false;
     float d = depths[gid];
-    if (!isfinite(d) || d <= 0.0f) return false;
+    if (!finite_bits(d) || d <= 0.0f) return false;
     return true;
 }
 
@@ -2486,9 +2533,22 @@ kernel void hybrid_sort_pack_kernel(
             gaussian_ids[d] = int(gidx);
             float2 xy = read_packed_float2(xys_in, gidx);
             float opac = 1.f / (1.f + exp(-opacities_in[gidx]));
+            float3 conic = read_packed_float3(conics_in, gidx);
+            float3 rgb = read_packed_float3(colors_in, gidx);
+            // Zombie containment at the pack choke point: opacity never passes
+            // through projection, so a nonfinite opacity (or any attribute that
+            // slipped past the projection gate) is packed fully transparent —
+            // same fate as the out-of-range branch above.
+            if (!(finite_bits(xy.x) && finite_bits(xy.y) && finite_bits(opac)
+                  && finite_bits3(conic) && finite_bits3(rgb))) {
+                write_packed_float3(packed_xy_opac, d, float3(0.0f, 0.0f, 0.0f));
+                write_packed_float3(packed_conic, d, float3(0.0f, 0.0f, 0.0f));
+                write_packed_float3(packed_rgb, d, float3(0.0f, 0.0f, 0.0f));
+                continue;
+            }
             write_packed_float3(packed_xy_opac, d, float3(xy.x, xy.y, opac));
-            write_packed_float3(packed_conic, d, read_packed_float3(conics_in, gidx));
-            write_packed_float3(packed_rgb, d, read_packed_float3(colors_in, gidx));
+            write_packed_float3(packed_conic, d, conic);
+            write_packed_float3(packed_rgb, d, rgb);
         }
     } else {
         // ----- Dense path: bitonic in device memory -----
@@ -2517,9 +2577,19 @@ kernel void hybrid_sort_pack_kernel(
             gaussian_ids[d] = int(gidx);
             float2 xy = read_packed_float2(xys_in, gidx);
             float opac = 1.f / (1.f + exp(-opacities_in[gidx]));
+            float3 conic = read_packed_float3(conics_in, gidx);
+            float3 rgb = read_packed_float3(colors_in, gidx);
+            // Zombie containment: see sparse path above.
+            if (!(finite_bits(xy.x) && finite_bits(xy.y) && finite_bits(opac)
+                  && finite_bits3(conic) && finite_bits3(rgb))) {
+                write_packed_float3(packed_xy_opac, d, float3(0.0f, 0.0f, 0.0f));
+                write_packed_float3(packed_conic, d, float3(0.0f, 0.0f, 0.0f));
+                write_packed_float3(packed_rgb, d, float3(0.0f, 0.0f, 0.0f));
+                continue;
+            }
             write_packed_float3(packed_xy_opac, d, float3(xy.x, xy.y, opac));
-            write_packed_float3(packed_conic, d, read_packed_float3(conics_in, gidx));
-            write_packed_float3(packed_rgb, d, read_packed_float3(colors_in, gidx));
+            write_packed_float3(packed_conic, d, conic);
+            write_packed_float3(packed_rgb, d, rgb);
         }
     }
 }
@@ -2718,8 +2788,10 @@ kernel void fused_loss_forward_kernel(
                 }
             }
 
-            float sigma_x_sq = sq_x - mu_x * mu_x;
-            float sigma_y_sq = sq_y - mu_y * mu_y;
+            // Clamp cancellation artifacts — variances are ≥ 0 by definition
+            // (see ssim_fused_v_fwd_h_bwd_kernel).
+            float sigma_x_sq = max(sq_x - mu_x * mu_x, 0.0f);
+            float sigma_y_sq = max(sq_y - mu_y * mu_y, 0.0f);
             float sigma_xy = cross_xy - mu_x * mu_y;
 
             uint iidx = (py * W + px) * 15 + c * 5;
@@ -3397,8 +3469,10 @@ kernel void ssim_v_fwd_kernel(
                 cross_xy += w * tg_hp[c][lid.y + dy][lid.x][4];
             }
 
-            float sigma_x_sq = sq_x - mu_x * mu_x;
-            float sigma_y_sq = sq_y - mu_y * mu_y;
+            // Clamp cancellation artifacts — variances are ≥ 0 by definition
+            // (see ssim_fused_v_fwd_h_bwd_kernel).
+            float sigma_x_sq = max(sq_x - mu_x * mu_x, 0.0f);
+            float sigma_y_sq = max(sq_y - mu_y * mu_y, 0.0f);
             float sigma_xy = cross_xy - mu_x * mu_y;
 
             // Store intermediates (same format as fused_loss_forward_kernel)
@@ -3491,7 +3565,11 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
                 sq_y += w*tg_hp[tile_y-SSIM_HALF_WIN+k][dx][3];
                 cross_xy += w*tg_hp[tile_y-SSIM_HALF_WIN+k][dx][4];
             }
-            float sigma_x_sq = sq_x - mu_x*mu_x, sigma_y_sq = sq_y - mu_y*mu_y;
+            // Variances are mathematically ≥ 0; negatives are cancellation
+            // artifacts (worse on some GPU-family FMA contractions) that can
+            // push D = σx²+σy²+C2 ≤ 0 and blow up every division below into
+            // the loss-gradient image. Clamp at the definition.
+            float sigma_x_sq = max(sq_x - mu_x*mu_x, 0.0f), sigma_y_sq = max(sq_y - mu_y*mu_y, 0.0f);
             float sigma_xy = cross_xy - mu_x*mu_y;
             float A = 2.0f*mu_x*mu_y + SSIM_C1, B = 2.0f*sigma_xy + SSIM_C2;
             float Cd = mu_x*mu_x + mu_y*mu_y + SSIM_C1, D = sigma_x_sq + sigma_y_sq + SSIM_C2;
@@ -3624,6 +3702,7 @@ kernel void ssim_v_bwd_kernel(
     constant float& ssim_weight,
     constant float& inv_n,          // 1.0 / (H * W * 3)
     device float* v_rendered,       // (H, W, 3)
+    device atomic_uint* nan_counts, // slot 6: nonfinite loss-gradient pixels (sanitized to 0)
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -3679,9 +3758,18 @@ kernel void ssim_v_bwd_kernel(
             float v_ssim = conv_f1 + rend_val * conv_f2 + gt_val * conv_f3;
             float v_l1 = (gt_val > rend_val) ? -1.0f : ((gt_val < rend_val) ? 1.0f : 0.0f);
 
-            v_rendered[(py * W + px) * 3 + c] = inv_n * (
+            float v_px = inv_n * (
                 -ssim_weight * v_ssim + (1.0f - ssim_weight) * v_l1
             );
+            // One nonfinite loss-gradient pixel poisons v_rgb+v_conic+v_xy+
+            // v_opacity of EVERY gaussian blended at that pixel in the same
+            // backward pass (the whole-class death signature). Sanitize to 0
+            // (drop this pixel's contribution for one step) and count it.
+            if (!finite_bits(v_px)) {
+                atomic_fetch_add_explicit(nan_counts + 6, 1u, memory_order_relaxed);
+                v_px = 0.0f;
+            }
+            v_rendered[(py * W + px) * 3 + c] = v_px;
         }
     }
 }
@@ -3760,7 +3848,7 @@ kernel void sgld_noise_kernel(
     qw /= qlen; qx /= qlen; qy /= qlen; qz /= qlen;
 
     // Clamp log-scales (see exp_scale_clamped): s² noise amplification must stay
-    // finite — the isfinite() containment below is not guaranteed under fast-math.
+    // finite — belt for the finite_bits containment below.
     float sx = exp(clamp(scales[idx*3],   -15.0f, 15.0f)),
           sy = exp(clamp(scales[idx*3+1], -15.0f, 15.0f)),
           sz = exp(clamp(scales[idx*3+2], -15.0f, 15.0f));
@@ -3789,9 +3877,9 @@ kernel void sgld_noise_kernel(
     //    (4.3% non-finite Gaussians vs 0.0% on dense scenes). max_disp is computed on
     //    the CPU relative to the scene's cull_radius, so the bound is correct under
     //    any normalization (no scene bounding box is needed inside the kernel).
-    if (!isfinite(v0) || !isfinite(v1) || !isfinite(v2)) return;
+    if (!finite_bits(v0) || !finite_bits(v1) || !finite_bits(v2)) return;
     float len2 = v0*v0 + v1*v1 + v2*v2;
-    if (!isfinite(len2)) return;              // s² overflowed — skip this perturbation
+    if (!finite_bits(len2)) return;           // s² overflowed — skip this perturbation
     if (len2 > max_disp * max_disp) {
         float inv = max_disp / sqrt(len2);
         v0 *= inv; v1 *= inv; v2 *= inv;

@@ -3,11 +3,18 @@
 #include <iostream>
 #include <random>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <limits>
 #include "model.hpp"
 #include "kdtree_tensor.hpp"
 #include "msplat.hpp"
 #include "loaders.hpp"
 #include <mach/mach.h>
+
+// Cumulative GPU-side NaN-gate counters (msplat_metal.mm). Slots:
+// 0=v_mean3d 1=v_scale 2=v_quat 3=v_colors(SH) 4=spare 5=v_opacity 6=v_rendered 7=spare
+extern "C" void msplat_grad_nan_counts(uint32_t out[8]);
 
 namespace fs = std::filesystem;
 
@@ -521,6 +528,55 @@ void Model::mcmcAfterTrain(int step) {
                   << " quat=" << nf_quat
                   << " opacity=" << nf_op
                   << " sh=" << nf_sh << std::endl;
+    }
+
+    // GPU NaN-gate counters: which gradient buffer carried nonfinite values
+    // (skipped at the Adam boundary / sanitized at the loss image). Deltas
+    // since the previous pass; silent when everything is finite. This is the
+    // line that localizes the seed kernel on hardware we cannot test locally.
+    {
+        uint32_t gnc[8] = {0};
+        msplat_grad_nan_counts(gnc);
+        static uint32_t gnc_last[8] = {0};
+        uint32_t d[8];
+        bool any = false;
+        for (int k = 0; k < 8; k++) {
+            d[k] = gnc[k] - gnc_last[k];
+            gnc_last[k] = gnc[k];
+            if (d[k]) any = true;
+        }
+        if (any) {
+            std::cout << "MCMC gradnan step=" << step
+                      << " mean=" << d[0]
+                      << " scale=" << d[1]
+                      << " quat=" << d[2]
+                      << " sh=" << d[3]
+                      << " opacity=" << d[5]
+                      << " vrend=" << d[6] << std::endl;
+        }
+    }
+
+    // Self-test: MSPLAT_NAN_INJECT=<step> poisons featuresDc of 100 random
+    // alive gaussians at the end of that MCMC pass. Reproduces the M1-class
+    // failure mode (NaN color entering tiles) on any GPU: with the shader
+    // containment the batch renders invisible, is culled at the next pass,
+    // and quality is unaffected. Without it, the epidemic reproduces locally.
+    static int inject_step = -2;
+    if (inject_step == -2) {
+        const char* e = std::getenv("MSPLAT_NAN_INJECT");
+        inject_step = e ? std::atoi(e) : -1;
+    }
+    if (step == inject_step && !alive.empty()) {
+        float* fdc = featuresDc.data<float>();
+        std::mt19937 rng(1234);
+        std::uniform_int_distribution<size_t> pick(0, alive.size() - 1);
+        const float qnan = std::numeric_limits<float>::quiet_NaN();
+        for (int k = 0; k < 100; k++) {
+            int i = alive[pick(rng)];
+            fdc[i*3+0] = qnan; fdc[i*3+1] = qnan; fdc[i*3+2] = qnan;
+        }
+        std::cout << "MCMC nan-inject step=" << step
+                  << " poisoned=100 (featuresDc)" << std::endl;
     }
 }
 

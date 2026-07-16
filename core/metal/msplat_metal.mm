@@ -526,6 +526,11 @@ struct FusedTensorCache {
     MTensor v_xy, v_conic, v_colors_rast, v_opacity, v_depth;
     MTensor v_mean3d, v_scale, v_quat, v_features_dc, v_features_rest;
 
+    // Cumulative NaN-gate counters (never zeroed; CPU logs deltas).
+    // Slots: 0=v_mean3d 1=v_scale 2=v_quat 3=v_colors(SH) 4=spare
+    //        5=v_opacity 6=v_rendered pixels 7=spare
+    MTensor grad_nan_counts;
+
     void ensure_forward(int np, int64_t cap, int ih, int iw, int nt,
                         id<MTLDevice> dev) {
         // MTensor has no destructor/move-assign: reassigning a cached buffer
@@ -571,6 +576,9 @@ struct FusedTensorCache {
         if (!loss_sum.defined()) {
             loss_sum = mtensor_empty(dev, {1}, DType::Float32);
         }
+        if (!grad_nan_counts.defined()) {
+            grad_nan_counts = mtensor_zeros(dev, {8}, DType::Int32);
+        }
     }
 
     void ensure_chunks(int K, int ih, int iw, id<MTLDevice> dev) {
@@ -606,6 +614,16 @@ static FusedTensorCache g_tcache;
 
 void cleanup_msplat_metal() {
     g_tcache = FusedTensorCache{};
+}
+
+// Cumulative NaN-gate counters for CPU-side delta logging (call after a GPU
+// sync). Zeros until the first training step allocates the buffer.
+extern "C" void msplat_grad_nan_counts(uint32_t out[8]) {
+    if (!g_tcache.grad_nan_counts.defined()) {
+        std::memset(out, 0, 8 * sizeof(uint32_t));
+        return;
+    }
+    std::memcpy(out, g_tcache.grad_nan_counts.data<int32_t>(), 8 * sizeof(uint32_t));
 }
 
 // Internal forward pipeline — used by both msplat_render and msplat_train_step.
@@ -1178,6 +1196,7 @@ std::tuple<MTensor, float> msplat_train_step(
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:3];
         ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
         ENC_BUF(enc, v_rendered, 6);
+        ENC_BUF(enc, g_tcache.grad_nan_counts, 7);
         [enc dispatchThreads:grid threadsPerThreadgroup:tg];
     };
 
@@ -1269,6 +1288,7 @@ std::tuple<MTensor, float> msplat_train_step(
         [enc setBuffer:adam_exp_avg[4].buffer() offset:0 atIndex:25]; // rest exp_avg
         [enc setBuffer:adam_exp_avg_sq[4].buffer() offset:0 atIndex:26]; // rest exp_avg_sq
         [enc setBytes:sh_adam_hp.get() length:sizeof(SHAdamParams) atIndex:27];
+        ENC_BUF(enc, g_tcache.grad_nan_counts, 28);
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         // Adam for remaining groups (skip 3=featuresDc, 4=featuresRest — fused above)
         if (num_adam_groups > 0) {
@@ -1289,6 +1309,9 @@ std::tuple<MTensor, float> msplat_train_step(
                 ENC_SCALAR(enc, adam_bc2_sqrts[g], 7);
                 ENC_SCALAR(enc, adam_eps, 8);
                 ENC_SCALAR(enc, n, 9);
+                ENC_BUF(enc, g_tcache.grad_nan_counts, 10);
+                uint32_t adam_group_idx = (uint32_t)g;
+                ENC_SCALAR(enc, adam_group_idx, 11);
                 [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(atpg, 1, 1)];
             }
         }
