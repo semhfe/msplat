@@ -10,16 +10,22 @@ void cleanup_msplat_metal();
 // Returns the Metal device used by the msplat context (void* in C++, id<MTLDevice> in ObjC++)
 #ifdef __OBJC__
 id<MTLDevice> msplat_device();
+id<MTLCommandQueue> msplat_command_queue();
 #else
 void* msplat_device();
+void* msplat_command_queue();
 #endif
 
 // GPU tensor allocation (callable from C++ — delegates to Metal device)
 MTensor gpu_zeros(std::vector<int64_t> shape, DType dtype);
 MTensor gpu_empty(std::vector<int64_t> shape, DType dtype);
 
-// Commit current command buffer (non-blocking)
+// Commit current command buffer (blocks on inflight semaphore for training safety)
 void msplat_commit();
+
+// Commit without blocking — for viewer render path only.
+// Safe because the viewer has a single frame in flight at VSync cadence.
+void msplat_commit_nosync();
 
 // Synchronize (commit + wait for completion)
 void msplat_gpu_sync();

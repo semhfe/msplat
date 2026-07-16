@@ -424,6 +424,10 @@ id<MTLDevice> msplat_device() {
     return get_global_context()->device;
 }
 
+id<MTLCommandQueue> msplat_command_queue() {
+    return get_global_context()->queue;
+}
+
 MTensor gpu_zeros(std::vector<int64_t> shape, DType dtype) {
     return mtensor_zeros(get_global_context()->device, std::move(shape), dtype);
 }
@@ -438,6 +442,17 @@ void msplat_commit() {
         g_gpu_timing_checked = true;
     }
     get_global_context()->commitCB();
+}
+
+void msplat_commit_nosync() {
+    MetalContext* ctx = get_global_context();
+    if (ctx->_currentCB) {
+        // Commit without semaphore wait — safe for the viewer because:
+        // 1. Only 1 frame in flight at VSync cadence
+        // 2. The Swift side creates its own CB on the same serial queue
+        // 3. Metal guarantees submission order on a serial queue
+        [ctx->_currentCB commitAndContinue];
+    }
 }
 
 void msplat_gpu_sync() {

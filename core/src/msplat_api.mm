@@ -385,3 +385,336 @@ int msplat_trainer_iteration(MsplatTrainer t) {
 
 void msplat_sync(void) { msplat::sync(); }
 void msplat_cleanup(void) { msplat::cleanup(); }
+
+// ── Viewer (render-only, no training) ───────────────────────────────────────
+//
+// Bypasses Model/Trainer entirely: loads Gaussian parameters from a PLY
+// directly into GPU tensors, builds synthetic camera matrices from FOV +
+// render resolution, and calls msplat_render. No optimizer state, no dataset
+// loading, no image I/O — just the GPU sort+rasterize pipeline.
+
+#include "msplat_c_api.h"
+#include "loaders.hpp"
+
+struct ViewerImpl {
+    // Gaussian parameters — loaded once from PLY, never mutated.
+    MTensor means, scales, quats, featuresDc, featuresRest, opacities;
+    MTensor backgroundColor;
+
+    // Cached GPU matrices (reallocated on resize/FOV change).
+    MTensor viewMat, projMat;
+
+    int width = 0, height = 0;
+    float fovY = 0;
+    int numPoints = 0;
+
+    // SH degree derived from PLY data.
+    int shDegree = 0;
+    int shBases = 0;
+
+    // PLY normalization (for keepCrs=false, these are identity).
+    float scale = 1.0f;
+    float translation[3] = {};
+
+    // Cached bounding box (computed once at load time).
+    float boundsMin[3] = {0, 0, 0};
+    float boundsMax[3] = {0, 0, 0};
+
+    // Highest-density region center (computed once at load time).
+    float densityCenterPos[3] = {0, 0, 0};
+
+    void updateIntrinsics() {
+        // Allocate or reuse the 4x4 matrix GPU buffers.
+        if (!viewMat.defined())
+            viewMat = gpu_empty({4, 4}, DType::Float32);
+        if (!projMat.defined())
+            projMat = gpu_empty({4, 4}, DType::Float32);
+    }
+
+    void computeBounds() {
+        if (numPoints == 0) return;
+        // means is [N, 3] Float32 on shared memory — read directly.
+        const float* p = (const float*)means.data_ptr();
+        float mn[3] = {p[0], p[1], p[2]};
+        float mx[3] = {p[0], p[1], p[2]};
+        for (int i = 1; i < numPoints; i++) {
+            for (int j = 0; j < 3; j++) {
+                float v = p[i * 3 + j];
+                if (v < mn[j]) mn[j] = v;
+                if (v > mx[j]) mx[j] = v;
+            }
+        }
+        memcpy(boundsMin, mn, sizeof(mn));
+        memcpy(boundsMax, mx, sizeof(mx));
+    }
+
+    /// Find the center of the highest-density region using an 8×8×8 grid bucketing.
+    /// This tells the camera where the actual detail is, not just the geometric center.
+    void computeDensityCenter() {
+        if (numPoints == 0) return;
+        const float* p = (const float*)means.data_ptr();
+        constexpr int G = 8;  // grid resolution per axis
+        int grid[G * G * G] = {};
+        float ext[3] = {
+            boundsMax[0] - boundsMin[0],
+            boundsMax[1] - boundsMin[1],
+            boundsMax[2] - boundsMin[2]
+        };
+        // Avoid division by zero for degenerate axes.
+        for (int j = 0; j < 3; j++)
+            if (ext[j] < 1e-6f) ext[j] = 1e-6f;
+
+        for (int i = 0; i < numPoints; i++) {
+            int ix = std::min((int)((p[i*3]   - boundsMin[0]) / ext[0] * G), G - 1);
+            int iy = std::min((int)((p[i*3+1] - boundsMin[1]) / ext[1] * G), G - 1);
+            int iz = std::min((int)((p[i*3+2] - boundsMin[2]) / ext[2] * G), G - 1);
+            grid[ix * G * G + iy * G + iz]++;
+        }
+        // Find the densest cell.
+        int maxCount = 0, maxIdx = 0;
+        for (int i = 0; i < G * G * G; i++) {
+            if (grid[i] > maxCount) { maxCount = grid[i]; maxIdx = i; }
+        }
+        // Convert back to world coordinates (center of the cell).
+        int ix = maxIdx / (G * G);
+        int iy = (maxIdx / G) % G;
+        int iz = maxIdx % G;
+        densityCenterPos[0] = boundsMin[0] + (ix + 0.5f) / G * ext[0];
+        densityCenterPos[1] = boundsMin[1] + (iy + 0.5f) / G * ext[1];
+        densityCenterPos[2] = boundsMin[2] + (iz + 0.5f) / G * ext[2];
+    }
+
+    // Shared matrix setup — returns camera position in world space.
+    void preparePose(const float camToWorld[16], float cam_pos[3],
+                     float* fx_out, float* fy_out, float* cx_out, float* cy_out,
+                     int* degree_out, int* degreesToUse_out) {
+        // --- Build view matrix from camToWorld (replicates Model::prepareCam) ---
+        // camToWorld is 4x4 row-major, OpenGL convention (Y-up, -Z forward).
+        // msplat's internal convention: negate Y and Z columns of the rotation.
+        const float* d = camToWorld;
+        float R[3][3], Rinv[3][3], T[3], Tinv[3];
+        for (int i = 0; i < 3; i++) {
+            R[i][0] =  d[i*4+0];
+            R[i][1] = -d[i*4+1];
+            R[i][2] = -d[i*4+2];
+            T[i]    =  d[i*4+3];
+        }
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+                Rinv[i][j] = R[j][i];
+        for (int i = 0; i < 3; i++)
+            Tinv[i] = -(Rinv[i][0]*T[0] + Rinv[i][1]*T[1] + Rinv[i][2]*T[2]);
+
+        float vm[16] = {
+            Rinv[0][0], Rinv[0][1], Rinv[0][2], Tinv[0],
+            Rinv[1][0], Rinv[1][1], Rinv[1][2], Tinv[1],
+            Rinv[2][0], Rinv[2][1], Rinv[2][2], Tinv[2],
+            0, 0, 0, 1
+        };
+
+        // Intrinsics from FOV + render size.
+        float fy = (float)height / (2.0f * tanf(fovY * 0.5f));
+        float aspect = (float)width / (float)height;
+        float fovX = 2.0f * atanf(tanf(fovY * 0.5f) * aspect);
+        float fx = (float)width / (2.0f * tanf(fovX * 0.5f));
+
+        *fx_out = fx; *fy_out = fy;
+        *cx_out = (float)width * 0.5f;
+        *cy_out = (float)height * 0.5f;
+
+        // Projection-view matrix (OpenGL style, matches prepareCam).
+        float t_p = 0.001f * tanf(0.5f * fovY);
+        float r_p = 0.001f * tanf(0.5f * fovX);
+        float pm[16] = {
+            0.001f/r_p, 0, 0, 0,
+            0, 0.001f/t_p, 0, 0,
+            0, 0, (1000.0f+0.001f)/(1000.0f-0.001f), -1000.0f*0.001f/(1000.0f-0.001f),
+            0, 0, 1, 0
+        };
+        float pvm[16] = {};
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 4; j++)
+                for (int k = 0; k < 4; k++)
+                    pvm[i*4+j] += pm[i*4+k] * vm[k*4+j];
+
+        memcpy(viewMat.data_ptr(), vm, sizeof(vm));
+        memcpy(projMat.data_ptr(), pvm, sizeof(pvm));
+
+        cam_pos[0] = T[0]; cam_pos[1] = T[1]; cam_pos[2] = T[2];
+
+        // SH degrees to use — for a fully trained model, use all available.
+        int frBases = (int)featuresRest.size(-2) + 1;
+        *degree_out = (frBases <= 1) ? 0 : (frBases <= 4) ? 1 : (frBases <= 9) ? 2 : (frBases <= 16) ? 3 : 4;
+        *degreesToUse_out = *degree_out;
+    }
+
+    // Legacy render path: GPU compute → gpu_sync → CPU float→uint8 readback.
+    void render(const float camToWorld[16], uint8_t* outRGBA) {
+        float cam_pos[3], fx, fy, cx, cy;
+        int degree, degreesToUse;
+        preparePose(camToWorld, cam_pos, &fx, &fy, &cx, &cy, &degree, &degreesToUse);
+
+        auto tileBounds = std::make_tuple(
+            (width  + BLOCK_X - 1) / BLOCK_X,
+            (height + BLOCK_Y - 1) / BLOCK_Y, 1);
+
+        MTensor rgb = msplat_render(
+            numPoints, means, scales, 1.0f,
+            quats, viewMat, projMat, fx, fy, cx, cy,
+            (unsigned)height, (unsigned)width, tileBounds, 0.01f,
+            (unsigned)degree, (unsigned)degreesToUse, cam_pos,
+            featuresDc, featuresRest, opacities, backgroundColor);
+        msplat_gpu_sync();
+
+        // Convert RGB float32 → RGBA uint8 (unified memory — no copy needed).
+        const float* src = (const float*)rgb.data_ptr();
+        int n = width * height;
+        for (int i = 0; i < n; i++) {
+            outRGBA[i * 4]     = (uint8_t)(fminf(fmaxf(src[i*3],   0.f), 1.f) * 255.f);
+            outRGBA[i * 4 + 1] = (uint8_t)(fminf(fmaxf(src[i*3+1], 0.f), 1.f) * 255.f);
+            outRGBA[i * 4 + 2] = (uint8_t)(fminf(fmaxf(src[i*3+2], 0.f), 1.f) * 255.f);
+            outRGBA[i * 4 + 3] = 255;
+        }
+    }
+
+    // Zero-copy render path: GPU compute → commit (non-blocking) → return MTLBuffer.
+    // The returned buffer (g_tcache.out_img) is [H, W, 3] Float32 linear RGB.
+    // Caller is responsible for GPU-side sRGB conversion and blit.
+    id<MTLBuffer> renderBuffer(const float camToWorld[16]) {
+        float cam_pos[3], fx, fy, cx, cy;
+        int degree, degreesToUse;
+        preparePose(camToWorld, cam_pos, &fx, &fy, &cx, &cy, &degree, &degreesToUse);
+
+        auto tileBounds = std::make_tuple(
+            (width  + BLOCK_X - 1) / BLOCK_X,
+            (height + BLOCK_Y - 1) / BLOCK_Y, 1);
+
+        MTensor rgb = msplat_render(
+            numPoints, means, scales, 1.0f,
+            quats, viewMat, projMat, fx, fy, cx, cy,
+            (unsigned)height, (unsigned)width, tileBounds, 0.01f,
+            (unsigned)degree, (unsigned)degreesToUse, cam_pos,
+            featuresDc, featuresRest, opacities, backgroundColor);
+        // Non-blocking commit — GPU work is submitted but we don't wait.
+        // The viewer runs at VSync cadence with 1 frame in flight, so no
+        // unbounded queue buildup risk. The Swift side's own command buffer
+        // on the same serial queue provides implicit ordering.
+        msplat_commit_nosync();
+
+        return rgb.buffer();
+    }
+};
+
+MsplatViewer msplat_viewer_create(const char* plyPath,
+                                   int width, int height, float fovY) {
+    try {
+        auto* v = new ViewerImpl();
+        v->width = width;
+        v->height = height;
+        v->fovY = fovY;
+
+        // Load Gaussian parameters directly to GPU — no optimizer buffers.
+        // scale=1, translation={0,0,0}, keepCrs=false: PLY is in normalized space.
+        float zero[3] = {0, 0, 0};
+        auto g = loadGaussianPly(std::string(plyPath), 1.0f, zero, false);
+        v->means = std::move(g.means);
+        v->scales = std::move(g.scales);
+        v->quats = std::move(g.quats);
+        v->featuresDc = std::move(g.featuresDc);
+        v->featuresRest = std::move(g.featuresRest);
+        v->opacities = std::move(g.opacities);
+        v->numPoints = (int)v->means.size(0);
+
+        // Default black background.
+        v->backgroundColor = gpu_empty({3}, DType::Float32);
+        float bg[3] = {0, 0, 0};
+        memcpy(v->backgroundColor.data_ptr(), bg, sizeof(bg));
+
+        v->updateIntrinsics();
+        v->computeBounds();
+        v->computeDensityCenter();
+
+        fprintf(stderr, "[viewer] Loaded %d Gaussians from %s (%dx%d, fov=%.1f°, bounds=[%.2f,%.2f,%.2f]-[%.2f,%.2f,%.2f], density_center=[%.2f,%.2f,%.2f])\n",
+                v->numPoints, plyPath, width, height, fovY * 180.0f / M_PI,
+                v->boundsMin[0], v->boundsMin[1], v->boundsMin[2],
+                v->boundsMax[0], v->boundsMax[1], v->boundsMax[2],
+                v->densityCenterPos[0], v->densityCenterPos[1], v->densityCenterPos[2]);
+        return static_cast<MsplatViewer>(v);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[viewer] Failed to create viewer: %s\n", e.what());
+        return nullptr;
+    }
+}
+
+void msplat_viewer_resize(MsplatViewer v, int width, int height) {
+    auto* viewer = static_cast<ViewerImpl*>(v);
+    if (!viewer || (viewer->width == width && viewer->height == height)) return;
+    viewer->width = width;
+    viewer->height = height;
+    // ensure_forward will reallocate render buffers on next render call.
+}
+
+void msplat_viewer_set_fov(MsplatViewer v, float fovY) {
+    auto* viewer = static_cast<ViewerImpl*>(v);
+    if (viewer) viewer->fovY = fovY;
+}
+
+void msplat_viewer_set_background(MsplatViewer v, float r, float g, float b) {
+    auto* viewer = static_cast<ViewerImpl*>(v);
+    if (!viewer) return;
+    float bg[3] = {r, g, b};
+    memcpy(viewer->backgroundColor.data_ptr(), bg, sizeof(bg));
+}
+
+void msplat_viewer_render(MsplatViewer v, const float camToWorld[16],
+                           uint8_t* outRGBA) {
+    auto* viewer = static_cast<ViewerImpl*>(v);
+    if (!viewer || !outRGBA) return;
+    viewer->render(camToWorld, outRGBA);
+}
+
+int msplat_viewer_splat_count(MsplatViewer v) {
+    auto* viewer = static_cast<ViewerImpl*>(v);
+    return viewer ? viewer->numPoints : 0;
+}
+
+void msplat_viewer_get_size(MsplatViewer v, int* outWidth, int* outHeight) {
+    auto* viewer = static_cast<ViewerImpl*>(v);
+    if (viewer) {
+        if (outWidth) *outWidth = viewer->width;
+        if (outHeight) *outHeight = viewer->height;
+    }
+}
+
+void* msplat_viewer_render_buffer(MsplatViewer v, const float camToWorld[16],
+                                   int* outWidth, int* outHeight) {
+    auto* viewer = static_cast<ViewerImpl*>(v);
+    if (!viewer) { *outWidth = 0; *outHeight = 0; return nullptr; }
+    if (outWidth)  *outWidth  = viewer->width;
+    if (outHeight) *outHeight = viewer->height;
+    id<MTLBuffer> buf = viewer->renderBuffer(camToWorld);
+    return (__bridge void*)buf;
+}
+
+void msplat_viewer_bounds(MsplatViewer v, float boundsMin[3], float boundsMax[3]) {
+    auto* viewer = static_cast<ViewerImpl*>(v);
+    if (!viewer) return;
+    memcpy(boundsMin, viewer->boundsMin, 3 * sizeof(float));
+    memcpy(boundsMax, viewer->boundsMax, 3 * sizeof(float));
+}
+
+void msplat_viewer_density_center(MsplatViewer v, float center[3]) {
+    auto* viewer = static_cast<ViewerImpl*>(v);
+    if (!viewer) return;
+    memcpy(center, viewer->densityCenterPos, 3 * sizeof(float));
+}
+
+void* msplat_viewer_command_queue(MsplatViewer v) {
+    (void)v;  // queue is global singleton, not per-viewer
+    return (__bridge void*)msplat_command_queue();
+}
+
+void msplat_viewer_destroy(MsplatViewer v) {
+    auto* viewer = static_cast<ViewerImpl*>(v);
+    delete viewer;
+}

@@ -113,6 +113,60 @@ void msplat_set_metallib_path(const char* path);
 void msplat_sync(void);
 void msplat_cleanup(void);
 
+// ── Viewer (render-only, no training) ───────────────────────────────────────
+
+typedef void* MsplatViewer;
+
+/// Load a trained Gaussian PLY for view-only rendering.
+/// width/height: initial render resolution. fovY: vertical FOV in radians.
+/// Returns NULL on failure (bad path, parse error).
+MsplatViewer msplat_viewer_create(const char* plyPath,
+                                   int width, int height, float fovY);
+
+/// Update render resolution (e.g. window resize).
+void msplat_viewer_resize(MsplatViewer v, int width, int height);
+
+/// Update vertical field of view (radians).
+void msplat_viewer_set_fov(MsplatViewer v, float fovY);
+
+/// Set background color (RGB, each 0–1).
+void msplat_viewer_set_background(MsplatViewer v, float r, float g, float b);
+
+/// Render from a camera-to-world pose (4x4 row-major, OpenGL convention)
+/// into a caller-provided RGBA uint8 buffer.
+/// outRGBA must be at least width*height*4 bytes.
+void msplat_viewer_render(MsplatViewer v, const float camToWorld[16],
+                           uint8_t* outRGBA);
+
+/// Number of Gaussians in the loaded scene.
+int msplat_viewer_splat_count(MsplatViewer v);
+
+/// Render dimensions (after the most recent create/resize).
+void msplat_viewer_get_size(MsplatViewer v, int* outWidth, int* outHeight);
+
+/// Zero-copy render: executes GPU compute pipeline and returns the raw output
+/// MTLBuffer (Float32 RGB, shape [H*W*3], StorageModeShared).
+/// The buffer is valid until the next render call. Caller must NOT free it.
+/// Calls msplat_commit_nosync() internally (non-blocking, no semaphore wait).
+/// Returns NULL if viewer is invalid. outWidth/outHeight receive render dims.
+void* msplat_viewer_render_buffer(MsplatViewer v, const float camToWorld[16],
+                                   int* outWidth, int* outHeight);
+
+/// Scene bounding box from loaded PLY gaussian means.
+/// Sets boundsMin/boundsMax to the axis-aligned bounding box of all positions.
+void msplat_viewer_bounds(MsplatViewer v, float boundsMin[3], float boundsMax[3]);
+
+/// Center of the highest-density region (8×8×8 grid bucketing of gaussian means).
+/// Useful for initial camera positioning — points the camera at where the detail is.
+void msplat_viewer_density_center(MsplatViewer v, float center[3]);
+
+/// Returns the engine's MTLCommandQueue (as void*) for use in Swift-side
+/// blit/compute encoders. Ensures GPU work is serialized on the same queue.
+void* msplat_viewer_command_queue(MsplatViewer v);
+
+/// Destroy viewer and release all GPU resources.
+void msplat_viewer_destroy(MsplatViewer v);
+
 #ifdef __cplusplus
 }
 #endif
