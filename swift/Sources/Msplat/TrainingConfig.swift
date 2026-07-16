@@ -6,8 +6,6 @@ public struct TrainingConfig {
     public var shDegree: Int32 = 3
     public var shDegreeInterval: Int32 = 1_000
     public var ssimWeight: Float = 0.2
-    public var numDownscales: Int32 = 2
-    public var resolutionSchedule: Int32 = 3_000
     // MCMC parameters (3DGS-MCMC, NeurIPS 2024).
     public var capMax: Int32 = 1_000_000
     public var noiseLr: Float = 5e5
@@ -28,8 +26,6 @@ public struct TrainingConfig {
         c.shDegree = shDegree
         c.shDegreeInterval = shDegreeInterval
         c.ssimWeight = ssimWeight
-        c.numDownscales = numDownscales
-        c.resolutionSchedule = resolutionSchedule
         c.capMax = capMax
         c.noiseLr = noiseLr
         c.opacityReg = opacityReg
@@ -41,3 +37,4 @@ public struct TrainingConfig {
         return c
     }
 }
+
