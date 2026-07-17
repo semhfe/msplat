@@ -844,15 +844,22 @@ static void forward_pipeline(
 
     auto encode_loss_fwd = [&](id<MTLComputeCommandEncoder> enc) {
         // Separable SSIM forward: H conv → barrier → V conv + SSIM + reduction
-        MTLSize grid = MTLSizeMake(img_width, img_height, 1);
         MTLSize tg = MTLSizeMake(16, 16, 1);
+        // Full 16x16 threadgroups (ceil), NOT dispatchThreads: these kernels
+        // run cooperative threadgroup loops with a fixed 256-thread stride,
+        // and the truncated edge groups produced by dispatchThreads leave
+        // shared-memory slots uninitialized — garbage SSIM moments at every
+        // right/bottom edge tile (the Apple7 epidemic's true seed; benign-
+        // looking stale floats on Apple9). Out-of-image threads are already
+        // guarded at every read/write.
+        MTLSize ssim_tgs = MTLSizeMake((img_width + 15) / 16, (img_height + 15) / 16, 1);
 
         // Pass 1: horizontal convolution
         [enc setComputePipelineState:ctx->ssim_h_fwd_kernel_cpso];
         ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:2];
         ENC_BUF(enc, g_tcache.ssim_h_buf, 3);
-        [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+        [enc dispatchThreadgroups:ssim_tgs threadsPerThreadgroup:tg];
 
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
@@ -863,7 +870,7 @@ static void forward_pipeline(
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:3];
         ENC_SCALAR(enc, ssim_weight, 4);
         ENC_BUF(enc, loss_intermediates, 5); ENC_BUF(enc, loss_sum, 6);
-        [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+        [enc dispatchThreadgroups:ssim_tgs threadsPerThreadgroup:tg];
     };
 
     // Zero cached buffers will be done inside the command encoder via blit.
@@ -1175,14 +1182,21 @@ std::tuple<MTensor, float> msplat_train_step(
     // Fused loss: ssim_h_fwd → fused_v_fwd_h_bwd → ssim_v_bwd
     // Eliminates loss_intermediates round-trip (130 MB/iter bandwidth saved).
     auto encode_loss_fwd_bwd = [&](id<MTLComputeCommandEncoder> enc) {
-        MTLSize grid = MTLSizeMake(img_width, img_height, 1);
         MTLSize tg = MTLSizeMake(16, 16, 1);
+        // Full 16x16 threadgroups (ceil), NOT dispatchThreads: these kernels
+        // run cooperative threadgroup loops with a fixed 256-thread stride,
+        // and the truncated edge groups produced by dispatchThreads leave
+        // shared-memory slots uninitialized — garbage SSIM moments at every
+        // right/bottom edge tile (the Apple7 epidemic's true seed; benign-
+        // looking stale floats on Apple9). Out-of-image threads are already
+        // guarded at every read/write.
+        MTLSize ssim_tgs = MTLSizeMake((img_width + 15) / 16, (img_height + 15) / 16, 1);
         // Pass 1: H conv on images → ssim_h_buf
         [enc setComputePipelineState:ctx->ssim_h_fwd_kernel_cpso];
         ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:2];
         ENC_BUF(enc, g_tcache.ssim_h_buf, 3);
-        [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+        [enc dispatchThreadgroups:ssim_tgs threadsPerThreadgroup:tg];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         // Pass 2: Fused V fwd + H bwd
         [enc setComputePipelineState:ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso];
@@ -1192,7 +1206,7 @@ std::tuple<MTensor, float> msplat_train_step(
         ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
         ENC_BUF(enc, loss_intermediates, 6); ENC_BUF(enc, loss_sum, 7);
         ENC_BUF(enc, g_tcache.grad_nan_counts, 8); // slot 4: nonfinite-moment windows
-        [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+        [enc dispatchThreadgroups:ssim_tgs threadsPerThreadgroup:tg];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         // Pass 3: V bwd
         [enc setComputePipelineState:ctx->ssim_v_bwd_kernel_cpso];
@@ -1202,7 +1216,7 @@ std::tuple<MTensor, float> msplat_train_step(
         ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
         ENC_BUF(enc, v_rendered, 6);
         ENC_BUF(enc, g_tcache.grad_nan_counts, 7);
-        [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+        [enc dispatchThreadgroups:ssim_tgs threadsPerThreadgroup:tg];
     };
 
     auto encode_rast_bwd = [&](id<MTLComputeCommandEncoder> enc) {
