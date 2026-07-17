@@ -54,14 +54,18 @@ find_library(COREGRAPHICS_FRAMEWORK CoreGraphics REQUIRED)
 
 # --- Compile Metal shaders ---
 
+# SDK for the Metal shader compiler. "macosx" (default) or "iphoneos" —
+# must match the platform of the process that loads the metallib.
+set(MSPLAT_METAL_SDK "macosx" CACHE STRING "xcrun SDK for the Metal compiler (macosx|iphoneos)")
+
 set(METAL_SOURCE ${CMAKE_SOURCE_DIR}/core/metal/msplat_metal.metal)
 configure_file(${METAL_SOURCE} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.metal COPYONLY)
 add_custom_command(
     OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib
-    COMMAND xcrun -sdk macosx metal -O3 -c
+    COMMAND xcrun -sdk ${MSPLAT_METAL_SDK} metal -O3 -c
         ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.metal
         -o ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.air
-    COMMAND xcrun -sdk macosx metallib
+    COMMAND xcrun -sdk ${MSPLAT_METAL_SDK} metallib
         ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.air
         -o ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib
     COMMAND rm -f ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.air
@@ -104,16 +108,18 @@ target_link_libraries(msplat_core PUBLIC
 target_compile_definitions(msplat_core PRIVATE USE_MPS)
 add_dependencies(msplat_core metallib)
 
-# --- CLI binary ---
+# --- CLI binary (host platforms only — iOS apps link msplat_core directly) ---
 
-add_executable(msplat cli/msplat.mm)
-target_link_libraries(msplat PRIVATE
-    msplat_core
-    CLI11::CLI11
-    pthread
-)
-target_compile_definitions(msplat PRIVATE USE_MPS)
-install(TARGETS msplat DESTINATION bin)
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    add_executable(msplat cli/msplat.mm)
+    target_link_libraries(msplat PRIVATE
+        msplat_core
+        CLI11::CLI11
+        pthread
+    )
+    target_compile_definitions(msplat PRIVATE USE_MPS)
+    install(TARGETS msplat DESTINATION bin)
+endif()
 
 # --- Python bindings (optional, enabled when building via scikit-build-core) ---
 
