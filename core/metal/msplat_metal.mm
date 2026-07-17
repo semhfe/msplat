@@ -577,7 +577,7 @@ struct FusedTensorCache {
             loss_sum = mtensor_empty(dev, {1}, DType::Float32);
         }
         if (!grad_nan_counts.defined()) {
-            grad_nan_counts = mtensor_zeros(dev, {8}, DType::Int32);
+            grad_nan_counts = mtensor_zeros(dev, {16}, DType::Int32);
         }
     }
 
@@ -618,12 +618,12 @@ void cleanup_msplat_metal() {
 
 // Cumulative NaN-gate counters for CPU-side delta logging (call after a GPU
 // sync). Zeros until the first training step allocates the buffer.
-extern "C" void msplat_grad_nan_counts(uint32_t out[8]) {
+extern "C" void msplat_grad_nan_counts(uint32_t out[16]) {
     if (!g_tcache.grad_nan_counts.defined()) {
-        std::memset(out, 0, 8 * sizeof(uint32_t));
+        std::memset(out, 0, 16 * sizeof(uint32_t));
         return;
     }
-    std::memcpy(out, g_tcache.grad_nan_counts.data<int32_t>(), 8 * sizeof(uint32_t));
+    std::memcpy(out, g_tcache.grad_nan_counts.data<int32_t>(), 16 * sizeof(uint32_t));
 }
 
 // Internal forward pipeline — used by both msplat_render and msplat_train_step.
@@ -719,7 +719,7 @@ static void forward_pipeline(
         [enc setBytes:cam_pos_arr->data() length:sizeof(*cam_pos_arr) atIndex:18];
         ENC_BUF(enc, features_dc, 19); ENC_BUF(enc, features_rest, 20);
         ENC_BUF(enc, colors, 21); ENC_BUF(enc, aabb, 22);
-        // buffer 23 removed (was opacity-aware AABB, reverted)
+        ENC_BUF(enc, g_tcache.grad_nan_counts, 23); // zombie-gate telemetry
 
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
     };
@@ -779,6 +779,7 @@ static void forward_pipeline(
             ENC_BUF(enc, packed_xy_opac, 8); ENC_BUF(enc, packed_conic, 9);
             ENC_BUF(enc, packed_rgb, 10); ENC_BUF(enc, gaussian_ids, 11);
             ENC_SCALAR(enc, capacity_u32, 12); ENC_SCALAR(enc, num_points_u32, 13);
+            ENC_BUF(enc, g_tcache.grad_nan_counts, 14); // zombie-gate telemetry
 
             [enc dispatchThreadgroups:MTLSizeMake(num_tiles, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
         }
@@ -1064,7 +1065,7 @@ std::tuple<MTensor, float> msplat_train_step(
         [enc setBytes:cam_pos_arr->data() length:sizeof(*cam_pos_arr) atIndex:18];
         ENC_BUF(enc, features_dc, 19); ENC_BUF(enc, features_rest, 20);
         ENC_BUF(enc, colors, 21); ENC_BUF(enc, aabb, 22);
-        // buffer 23 removed (was opacity-aware AABB, reverted)
+        ENC_BUF(enc, g_tcache.grad_nan_counts, 23); // zombie-gate telemetry
 
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
     };
@@ -1124,6 +1125,7 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_BUF(enc, packed_xy_opac, 8); ENC_BUF(enc, packed_conic, 9);
             ENC_BUF(enc, packed_rgb, 10); ENC_BUF(enc, gaussian_ids, 11);
             ENC_SCALAR(enc, capacity_u32, 12); ENC_SCALAR(enc, num_points_u32, 13);
+            ENC_BUF(enc, g_tcache.grad_nan_counts, 14); // zombie-gate telemetry
             [enc dispatchThreadgroups:MTLSizeMake(num_tiles, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
         }
     };

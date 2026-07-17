@@ -14,7 +14,7 @@
 
 // Cumulative GPU-side NaN-gate counters (msplat_metal.mm). Slots:
 // 0=v_mean3d 1=v_scale 2=v_quat 3=v_colors(SH) 4=spare 5=v_opacity 6=v_rendered 7=spare
-extern "C" void msplat_grad_nan_counts(uint32_t out[8]);
+extern "C" void msplat_grad_nan_counts(uint32_t out[16]);
 
 namespace fs = std::filesystem;
 
@@ -535,12 +535,12 @@ void Model::mcmcAfterTrain(int step) {
     // since the previous pass; silent when everything is finite. This is the
     // line that localizes the seed kernel on hardware we cannot test locally.
     {
-        uint32_t gnc[8] = {0};
+        uint32_t gnc[16] = {0};
         msplat_grad_nan_counts(gnc);
-        static uint32_t gnc_last[8] = {0};
-        uint32_t d[8];
+        static uint32_t gnc_last[16] = {0};
+        uint32_t d[16];
         bool any = false;
-        for (int k = 0; k < 8; k++) {
+        for (int k = 0; k < 16; k++) {
             d[k] = gnc[k] - gnc_last[k];
             gnc_last[k] = gnc[k];
             if (d[k]) any = true;
@@ -552,7 +552,20 @@ void Model::mcmcAfterTrain(int step) {
                       << " quat=" << d[2]
                       << " sh=" << d[3]
                       << " opacity=" << d[5]
-                      << " vrend=" << d[6] << std::endl;
+                      << " vrend=" << d[6]
+                      << " proj=" << d[7]
+                      << " pack=" << d[13] << std::endl;
+        }
+        // Zombie-gate breakdown: which projection output (or pack attribute)
+        // was nonfinite. Names the guilty computation for a surgical fix.
+        if (d[7] || d[13]) {
+            std::cout << "MCMC zombiegate step=" << step
+                      << " center=" << d[8]
+                      << " depth=" << d[9]
+                      << " aabb=" << d[10]
+                      << " conic=" << d[11]
+                      << " rgb=" << d[12]
+                      << " opac=" << d[14] << std::endl;
         }
     }
 

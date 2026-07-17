@@ -1733,6 +1733,7 @@ kernel void project_and_sh_forward_kernel(
     constant float* features_rest,
     device float* colors,
     device float* aabb, // float2: per-axis pixel extents
+    device atomic_uint* nan_counts, // zombie-gate telemetry: 7=total, 8=center, 9=depth, 10=aabb, 11=conic, 12=rgb
     uint3 gp [[thread_position_in_grid]]
 ) {
     uint idx = gp.x;
@@ -1806,11 +1807,20 @@ kernel void project_and_sh_forward_kernel(
     // If any projection output is nonfinite, cull the gaussian for this step
     // (radii=0 excludes it from count/scatter/rasterize).
     float3 out_rgb = read_packed_float3(colors, idx);
-    if (!(finite_bits(center.x) && finite_bits(center.y) && finite_bits(p_view.z)
-          && finite_bits(aabb_x) && finite_bits(aabb_y)
-          && finite_bits3(conic) && finite_bits3(out_rgb))) {
+    bool ok_center = finite_bits(center.x) && finite_bits(center.y);
+    bool ok_depth  = finite_bits(p_view.z);
+    bool ok_aabb   = finite_bits(aabb_x) && finite_bits(aabb_y);
+    bool ok_conic  = finite_bits3(conic);
+    bool ok_rgb    = finite_bits3(out_rgb);
+    if (!(ok_center && ok_depth && ok_aabb && ok_conic && ok_rgb)) {
         radii[idx] = 0;
         num_tiles_hit[idx] = 0;
+        atomic_fetch_add_explicit(nan_counts + 7, 1u, memory_order_relaxed);
+        if (!ok_center) atomic_fetch_add_explicit(nan_counts + 8,  1u, memory_order_relaxed);
+        if (!ok_depth)  atomic_fetch_add_explicit(nan_counts + 9,  1u, memory_order_relaxed);
+        if (!ok_aabb)   atomic_fetch_add_explicit(nan_counts + 10, 1u, memory_order_relaxed);
+        if (!ok_conic)  atomic_fetch_add_explicit(nan_counts + 11, 1u, memory_order_relaxed);
+        if (!ok_rgb)    atomic_fetch_add_explicit(nan_counts + 12, 1u, memory_order_relaxed);
     }
 }
 
@@ -2477,6 +2487,7 @@ kernel void hybrid_sort_pack_kernel(
     device   int*       gaussian_ids         [[buffer(11)]],
     constant uint&      capacity             [[buffer(12)]],  // isect/packed buffer size
     constant uint&      num_points           [[buffer(13)]],  // decoded-id bounds guard
+    device atomic_uint* nan_counts           [[buffer(14)]],  // 13=pack-gate total, 14=nonfinite opacity
     uint tg_id [[threadgroup_position_in_grid]],
     uint tid   [[thread_position_in_threadgroup]]
 ) {
@@ -2541,6 +2552,8 @@ kernel void hybrid_sort_pack_kernel(
             // same fate as the out-of-range branch above.
             if (!(finite_bits(xy.x) && finite_bits(xy.y) && finite_bits(opac)
                   && finite_bits3(conic) && finite_bits3(rgb))) {
+                atomic_fetch_add_explicit(nan_counts + 13, 1u, memory_order_relaxed);
+                if (!finite_bits(opac)) atomic_fetch_add_explicit(nan_counts + 14, 1u, memory_order_relaxed);
                 write_packed_float3(packed_xy_opac, d, float3(0.0f, 0.0f, 0.0f));
                 write_packed_float3(packed_conic, d, float3(0.0f, 0.0f, 0.0f));
                 write_packed_float3(packed_rgb, d, float3(0.0f, 0.0f, 0.0f));
@@ -2582,6 +2595,8 @@ kernel void hybrid_sort_pack_kernel(
             // Zombie containment: see sparse path above.
             if (!(finite_bits(xy.x) && finite_bits(xy.y) && finite_bits(opac)
                   && finite_bits3(conic) && finite_bits3(rgb))) {
+                atomic_fetch_add_explicit(nan_counts + 13, 1u, memory_order_relaxed);
+                if (!finite_bits(opac)) atomic_fetch_add_explicit(nan_counts + 14, 1u, memory_order_relaxed);
                 write_packed_float3(packed_xy_opac, d, float3(0.0f, 0.0f, 0.0f));
                 write_packed_float3(packed_conic, d, float3(0.0f, 0.0f, 0.0f));
                 write_packed_float3(packed_rgb, d, float3(0.0f, 0.0f, 0.0f));
