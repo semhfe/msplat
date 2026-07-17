@@ -554,7 +554,9 @@ void Model::mcmcAfterTrain(int step) {
                       << " opacity=" << d[5]
                       << " vrend=" << d[6]
                       << " proj=" << d[7]
-                      << " pack=" << d[13] << std::endl;
+                      << " pack=" << d[13]
+                      << " rastnan=" << d[15]
+                      << " ssimwin=" << d[4] << std::endl;
         }
         // Zombie-gate breakdown: which projection output (or pack attribute)
         // was nonfinite. Names the guilty computation for a surgical fix.

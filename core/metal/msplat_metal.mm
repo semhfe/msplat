@@ -819,6 +819,7 @@ static void forward_pipeline(
         ENC_BUF(enc, g_tcache.chunk_T, 7); ENC_BUF(enc, g_tcache.chunk_C, 8); ENC_BUF(enc, g_tcache.chunk_final_idx, 9);
         ENC_SCALAR(enc, CHUNK_SIZE, 10); ENC_SCALAR(enc, K_max, 11);
         [enc setBytes:block_size_dim2->data() length:sizeof(*block_size_dim2) atIndex:12];
+        ENC_BUF(enc, g_tcache.grad_nan_counts, 13); // slot 15: nonfinite-sigma births
         [enc dispatchThreadgroups:chunked_tg threadsPerThreadgroup:tg_size];
 
         // Phase 2: merge kernel — one thread per pixel
@@ -1157,6 +1158,7 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_BUF(enc, g_tcache.chunk_T, 7); ENC_BUF(enc, g_tcache.chunk_C, 8); ENC_BUF(enc, g_tcache.chunk_final_idx, 9);
             ENC_SCALAR(enc, CHUNK_SIZE, 10); ENC_SCALAR(enc, K_max, 11);
             [enc setBytes:block_size_dim2->data() length:sizeof(*block_size_dim2) atIndex:12];
+            ENC_BUF(enc, g_tcache.grad_nan_counts, 13); // slot 15: nonfinite-sigma births
             [enc dispatchThreadgroups:MTLSizeMake(tile_x, tile_y, K_max) threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             // Merge
@@ -1189,6 +1191,7 @@ std::tuple<MTensor, float> msplat_train_step(
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:3];
         ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
         ENC_BUF(enc, loss_intermediates, 6); ENC_BUF(enc, loss_sum, 7);
+        ENC_BUF(enc, g_tcache.grad_nan_counts, 8); // slot 4: nonfinite-moment windows
         [enc dispatchThreads:grid threadsPerThreadgroup:tg];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         // Pass 3: V bwd

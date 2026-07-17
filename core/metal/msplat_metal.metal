@@ -575,7 +575,10 @@ kernel void nd_rasterize_forward_kernel(
             // opacity = sigmoid(raw) ∈ [0,1], so alpha ≤ exp(-sigma).
             // exp(-5.55) ≈ 0.00389 < 1/255 ≈ 0.00392, so sigma ≥ 5.55 ⟹ alpha < 1/255.
             // Empirically 94% of evaluations have sigma ≥ 5.55 (garden scene, mipnerf360).
-            if (sigma < 0.f || sigma >= 5.55f) {
+            // NaN passes both range checks below (all comparisons false) and
+            // min() may leak it into the pixel under fast-math — a per-family
+            // codegen choice (the Apple7 NaN-pixel seed). Bit-test first.
+            if (!finite_bits(sigma) || sigma < 0.f || sigma >= 5.55f) {
                 continue;
             }
 
@@ -2954,6 +2957,7 @@ kernel void rasterize_forward_chunked_kernel(
     constant uint& chunk_size,
     constant uint& K_max,
     constant uint2& blockDim,
+    device atomic_uint* nan_counts, // slot 15: nonfinite sigma (NaN-pixel births prevented)
     uint3 blockIdx [[threadgroup_position_in_grid]],
     uint tr [[thread_index_in_threadgroup]]
 ) {
@@ -3025,6 +3029,13 @@ kernel void rasterize_forward_chunked_kernel(
             const float sigma = fma(0.5f,
                 fma(conic_local.x, delta.x * delta.x, conic_local.z * delta.y * delta.y),
                 conic_local.y * delta.x * delta.y);
+            // NaN sigma passes both range checks (comparisons false) and min()
+            // may leak it into the pixel under fast-math on some GPU families
+            // (the Apple7 NaN-pixel seed). Bit-test first; count the births.
+            if (!finite_bits(sigma)) {
+                atomic_fetch_add_explicit(nan_counts + 15, 1u, memory_order_relaxed);
+                continue;
+            }
             if (sigma < 0.f || sigma >= 5.55f) continue;
             const float alpha = min(0.999f, xy_opac.z * exp(-sigma));
             if (alpha < 1.f / 255.f) continue;
@@ -3540,6 +3551,7 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
     constant float* ssim_h_buf, constant uint2& img_size,
     constant float& ssim_weight, constant float& inv_n,
     device float* deriv_h_buf, device atomic_float* loss_sum,
+    device atomic_uint* nan_counts, // slot 4: nonfinite-moment windows (fields zeroed)
     uint2 gid [[thread_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]], uint2 tgid [[threadgroup_position_in_grid]],
     uint2 tg_size [[threads_per_threadgroup]]
@@ -3579,6 +3591,20 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
                 sq_x += w*tg_hp[tile_y-SSIM_HALF_WIN+k][dx][2];
                 sq_y += w*tg_hp[tile_y-SSIM_HALF_WIN+k][dx][3];
                 cross_xy += w*tg_hp[tile_y-SSIM_HALF_WIN+k][dx][4];
+            }
+            // A nonfinite moment (NaN pixel inside the window) must invalidate
+            // the WHOLE window: under fast-math, max(NaN,0) can launder the
+            // variance to 0 while the covariance stays NaN — the derivative
+            // fields then mix NaN (sanitized downstream) with finite values
+            // ~1/C2 too large (invisible to every gate), silently detraining
+            // every gaussian blended nearby. Zero this window's fields instead.
+            if (!(finite_bits(mu_x) && finite_bits(mu_y) && finite_bits(sq_x)
+                  && finite_bits(sq_y) && finite_bits(cross_xy))) {
+                tg_f1[dy][dx] = 0.0f;
+                tg_f2[dy][dx] = 0.0f;
+                tg_f3[dy][dx] = 0.0f;
+                atomic_fetch_add_explicit(nan_counts + 4, 1u, memory_order_relaxed);
+                continue;
             }
             // Variances are mathematically ≥ 0; negatives are cancellation
             // artifacts (worse on some GPU-family FMA contractions) that can
