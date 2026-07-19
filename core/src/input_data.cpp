@@ -71,6 +71,42 @@ MTensor& Camera::getGPUImage() {
     return gpuBaseImage;
 }
 
+// Load the per-image training mask (white = use, black = ignore). All-white
+// masks are dropped on load so mask memory stays proportional to actual
+// masked coverage. The mask is resized to the post-downscale image dims and
+// binarized at 0.5 so interpolation never produces soft loss weights.
+void Camera::loadMask(const std::string &maskDir) {
+    if (maskDir.empty() || relativeName.empty() || width <= 0 || height <= 0) return;
+
+    fs::path appended = fs::path(maskDir) / (relativeName + ".png");
+    fs::path swapped = (fs::path(maskDir) / relativeName).replace_extension(".png");
+    std::string path;
+    if (fs::exists(appended)) path = appended.string();
+    else if (fs::exists(swapped)) path = swapped.string();
+    else return;
+
+    Image m = imreadRGB(path);  // grayscale PNGs decode to replicated RGB
+    if (m.empty()) return;
+    if (m.width != width || m.height != height) {
+        m = resizeArea(m, width, height);
+    }
+
+    size_t N = (size_t)width * (size_t)height;
+    std::vector<uint8_t> keep(N);
+    int64_t kept = 0;
+    const float *src = m.ptr();
+    for (size_t i = 0; i < N; ++i) {
+        bool k = src[i * 3] > 0.5f;
+        keep[i] = k ? 255 : 0;
+        kept += k ? 1 : 0;
+    }
+    if (kept == (int64_t)N) return;  // all-white: nothing masked
+
+    gpuMask = gpu_empty({height, width}, DType::UInt8);
+    memcpy(gpuMask.data_ptr(), keep.data(), N);
+    unmaskedPixels = kept;
+}
+
 // ── Scale & center ──────────────────────────────────────────────────────────
 
 void autoScaleAndCenter(InputData &data) {

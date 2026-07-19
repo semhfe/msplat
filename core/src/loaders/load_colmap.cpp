@@ -148,6 +148,7 @@ InputData loaders::loadColmap(const std::string &projectRoot, const std::string 
         cam.fx = cc.fx; cam.fy = cc.fy; cam.cx = cc.cx; cam.cy = cc.cy;
         cam.k1 = cc.k1; cam.k2 = cc.k2; cam.p1 = cc.p1; cam.p2 = cc.p2;
         cam.filePath = imageDir + "/" + img.filename;
+        cam.relativeName = img.filename;  // for mask resolution (--mask-dir)
         w2cToCamToWorld(img.quat, img.t, cam.camToWorld);
         data.cameras.push_back(cam);
     }

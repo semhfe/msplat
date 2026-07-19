@@ -62,7 +62,11 @@ std::tuple<MTensor, float> msplat_train_step(
     unsigned degree, unsigned degrees_to_use, float cam_pos[3],
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &background,
-    MTensor &gt, MTensor &window2d, float ssim_weight,
+    MTensor &gt,
+    // Training mask (H, W) uint8, COLMAP polarity (255 = use, 0 = ignore).
+    // When has_mask == 0 the tensor is a dummy binding and is never read.
+    MTensor &mask, int has_mask,
+    MTensor &window2d, float ssim_weight,
     float loss_inv_n, int features_rest_bases,
     int num_adam_groups,
     MTensor adam_params[], MTensor adam_exp_avg[], MTensor adam_exp_avg_sq[],

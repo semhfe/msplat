@@ -3552,6 +3552,8 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
     constant float& ssim_weight, constant float& inv_n,
     device float* deriv_h_buf, device atomic_float* loss_sum,
     device atomic_uint* nan_counts, // slot 4: nonfinite-moment windows (fields zeroed)
+    constant uchar* mask,           // (H, W) training mask, 255=use 0=ignore; read only when has_mask
+    constant int& has_mask,
     uint2 gid [[thread_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]], uint2 tgid [[threadgroup_position_in_grid]],
     uint2 tg_size [[threads_per_threadgroup]]
@@ -3583,6 +3585,16 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
         for (uint i = tr; i < DERIV_PIXELS; i += SSIM_TG * SSIM_TG) {
             uint dy = i / TILE_DIM, dx = i % TILE_DIM;
             uint tile_y = dy + SSIM_HALF_WIN;
+            // Training mask: a masked-out center pixel owns no loss. Zeroing
+            // its derivative fields makes the transpose convolutions (H here,
+            // V in pass 3) propagate exactly zero of its SSIM gradient — while
+            // unmasked neighbors' windows still train normally.
+            int mgx = base_gx + (int)dx, mgy = base_gy + (int)tile_y;
+            float mval = 1.0f;
+            if (has_mask && mgx >= 0 && mgx < (int)W && mgy >= 0 && mgy < (int)H
+                && mask[mgy * W + mgx] < 128) {
+                mval = 0.0f;
+            }
             float mu_x=0, mu_y=0, sq_x=0, sq_y=0, cross_xy=0;
             for (uint k = 0; k < SSIM_WIN; k++) {
                 float w = GAUSS_1D[k];
@@ -3617,14 +3629,14 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
             float iCD = 1.0f / (Cd * D);
             float dmu = 2.0f*B*(mu_x*Cd - A*mu_y) / (Cd*Cd*D);
             float dsyq = -A*B*iCD/D, dsxy = 2.0f*A*iCD;
-            tg_f1[dy][dx] = dmu - 2.0f*mu_y*dsyq - mu_x*dsxy;
-            tg_f2[dy][dx] = 2.0f*dsyq;
-            tg_f3[dy][dx] = dsxy;
+            tg_f1[dy][dx] = mval * (dmu - 2.0f*mu_y*dsyq - mu_x*dsxy);
+            tg_f2[dy][dx] = mval * (2.0f*dsyq);
+            tg_f3[dy][dx] = mval * dsxy;
             if (dx >= SSIM_HALF_WIN && dx < SSIM_HALF_WIN + SSIM_TG) {
                 int gpx = base_gx + (int)dx, gpy = base_gy + (int)(dy + SSIM_HALF_WIN);
                 if (gpx >= 0 && gpx < (int)W && gpy >= 0 && gpy < (int)H) {
-                    ssim_sum += (A * B) / (Cd * D);
-                    l1_sum += fabs((float)gt[(gpy*W+gpx)*3+c] * (1.0f/255.0f) - rendered[(gpy*W+gpx)*3+c]);
+                    ssim_sum += mval * (A * B) / (Cd * D);
+                    l1_sum += mval * fabs((float)gt[(gpy*W+gpx)*3+c] * (1.0f/255.0f) - rendered[(gpy*W+gpx)*3+c]);
                 }
             }
         }
@@ -3741,9 +3753,11 @@ kernel void ssim_v_bwd_kernel(
     constant float* ssim_h_buf,     // (H, W, 15)
     constant uint2& img_size,       // (W, H)
     constant float& ssim_weight,
-    constant float& inv_n,          // 1.0 / (H * W * 3)
+    constant float& inv_n,          // 1.0 / (unmasked_pixels * 3)
     device float* v_rendered,       // (H, W, 3)
     device atomic_uint* nan_counts, // slot 6: nonfinite loss-gradient pixels (sanitized to 0)
+    constant uchar* mask,           // (H, W) training mask, 255=use 0=ignore; read only when has_mask
+    constant int& has_mask,
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -3784,6 +3798,12 @@ kernel void ssim_v_bwd_kernel(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (px < W && py < H) {
+        // Masked pixel: its own L1 gradient is dropped here; its SSIM-loss
+        // contributions were already zeroed at the derivative fields in pass 2.
+        // v_ssim below legitimately keeps gradients flowing FROM unmasked
+        // neighbors' windows THROUGH this pixel's rendered value.
+        float m_center = 1.0f;
+        if (has_mask && mask[py * W + px] < 128) m_center = 0.0f;
         for (uint c = 0; c < 3; c++) {
             float conv_f1 = 0, conv_f2 = 0, conv_f3 = 0;
             for (uint dy = 0; dy < SSIM_WIN; dy++) {
@@ -3797,7 +3817,7 @@ kernel void ssim_v_bwd_kernel(
             float gt_val = (float)gt[(py * W + px) * 3 + c] * (1.0f/255.0f);
 
             float v_ssim = conv_f1 + rend_val * conv_f2 + gt_val * conv_f3;
-            float v_l1 = (gt_val > rend_val) ? -1.0f : ((gt_val < rend_val) ? 1.0f : 0.0f);
+            float v_l1 = m_center * ((gt_val > rend_val) ? -1.0f : ((gt_val < rend_val) ? 1.0f : 0.0f));
 
             float v_px = inv_n * (
                 -ssim_weight * v_ssim + (1.0f - ssim_weight) * v_l1

@@ -89,6 +89,10 @@ int main(int argc, char *argv[]) {
         ->expected(3);
     std::string colmapImagePath;
     app.add_option("--colmap-image-path", colmapImagePath, "Override COLMAP image directory");
+    std::string maskDir;
+    app.add_option("--mask-dir", maskDir,
+                   "Directory of per-image training masks (white=use, black=ignore); "
+                   "resolves <mask-dir>/<image-name>.png. Masked pixels contribute zero loss.");
     int positionLrMaxSteps = 30000;
     app.add_option("--position-lr-max-steps", positionLrMaxSteps, "Step where position LR reaches its final value")
         ->check(CLI::Range(1, 1000000));
@@ -118,6 +122,19 @@ int main(int argc, char *argv[]) {
 
         for (auto &cam : inputData.cameras)
             cam.loadImage(downScaleFactor);
+
+        // Load per-image training masks (after loadImage so dims are final).
+        // All-white / missing masks are dropped inside loadMask, so mask GPU
+        // memory stays proportional to actual masked coverage.
+        if (!maskDir.empty()) {
+            int64_t maskedCams = 0;
+            for (auto &cam : inputData.cameras) {
+                cam.loadMask(maskDir);
+                if (cam.gpuMask.defined()) ++maskedCams;
+            }
+            std::cout << "Masks: " << maskedCams << "/" << inputData.cameras.size()
+                      << " images have masked regions (from " << maskDir << ")" << std::endl;
+        }
 
         extern void log_memory(const char* label);
         log_memory("images loaded");

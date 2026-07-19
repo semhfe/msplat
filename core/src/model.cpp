@@ -862,14 +862,21 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
         adam_bc2s[i] = std::sqrt(bc2);
     }
 
-    float lossInvN = 1.0f / (float)(s.height * s.width * 3);
+    // Masked training: normalize the loss by the pixels that actually
+    // contribute so the effective learning-rate scale is mask-independent.
+    const bool hasMask = cam.gpuMask.defined() && cam.unmaskedPixels > 0;
+    float lossInvN = hasMask
+        ? 1.0f / (float)(cam.unmaskedPixels * 3)
+        : 1.0f / (float)(s.height * s.width * 3);
 
     auto [r, loss] = msplat_train_step(
         numPoints, means, scales, 1.0f,
         quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
         s.height, s.width, s.tileBounds, 0.01f,
         s.degree, s.degreesToUse, s.cam_pos, featuresDc, featuresRest,
-        opacities, backgroundColor, gt, window2d, ssimWeight,
+        opacities, backgroundColor, gt,
+        hasMask ? cam.gpuMask : gt, (int)hasMask,  // dummy bind when unmasked (kernels never read it)
+        window2d, ssimWeight,
         lossInvN, (int)featuresRest.size(-2),
         N_ADAM_GROUPS,
         adam_p, adam_ea, adam_eas,

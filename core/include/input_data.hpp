@@ -22,15 +22,27 @@ struct Camera {
     float k1 = 0, k2 = 0, k3 = 0, p1 = 0, p2 = 0;
     float camToWorld[16] = {};  // 4x4 row-major, camera-to-world (OpenGL: Y-up, Z-back)
     std::string filePath;
+    // Dataset-relative image name (e.g. "cam0/frame_000001.jpg") as stored in
+    // COLMAP images.bin — used to resolve the matching training mask.
+    std::string relativeName;
 
     // Single GPU image buffer (UMA shared storage — CPU & GPU read the same memory).
     // Replaces the previous dual-copy design (CPU std::vector + Metal MTensor).
     MTensor gpuBaseImage;
+    // Optional training mask (H, W) uint8: 255 = pixel contributes to the loss,
+    // 0 = ignored (COLMAP mask polarity). Undefined when the camera has no mask
+    // or the mask is all-white. See Camera::loadMask.
+    MTensor gpuMask;
+    // Count of contributing pixels when gpuMask is defined; -1 otherwise.
+    int64_t unmaskedPixels = -1;
     MTensor cachedViewMat, cachedProjViewMat;
     float cachedCamPos[3] = {};
     float cachedFovX = 0, cachedFovY = 0;
 
     void loadImage(float downscaleFactor);
+    // Load "<maskDir>/<relativeName>.png" (COLMAP convention; falls back to the
+    // extension-swapped name) — call AFTER loadImage so dimensions are final.
+    void loadMask(const std::string &maskDir);
     MTensor& getGPUImage();
     bool hasDistortion() const { return k1 != 0 || k2 != 0 || k3 != 0 || p1 != 0 || p2 != 0; }
 };
