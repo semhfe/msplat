@@ -1,9 +1,11 @@
 #ifndef MODEL_H
 #define MODEL_H
 
+#include <memory>
 #include "metal_tensor.hpp"
 #include "ssim.hpp"
 #include "input_data.hpp"
+#include "pose_opt.hpp"
 
 int numShBases(int degree);
 float psnr(const MTensor& rendered, const MTensor& gt);
@@ -102,6 +104,11 @@ struct Model{
 
   float scale;
   float translation[3] = {};
+
+  // Pose-opt (Task 2+): per-image SE(3) delta optimizer. Null = off (default);
+  // constructed by the CLI only when --pose-opt is passed. No forward-pass
+  // math consumes this yet — wiring only until Task 3.
+  std::unique_ptr<PoseOpt> poseOpt;
 
 private:
   void relocate(const std::vector<int>& dead_indices, const std::vector<int>& alive_indices);

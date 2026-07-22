@@ -39,6 +39,12 @@ struct Camera {
     float cachedCamPos[3] = {};
     float cachedFovX = 0, cachedFovY = 0;
 
+    // Pose-opt (Task 2+): index into PoseOpt's per-image delta array (-1 if
+    // pose-opt is off or this camera wasn't assigned one), and the rig-camera
+    // slot parsed from relativeName's "cam<k>/" prefix (-1 for non-rig datasets).
+    int poseIndex = -1;
+    int rigCamId = -1;
+
     void loadImage(float downscaleFactor);
     // Load "<maskDir>/<relativeName>.png" (COLMAP convention; falls back to the
     // extension-swapped name) — call AFTER loadImage so dimensions are final.

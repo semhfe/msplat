@@ -93,6 +93,20 @@ int main(int argc, char *argv[]) {
     app.add_option("--mask-dir", maskDir,
                    "Directory of per-image training masks (white=use, black=ignore); "
                    "resolves <mask-dir>/<image-name>.png. Masked pixels contribute zero loss.");
+    bool poseOpt = false;
+    app.add_flag("--pose-opt", poseOpt,
+                 "Per-image SE(3) pose refinement during training (360 rigs)");
+    float poseLr = 5e-4f;
+    app.add_option("--pose-lr", poseLr, "Pose refinement learning rate")
+        ->check(CLI::Range(0.0f, 1.0f));
+    int poseOptStart = 2000;
+    app.add_option("--pose-opt-start", poseOptStart, "Step to enable pose refinement");
+    int poseTta = 0;
+    app.add_option("--pose-tta", poseTta,
+                   "Test-time pose-alignment steps for the val view (requires --pose-opt)");
+    std::string seamWeightDir;
+    app.add_option("--seam-weight-dir", seamWeightDir,
+                   "Directory of per-crop-cam loss-weight PNGs (cam0.png..): gray 0-255 scales the loss");
     int positionLrMaxSteps = 30000;
     app.add_option("--position-lr-max-steps", positionLrMaxSteps, "Step where position LR reaches its final value")
         ->check(CLI::Range(1, 1000000));
@@ -152,6 +166,21 @@ int main(int argc, char *argv[]) {
             cams = train; valCam = val;
         }
 
+        auto rigCamOf = [](const std::string& rel) -> int {
+            // "cam<k>/frame_....jpg" -> k; -1 for non-rig datasets
+            if (rel.rfind("cam", 0) != 0) return -1;
+            size_t slash = rel.find('/');
+            if (slash == std::string::npos || slash <= 3) return -1;
+            try { return std::stoi(rel.substr(3, slash - 3)); } catch (...) { return -1; }
+        };
+        int nRigCams = 0;
+        for (size_t i = 0; i < cams.size(); i++) {
+            cams[i].poseIndex = (int)i;
+            cams[i].rigCamId = rigCamOf(cams[i].relativeName);
+            nRigCams = std::max(nRigCams, cams[i].rigCamId + 1);
+        }
+        if (valCam) { valCam->poseIndex = (int)cams.size(); valCam->rigCamId = rigCamOf(valCam->relativeName); }
+
         Model model(inputData, cams.size(),
                      shDegree, shDegreeInterval,
                      capMax, noiseLr, opacityReg, scaleReg,
@@ -159,6 +188,13 @@ int main(int argc, char *argv[]) {
                      bgColor.data(),
                      positionLrMaxSteps);
         model.cull_radius = cullRadius;
+
+        if (poseOpt) {
+            int nSlots = (int)cams.size() + (valCam ? 1 : 0);
+            model.poseOpt = std::make_unique<PoseOpt>(nSlots, nRigCams, poseLr, poseOptStart);
+            std::cout << "Pose-opt: ON  lr=" << poseLr << " start=" << poseOptStart
+                      << " cams=" << nRigCams << " images=" << nSlots << std::endl;
+        }
 
         log_memory("model init");
 

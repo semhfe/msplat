@@ -82,6 +82,7 @@ add_library(msplat_core STATIC
     core/metal/msplat_metal.mm
     core/src/msplat_api.mm
     core/src/model.cpp
+    core/src/pose_opt.cpp
     core/src/input_data.cpp
     core/src/loaders/load_colmap.cpp
     core/src/loaders/load_nerfstudio.cpp
@@ -94,6 +95,7 @@ add_library(msplat_core STATIC
 target_include_directories(msplat_core PUBLIC
     ${CMAKE_SOURCE_DIR}/core/include
     ${CMAKE_SOURCE_DIR}/core/metal
+    ${CMAKE_SOURCE_DIR}/core/src
 )
 target_link_libraries(msplat_core PUBLIC
     ${FOUNDATION_LIBRARY}
