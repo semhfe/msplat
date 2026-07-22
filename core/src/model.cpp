@@ -807,6 +807,7 @@ Model::CamSetup Model::prepareCam(Camera& cam, int step) {
         memcpy(cam.cachedViewMat.data_ptr(), vm, sizeof(vm));
         cam.cachedProjViewMat = gpu_empty({4, 4}, DType::Float32);
         memcpy(cam.cachedProjViewMat.data_ptr(), pvm, sizeof(pvm));
+        memcpy(cam.cachedProjMat, pm, sizeof(pm));
         cam.cachedCamPos[0] = T[0]; cam.cachedCamPos[1] = T[1]; cam.cachedCamPos[2] = T[2];
         cam.cachedFovX = fovX; cam.cachedFovY = fovY;
     }
@@ -821,6 +822,31 @@ Model::CamSetup Model::prepareCam(Camera& cam, int step) {
     s.cam_pos[1] = cam.cachedCamPos[1];
     s.cam_pos[2] = cam.cachedCamPos[2];
 
+    s.viewMat = cam.cachedViewMat;
+    s.projViewMat = cam.cachedProjViewMat;
+    if (poseOpt && cam.poseIndex >= 0) {
+        float vmComposed[16];
+        if (poseOpt->composeViewmat(cam.poseIndex, cam.rigCamId,
+                                    (const float*)cam.cachedViewMat.data_ptr(), vmComposed)) {
+            if (!poseScratchViewMat.defined()) {
+                poseScratchViewMat = gpu_empty({4,4}, DType::Float32);
+                poseScratchProjViewMat = gpu_empty({4,4}, DType::Float32);
+            }
+            float pvm[16] = {};
+            for (int i=0;i<4;i++) for (int j=0;j<4;j++) for (int k=0;k<4;k++)
+                pvm[i*4+j] += cam.cachedProjMat[i*4+k] * vmComposed[k*4+j];
+            memcpy(poseScratchViewMat.data_ptr(), vmComposed, sizeof(vmComposed));
+            memcpy(poseScratchProjViewMat.data_ptr(), pvm, sizeof(pvm));
+            s.viewMat = poseScratchViewMat;
+            s.projViewMat = poseScratchProjViewMat;
+            // camera center = -R' * t' with viewmat rows R'|t' (world->cam)
+            const float* m = vmComposed;
+            s.cam_pos[0] = -(m[0]*m[3] + m[4]*m[7] + m[8]*m[11]);
+            s.cam_pos[1] = -(m[1]*m[3] + m[5]*m[7] + m[9]*m[11]);
+            s.cam_pos[2] = -(m[2]*m[3] + m[6]*m[7] + m[10]*m[11]);
+        }
+    }
+
     return s;
 }
 
@@ -828,7 +854,7 @@ MTensor Model::render(Camera& cam, int step){
     auto s = prepareCam(cam, step);
     return msplat_render(
         means.size(0), means, scales, 1.0f,
-        quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
+        quats, s.viewMat, s.projViewMat, s.fx, s.fy, s.cx, s.cy,
         s.height, s.width, s.tileBounds, 0.01f,
         s.degree, s.degreesToUse, s.cam_pos, featuresDc, featuresRest,
         opacities, backgroundColor);
@@ -871,7 +897,7 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
 
     auto [r, loss] = msplat_train_step(
         numPoints, means, scales, 1.0f,
-        quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
+        quats, s.viewMat, s.projViewMat, s.fx, s.fy, s.cx, s.cy,
         s.height, s.width, s.tileBounds, 0.01f,
         s.degree, s.degreesToUse, s.cam_pos, featuresDc, featuresRest,
         opacities, backgroundColor, gt,

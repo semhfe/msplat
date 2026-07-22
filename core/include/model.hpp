@@ -43,6 +43,11 @@ struct Model{
     int height, width, degree, degreesToUse;
     std::tuple<int,int,int> tileBounds;
     float cam_pos[3];
+    // Composed (or, in the fast path, cached-unchanged) view/proj-view
+    // matrices for this call. Default aliases cam.cachedViewMat/cachedProjViewMat
+    // (same tensor handle, no data copy); pose-opt overrides them in-place
+    // when the per-image delta is non-zero.
+    MTensor viewMat, projViewMat;
   };
   CamSetup prepareCam(Camera& cam, int step);
   void fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight);
@@ -106,9 +111,13 @@ struct Model{
   float translation[3] = {};
 
   // Pose-opt (Task 2+): per-image SE(3) delta optimizer. Null = off (default);
-  // constructed by the CLI only when --pose-opt is passed. No forward-pass
-  // math consumes this yet — wiring only until Task 3.
+  // constructed by the CLI only when --pose-opt is passed.
   std::unique_ptr<PoseOpt> poseOpt;
+  // Pose-opt (Task 3): lazily-allocated scratch tensors for the composed
+  // viewmat/projViewMat, reused across prepareCam calls (avoids an alloc per
+  // call on the path that lasts for the entire training run once composing
+  // is active). Untouched (left undefined) on the flag-off / zero-delta path.
+  MTensor poseScratchViewMat, poseScratchProjViewMat;
 
 private:
   void relocate(const std::vector<int>& dead_indices, const std::vector<int>& alive_indices);

@@ -38,6 +38,10 @@ struct Camera {
     MTensor cachedViewMat, cachedProjViewMat;
     float cachedCamPos[3] = {};
     float cachedFovX = 0, cachedFovY = 0;
+    // Bare (non-view-composed) projection matrix, cached alongside the view
+    // matrices above. Used by pose-opt's compose branch to rebuild
+    // projViewMat = projMat * composedViewMat without recomputing fx/fy/cx/cy.
+    float cachedProjMat[16] = {};
 
     // Pose-opt (Task 2+): index into PoseOpt's per-image delta array (-1 if
     // pose-opt is off or this camera wasn't assigned one), and the rig-camera
