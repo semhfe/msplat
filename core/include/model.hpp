@@ -136,6 +136,10 @@ struct Model{
   // (owned by the engine's tensor cache); filled by msplat_train_step when
   // pose-opt is enabled so fullIteration can CPU-sum it. Untouched when off.
   MTensor poseGradPartials;
+  // Pose-opt (Task 6): per-image relativeName, index-aligned with Camera::poseIndex,
+  // used to key the poses_refined.json sidecar so save/resume survive reordering.
+  // Filled by the CLI when poseOpt is constructed; empty otherwise.
+  std::vector<std::string> poseNames;
 
 private:
   void relocate(const std::vector<int>& dead_indices, const std::vector<int>& alive_indices);

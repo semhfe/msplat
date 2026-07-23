@@ -602,6 +602,14 @@ void Model::save(const std::string &filename, int step) {
     else
         savePly(filename, step);
     fprintf(stderr, "Saved %s\n", filename.c_str());
+
+    // Pose-opt (Task 6): persist refined per-image SE(3) deltas beside the PLY
+    // so --resume can restore them. Keyed by relativeName (order-independent).
+    if (poseOpt) {
+        fs::path sidecar = fs::path(filename).parent_path() / "poses_refined.json";
+        if (poseOpt->save(sidecar.string(), poseNames))
+            fprintf(stderr, "Saved %s\n", sidecar.string().c_str());
+    }
 }
 
 void Model::savePly(const std::string &filename, int step){

@@ -192,6 +192,10 @@ int main(int argc, char *argv[]) {
         if (poseOpt) {
             int nSlots = (int)cams.size() + (valCam ? 1 : 0);
             model.poseOpt = std::make_unique<PoseOpt>(nSlots, nRigCams, poseLr, poseOptStart);
+            // poseNames index-aligned with Camera::poseIndex (0..cams-1, then valCam)
+            // so the poses_refined.json sidecar keys by image name for resume.
+            for (size_t i = 0; i < cams.size(); i++) model.poseNames.push_back(cams[i].relativeName);
+            if (valCam) model.poseNames.push_back(valCam->relativeName);
             std::cout << "Pose-opt: ON  lr=" << poseLr << " start=" << poseOptStart
                       << " cams=" << nRigCams << " images=" << nSlots << std::endl;
         }
@@ -250,7 +254,16 @@ int main(int argc, char *argv[]) {
         }
 
         size_t step = 1;
-        if (!resume.empty()) step = model.loadPly(resume) + 1;
+        if (!resume.empty()) {
+            step = model.loadPly(resume) + 1;
+            // Pose-opt (Task 6): restore refined poses from the sidecar if present.
+            // Absent sidecar (old checkpoints) => deltas stay zero, resume as before.
+            if (model.poseOpt) {
+                fs::path sidecar = fs::path(resume).parent_path() / "poses_refined.json";
+                if (fs::exists(sidecar) && model.poseOpt->load(sidecar.string(), model.poseNames))
+                    std::cout << "Pose-opt: loaded " << sidecar.string() << std::endl;
+            }
+        }
 
         double lastGatePsnr = -1e9;   // early-stop: previous 5k-step subset PSNR
         int gateMisses = 0;           // early-stop: consecutive sub-threshold gates
