@@ -123,7 +123,9 @@ struct Model{
   // fullIteration where pose-opt was enabled. Layout [rho_xyz, omega_xyz].
   // Computed as a byproduct of the projection backward (GPU per-threadgroup
   // reduction into a partials buffer, CPU-summed here). Consumed by Task 5's
-  // optimizer step. Zero on the flag-off path.
+  // optimizer step. Written ONLY on iterations where pose-opt is active for the
+  // image; retains its prior value otherwise (init 0), so Task 5 must gate its
+  // reads on the same poseEnabled condition rather than assume a fresh zero.
   float lastPoseGrad[6] = {};
   // Non-owning handle to the GPU per-threadgroup pose-gradient partials buffer
   // (owned by the engine's tensor cache); filled by msplat_train_step when

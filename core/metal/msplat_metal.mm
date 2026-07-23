@@ -1306,7 +1306,23 @@ std::tuple<MTensor, float> msplat_train_step(
         // Pose-opt (Task 4): the threadgroup reduction uses a tg_pose[256][6]
         // array, so the threadgroup MUST NOT exceed 256 threads when pose-opt is
         // on. Cap it here; ceil(num_points/tpg) then matches the partials sizing.
-        if (pose_opt_enabled) tpg = MIN(tpg, (NSUInteger)256);
+        if (pose_opt_enabled) {
+            // The partials buffer and the CPU sum are both sized ceil(np/256)+2
+            // groups, which is only correct when tpg == 256 (for np >= 256).
+            // Adding tg_pose[256][6] (6 KB) can lower this PSO's max threads; if
+            // it drops below 256 the ceil-grid launches MORE groups than the
+            // buffer holds -> out-of-bounds write + under-read. Fail loud rather
+            // than corrupt (mirrors the sort-kernel guard above). Dormant on
+            // Apple GPUs (max stays 1024), but the invariant is now enforced.
+            NSUInteger maxTG = ctx->project_and_sh_backward_kernel_cpso.maxTotalThreadsPerThreadgroup;
+            if (maxTG < 256) {
+                fprintf(stderr, "[FATAL] pose-opt needs project_and_sh_backward threadgroup >= 256 "
+                                "(got %lu); the tg_pose[256][6] reduction would over-launch the "
+                                "partials buffer.\n", (unsigned long)maxTG);
+                abort();
+            }
+            tpg = MIN(tpg, (NSUInteger)256);
+        }
         [enc setComputePipelineState:ctx->project_and_sh_backward_kernel_cpso];
         ENC_SCALAR(enc, num_points, 0); ENC_BUF(enc, means3d, 1); ENC_BUF(enc, scales, 2);
         ENC_SCALAR(enc, glob_scale, 3); ENC_BUF(enc, quats, 4);
