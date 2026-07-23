@@ -295,7 +295,8 @@ int main(int argc, char *argv[]) {
             // and restore them before the ± perturbation renders, otherwise
             // Adam+SGLD would move the operating point out from under the test.
             static const bool kFdCheck = std::getenv("MSPLAT_POSE_FD_CHECK") != nullptr;
-            const bool doFd = kFdCheck && poseOpt && step == 100 && cam.poseIndex >= 0;
+            const bool doFd = kFdCheck && poseOpt && (step == 100 || step == 5000)
+                              && cam.poseIndex >= 0;
             MTensor* fdParams[6] = { &model.means, &model.scales, &model.quats,
                                      &model.featuresDc, &model.featuresRest, &model.opacities };
             std::vector<std::vector<float>> fdSnap;
@@ -548,6 +549,30 @@ int main(int argc, char *argv[]) {
                       << "  SSIM:  " << (sumSsim / nTest)
                       << "  L1:  " << (sumL1 / nTest)
                       << "  Gaussians: " << model.means.size(0) << std::endl;
+        }
+
+        // DIAG (MSPLAT_TRAIN_EVAL=1): render a few TRAINING views with their
+        // OWN (refined, if pose-opt) poses and print PSNR. This is the gauge-
+        // and held-out-immune quality signal: a training view is rendered in
+        // exactly the frame the Gaussians were fit in, so it isolates model
+        // quality from any eval-pose mismatch. Discarded diagnostic; no train.
+        if (std::getenv("MSPLAT_TRAIN_EVAL") != nullptr && !cams.empty()) {
+            std::cout << "\n=== Train-view eval (refined poses) ===" << std::endl;
+            int nTr = std::min((size_t)5, cams.size());
+            size_t strideTr = cams.size() / nTr;
+            double sp = 0;
+            for (int i = 0; i < nTr; i++) {
+                Camera &tc = cams[i * strideTr];
+                MTensor rgb = model.render(tc, finalStep);
+                msplat_gpu_sync();
+                MTensor rgb_cpu = rgb.cpu();
+                MTensor gt_cpu = dequantize_gt(tc.getGPUImage());
+                float p = psnr(rgb_cpu, gt_cpu);
+                sp += p;
+                std::cout << "  " << fs::path(tc.filePath).filename().string()
+                          << "  PSNR=" << p << std::endl;
+            }
+            std::cout << "  train-view mean PSNR: " << (sp / nTr) << std::endl;
         }
 
         // Validation

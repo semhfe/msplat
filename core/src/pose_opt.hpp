@@ -27,6 +27,18 @@ constexpr float kImageLrScale = 0.5f;
 constexpr float kCamWeightDecay = 1e-3f;
 constexpr float kImageWeightDecay = 1e-2f;
 
+// Gauge / over-correction control (added after the Task-4 validation showed the
+// poses drifting to ~5x the physical stitch correction). Adam is scale-
+// invariant, so it keeps taking ~lr-sized steps even when the true pose
+// gradient is tiny near the optimum, drifting the poses until the (weak) decay
+// balances it — and that drift equilibrium is independent of lr. Two hard
+// controls tame it: (1) clamp each delta near the physical correction scale
+// (~1.3px / 859px focal = 1.5e-3 rad), and (2) zero-mean the per-cam deltas so
+// their unobservable common mode (a free global rig rotation/translation)
+// cannot accumulate.
+constexpr float kMaxDeltaRot = 3.0e-3f;    // radians (2x physical, generous)
+constexpr float kMaxDeltaTrans = 3.0e-3f;  // normalized scene units
+
 // Compose the SE(3) delta matrix for a 6-vector xi = [rho_xyz, omega_xyz]:
 //   out4x4 = [ Rodrigues(omega), rho ; 0 0 0 1 ]  (row-major 4x4)
 // Guards theta = |omega| < 1e-12 by returning the identity rotation (avoids

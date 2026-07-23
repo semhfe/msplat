@@ -35,6 +35,21 @@ void adamUpdate(std::array<float, 6>& xi, std::array<float, 6>& m, std::array<fl
     }
 }
 
+// Clamp a delta so its translation (0..2) and rotation (3..5) L2 norms stay
+// within the physical-correction caps — blocks Adam's scale-invariant drift.
+static void clampDelta(std::array<float, 6>& xi) {
+    float tr = std::sqrt(xi[0] * xi[0] + xi[1] * xi[1] + xi[2] * xi[2]);
+    if (tr > kMaxDeltaTrans) {
+        const float s = kMaxDeltaTrans / tr;
+        xi[0] *= s; xi[1] *= s; xi[2] *= s;
+    }
+    float ro = std::sqrt(xi[3] * xi[3] + xi[4] * xi[4] + xi[5] * xi[5]);
+    if (ro > kMaxDeltaRot) {
+        const float s = kMaxDeltaRot / ro;
+        xi[3] *= s; xi[4] *= s; xi[5] *= s;
+    }
+}
+
 // ---- Minimal hand-rolled JSON-ish (de)serialization -----------------------
 // This file has no include paths and must not depend on nlohmann or any
 // other library; the persisted format is simple enough (fixed shape, no
@@ -203,10 +218,25 @@ void PoseOpt::step(int imageIdx, int rigCam, const float grad6[6], int trainStep
 
     adamUpdate(xiImage_[imageIdx], mImage_[imageIdx], vImage_[imageIdx], tImage_[imageIdx],
                grad6, kImageLrScale * lrT, kImageWeightDecay);
+    clampDelta(xiImage_[imageIdx]);
 
     if (rigCam >= 0) {
         adamUpdate(xiCam_[rigCam], mCam_[rigCam], vCam_[rigCam], tCam_[rigCam], grad6, lrT,
                    kCamWeightDecay);
+        clampDelta(xiCam_[rigCam]);
+
+        // Gauge fix: remove the per-cam common mode (a free global rig
+        // rotation/translation the photometric loss cannot observe) by
+        // zero-meaning the per-cam deltas. Cheap (<=16 vectors) and keeps the
+        // relative per-crop corrections intact.
+        if (nCams_ > 1) {
+            std::array<float, 6> mean{0, 0, 0, 0, 0, 0};
+            for (int c = 0; c < nCams_; c++)
+                for (int k = 0; k < 6; k++) mean[k] += xiCam_[c][k];
+            for (int k = 0; k < 6; k++) mean[k] /= static_cast<float>(nCams_);
+            for (int c = 0; c < nCams_; c++)
+                for (int k = 0; k < 6; k++) xiCam_[c][k] -= mean[k];
+        }
     }
 }
 
@@ -216,6 +246,7 @@ void PoseOpt::stepImageOnly(int imageIdx, const float grad6[6]) {
     // directly, continuing this slot's own Adam visit count.
     adamUpdate(xiImage_[imageIdx], mImage_[imageIdx], vImage_[imageIdx], tImage_[imageIdx],
                grad6, kImageLrScale * lr, kImageWeightDecay);
+    clampDelta(xiImage_[imageIdx]);
 }
 
 bool PoseOpt::save(const std::string& jsonPath, const std::vector<std::string>& names) const {
