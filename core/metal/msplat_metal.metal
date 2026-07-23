@@ -1365,7 +1365,11 @@ void project_cov3d_ewa_vjp(
     v_mean3d[2] += (float)dot(v_t, W[2]);
 }
 
-// Thread-local overload: reads cov3d from registers, writes v_cov3d to registers
+// Thread-local overload: reads cov3d from registers, writes v_cov3d to registers.
+// Pose-opt (Task 4): when v_omega_cov != nullptr, ALSO returns the covariance
+// path's contribution to the left-SE(3) rotation gradient dL/domega (3 floats).
+// Passing nullptr (the default for non-pose callers) skips that math entirely,
+// keeping the flag-off path structurally and numerically inert.
 void project_cov3d_ewa_vjp(
     thread float* cov3d,
     constant float* viewmat,
@@ -1376,7 +1380,9 @@ void project_cov3d_ewa_vjp(
     float3 v_cov2d,
     device float* v_mean3d,
     thread float* v_cov3d,
-    float3 p_view
+    float3 p_view,
+    thread float3* v_omega_cov = nullptr,
+    thread float3* v_tcov_cam = nullptr
 ) {
     float lim_x = 1.3f * tan_fovx;
     float lim_y = 1.3f * tan_fovy;
@@ -1434,6 +1440,38 @@ void project_cov3d_ewa_vjp(
     v_mean3d[0] += (float)dot(v_t, W[0]);
     v_mean3d[1] += (float)dot(v_t, W[1]);
     v_mean3d[2] += (float)dot(v_t, W[2]);
+
+    // Pose-opt (Task 4): the camera-space covariance mean gradient dL/dp_view
+    // (BEFORE the W conversion above). Moving p_view changes each Gaussian's
+    // projected FOOTPRINT via J(p_view) -> this term dominates the z-translation
+    // gradient (which the screen path alone misses). The 0.5 factor removes the
+    // symmetric-doubling inherited from v_T = 2 v_cov T V (correct for v_cov3d,
+    // double-counted for the mean). Scale FD-arbitrated (Step 7).
+    if (v_tcov_cam) *v_tcov_cam = 0.5f * v_t;
+
+    // ---- Pose-opt (Task 4): covariance-path rotation gradient ----
+    // The camera-frame 3D covariance is Sigma_cam = W * V * W^T (W = viewmat
+    // rotation R, V = world cov3d). Under a left-SE(3) perturbation R -> (I+[w]x)R
+    // (the SAME convention as the mean path's cross(p_view, v_t)),
+    //   dSigma_cam = [w]x Sigma_cam - Sigma_cam [w]x,
+    // and with G_cam = dL/dSigma_cam = J^T v_cov J (J = EWA Jacobian, v_cov the
+    // symmetric 3x3 embedding of dL/dcov2d, both already in registers),
+    //   dL/dw = 2 * antisym(G_cam * Sigma_cam).
+    // NOTE: this is the DIRECT dependence of Sigma_cam on R only; the
+    // p_view-through-R dependence (J and the mean) is already folded into
+    // v_mean3d above and handled by the caller's mean path -- no double count.
+    // Signs are the arbiter-of-record from the FD check (Step 7), not first
+    // principles alone; flip a component here if FD disagrees.
+    if (v_omega_cov) {
+        float3x3 Gcam = transpose(J) * v_cov * J;   // dL/dSigma_cam (3x3, symmetric)
+        float3x3 Scam = W * V * transpose(W);        // Sigma_cam = R V R^T (3x3, symmetric)
+        float3x3 C = Gcam * Scam;                    // G_cam * Sigma_cam
+        *v_omega_cov = 2.0f * float3(
+            C[1][2] - C[2][1],
+            C[2][0] - C[0][2],
+            C[0][1] - C[1][0]
+        );
+    }
 }
 
 inline float4 quat_to_rotmat_vjp(const float4 quat, const float3x3 v_R) {
@@ -1883,12 +1921,34 @@ kernel void project_and_sh_backward_kernel(
     device float* rest_exp_avg_sq,
     constant SHAdamParams& adam_hp,
     device atomic_uint* nan_counts,    // slot 3: nonfinite v_colors (SH grads skipped)
-    uint idx [[thread_position_in_grid]]
+    // Pose-opt (Task 4): per-threadgroup pose-gradient partials + enable flag.
+    // When pose_opt_enabled == 0 these are dummy-bound and never read; the
+    // kernel then takes the legacy early-return and is numerically inert.
+    device float* pose_grad_partials,
+    constant int& pose_opt_enabled,
+    uint idx        [[thread_position_in_grid]],
+    uint idx_in_tg  [[thread_index_in_threadgroup]],
+    uint threads_in_tg [[threads_per_threadgroup]],
+    uint tgid       [[threadgroup_position_in_grid]]
 ) {
-    if (idx >= (uint)num_points || radii[idx] <= 0) {
-        return;
+    // Restructured early-exit (Task 4): when pose-opt is on, EVERY launched
+    // thread must reach the reduction barriers below, so inactive threads may
+    // not return early. Only the legacy (pose-off) path keeps the fast return.
+    bool active = (idx < (uint)num_points) && (radii[idx] > 0);
+    if (!pose_opt_enabled && !active) {
+        return;   // legacy fast path: no barriers reached when pose-opt is off
     }
-    float3 p_world = read_packed_float3(means3d, idx);
+
+    // Hoisted to function scope so the pose block (after the if(active) body)
+    // and the SH backward (after the reduction) can read them; inactive threads
+    // leave these at zero.
+    float3 p_world = 0.0f;
+    float3 p_view = 0.0f;
+    float3 g_pose_t = 0.0f;   // dL/drho  (camera-frame translation gradient)
+    float3 g_pose_w = 0.0f;   // dL/domega (camera-frame rotation gradient)
+
+    if (active) {
+    p_world = read_packed_float3(means3d, idx);
     float fx = intrins.x;
     float fy = intrins.y;
 
@@ -1922,8 +1982,12 @@ kernel void project_and_sh_backward_kernel(
     // v_cov3d (thread-local) and v_mean3d contribution
     float tan_fovx = 0.5f * (float)img_size.x / fx;
     float tan_fovy = 0.5f * (float)img_size.y / fy;
-    float3 p_view = transform_4x3(viewmat, p_world);
+    p_view = transform_4x3(viewmat, p_world);
     float local_v_cov3d[6];
+    // When pose-opt is on, also collect the covariance path's rotation
+    // gradient contribution (dL/domega_cov); nullptr otherwise keeps it inert.
+    float3 v_omega_cov = 0.0f;
+    float3 v_tcov_cam = 0.0f;
     project_cov3d_ewa_vjp(
         local_cov3d,
         viewmat,
@@ -1934,7 +1998,9 @@ kernel void project_and_sh_backward_kernel(
         float3(local_v_cov2d[0], local_v_cov2d[1], local_v_cov2d[2]),
         &(v_mean3d[3*idx]),
         local_v_cov3d,
-        p_view
+        p_view,
+        pose_opt_enabled ? &v_omega_cov : nullptr,
+        pose_opt_enabled ? &v_tcov_cam : nullptr
     );
 
     // v_scale and v_quat (reads v_cov3d from thread-local)
@@ -1950,6 +2016,75 @@ kernel void project_and_sh_backward_kernel(
     v_scale[3*idx + 0] *= exp_scale.x;
     v_scale[3*idx + 1] *= exp_scale.y;
     v_scale[3*idx + 2] *= exp_scale.z;
+
+    // ---- Pose-opt (Task 4): camera-space pose gradient contributions ----
+    if (pose_opt_enabled) {
+        // Compute dL/dp_view DIRECTLY in camera space from the rasterizer's EXACT
+        // outputs, instead of round-tripping through the approximate world-space
+        // v_mean3d (project_pix_vjp drops the perspective-w term). The pinhole
+        // projection Jacobian is J_screen = dpixel/dp_view =
+        //   [[ fx/z,   0,   -fx*x/z^2 ],
+        //    [  0,   fy/z,  -fy*y/z^2 ]]   (fx,fy in pixels, (x,y,z)=p_view)
+        // so the screen path is dL/dp_view = J_screen^T * v_xy (v_xy = dL/dpixel),
+        // plus the depth path v_depth * e_z (depth == p_view.z).
+        // NOTE: rho_x matches FD with +fx, but the rasterizer's v_xy.y carries the
+        // opposite sign convention (image row order vs projection y), so the y
+        // screen terms take a leading minus. Signs are FD-arbitrated (Step 7).
+        float rz = 1.0f / p_view.z;
+        float rz2 = rz * rz;
+        float2 vxy = read_packed_float2(v_xy, idx);
+        float vz = v_depth[idx];
+        float3 dL_dpview = float3(
+            fx * rz * vxy.x,
+            -fy * rz * vxy.y,
+            -fx * p_view.x * rz2 * vxy.x + fy * p_view.y * rz2 * vxy.y + vz
+        );
+        // Add the covariance-through-J mean gradient (camera space): moving the
+        // camera in z rescales each Gaussian's screen footprint -> this is the
+        // dominant z-translation signal the screen path alone misses. Only the
+        // z-component is taken: the lateral (x,y) footprint change is tiny in
+        // truth, and the engine's off-diagonal v_J terms (v_t.x/.y) are in a
+        // transposed convention that fights the screen path (FD-arbitrated).
+        dL_dpview.z += v_tcov_cam.z;
+        // Translation grad: dL/drho = dL/dp_view (dp_view/drho = I).
+        g_pose_t = dL_dpview;
+        // Mean-path rotation grad. The cross order is cross(dL, p_view) — the
+        // negative of the textbook p_view x dL — matching the actual Rodrigues +
+        // E*viewmat composition sign in se3_delta_matrix (FD-arbitrated, Step 7).
+        g_pose_w = cross(dL_dpview, p_view);
+        // Covariance-path rotation grad (amendment 7): direct dependence of
+        // Sigma_cam = R V R^T on R; same sign convention as the mean path.
+        g_pose_w -= v_omega_cov;
+    }
+    }   // end if(active)
+
+    // ---- Pose-opt (Task 4): per-threadgroup reduction of (g_pose_t, g_pose_w)
+    // into pose_grad_partials[tgid][0..5] = [rho_xyz, omega_xyz]. ALL launched
+    // threads reach these barriers when pose_opt_enabled (inactive threads wrote
+    // zeros above). Apple7 discipline: inactive/beyond-count slots are never
+    // read because the tree guard checks (tid + s2 < tg_n) against the ACTUAL
+    // per-threadgroup thread count (correct even for truncated edge groups under
+    // dispatchThreads).
+    if (pose_opt_enabled) {
+        threadgroup float tg_pose[256][6];
+        uint tid = idx_in_tg;
+        uint tg_n = threads_in_tg;   // actual thread count (<=256; edge groups smaller)
+        float vals[6] = { g_pose_t.x, g_pose_t.y, g_pose_t.z,
+                          g_pose_w.x, g_pose_w.y, g_pose_w.z };
+        for (int k = 0; k < 6; k++) tg_pose[tid][k] = vals[k];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s2 = 128; s2 > 0; s2 >>= 1) {
+            if (tid < s2 && tid + s2 < tg_n) {
+                for (int k = 0; k < 6; k++) tg_pose[tid][k] += tg_pose[tid + s2][k];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0) {
+            for (int k = 0; k < 6; k++) pose_grad_partials[tgid * 6 + k] = tg_pose[0][k];
+        }
+    }
+
+    if (!active) return;
 
     // ---- Fused SH backward + Adam ----
     // Compute SH gradients in registers and apply Adam inline.

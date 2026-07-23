@@ -54,6 +54,12 @@ struct PoseOpt {
     // TTA: update ONLY xi_i(imageIdx) (used for held-out eval alignment).
     void stepImageOnly(int imageIdx, const float grad6[6]);
 
+    // FD-check hook only (Task 4): mutable access to a single per-image delta
+    // component so the finite-difference test can perturb xi_i(imageIdx)[k] by
+    // +/- eps, re-render, and compare against the analytic gradient. Not used
+    // on any production path.
+    float& xiImageRef(int imageIdx, int k) { return xiImage_[imageIdx][k]; }
+
     bool save(const std::string& jsonPath, const std::vector<std::string>& names) const;
     bool load(const std::string& jsonPath, const std::vector<std::string>& names);
 

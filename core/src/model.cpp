@@ -895,6 +895,12 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
         ? 1.0f / (float)(cam.unmaskedPixels * 3)
         : 1.0f / (float)(s.height * s.width * 3);
 
+    // Pose-opt (Task 4): compute the per-image pose gradient as a byproduct of
+    // the projection backward whenever pose-opt is active for this image. The
+    // optimizer step itself is wired by Task 5; here we only produce the (FD-
+    // verified) gradient into lastPoseGrad.
+    const bool poseEnabled = (poseOpt && cam.poseIndex >= 0);
+
     auto [r, loss] = msplat_train_step(
         numPoints, means, scales, 1.0f,
         quats, s.viewMat, s.projViewMat, s.fx, s.fy, s.cx, s.cy,
@@ -907,9 +913,24 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
         N_ADAM_GROUPS,
         adam_p, adam_ea, adam_eas,
         adam_ss, adam_bc2s,
-        adam_beta1, adam_beta2, adam_eps);
+        adam_beta1, adam_beta2, adam_eps,
+        poseEnabled ? &poseGradPartials : nullptr, poseEnabled ? 1 : 0);
 
     radii = r;
+
+    if (poseEnabled) {
+        // Drain THIS step's backward so the pose partials are valid (the fused
+        // pipeline only reads a stale loss inline; the partials must not be
+        // read stale). commitAndContinue keeps encoding open for the SGLD/MCMC
+        // work that follows. Then CPU-sum the per-threadgroup partials.
+        msplat_commit();
+        const int64_t nGroups = (int64_t)(numPoints + 255) / 256 + 2;
+        const float* pg = poseGradPartials.data<float>();
+        float grad6[6] = {0, 0, 0, 0, 0, 0};
+        for (int64_t gi = 0; gi < nGroups; ++gi)
+            for (int k = 0; k < 6; ++k) grad6[k] += pg[gi * 6 + k];
+        for (int k = 0; k < 6; ++k) lastPoseGrad[k] = grad6[k];
+    }
 
     // MCMC: SGLD noise perturbation, then post-Adam opacity/scale regularization.
     // Noise is generated on GPU (PCG+Box-Muller, seeded by step) — previously this

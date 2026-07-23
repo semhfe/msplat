@@ -71,7 +71,13 @@ std::tuple<MTensor, float> msplat_train_step(
     int num_adam_groups,
     MTensor adam_params[], MTensor adam_exp_avg[], MTensor adam_exp_avg_sq[],
     float adam_step_sizes[], float adam_bc2_sqrts[],
-    float adam_beta1, float adam_beta2, float adam_eps
+    float adam_beta1, float adam_beta2, float adam_eps,
+    // Pose-opt (Task 4): when pose_opt_enabled != 0, the projection backward
+    // reduces the per-image pose gradient dL/dxi into a per-threadgroup partials
+    // buffer; on return *pose_grad_partials aliases that buffer (non-owning) so
+    // the caller can CPU-sum it after the command buffer completes. Pass
+    // nullptr / 0 to disable (the kernel then takes its legacy early-return).
+    MTensor* pose_grad_partials = nullptr, int pose_opt_enabled = 0
 );
 
 // MCMC: fill an N*3 noise buffer with N(0,1) samples on GPU (PCG+Box-Muller).

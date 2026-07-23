@@ -273,7 +273,70 @@ int main(int argc, char *argv[]) {
 
             auto iter_start = cpu_now();
             MTensor gt = cam.getGPUImage();
+
+            // ── FD-check hook (Task 4): verify the analytic pose gradient
+            // against finite differences. Active only under
+            // MSPLAT_POSE_FD_CHECK=1 with --pose-opt, at step 100, for images
+            // with a pose slot. The analytic gradient is evaluated by the fused
+            // backward at the PRE-update params, so we snapshot those params here
+            // and restore them before the ± perturbation renders, otherwise
+            // Adam+SGLD would move the operating point out from under the test.
+            static const bool kFdCheck = std::getenv("MSPLAT_POSE_FD_CHECK") != nullptr;
+            const bool doFd = kFdCheck && poseOpt && step == 100 && cam.poseIndex >= 0;
+            MTensor* fdParams[6] = { &model.means, &model.scales, &model.quats,
+                                     &model.featuresDc, &model.featuresRest, &model.opacities };
+            std::vector<std::vector<float>> fdSnap;
+            if (doFd) {
+                msplat_gpu_sync();                 // drain step 99; params stable at P0
+                fdSnap.resize(6);
+                for (int i = 0; i < 6; ++i) {
+                    size_t nb = fdParams[i]->nbytes();
+                    fdSnap[i].resize(nb / sizeof(float));
+                    memcpy(fdSnap[i].data(), fdParams[i]->data_ptr(), nb);
+                }
+            }
+
             model.fullIteration(cam, step, gt, ssimWeight);
+
+            if (doFd) {
+                msplat_gpu_sync();                 // drain step 100 (Adam+SGLD+MCMC)
+                float analytic[6];
+                for (int k = 0; k < 6; ++k) analytic[k] = model.lastPoseGrad[k];
+                // Restore P0 so the FD renders share the analytic grad's operating point.
+                for (int i = 0; i < 6; ++i)
+                    memcpy(fdParams[i]->data_ptr(), fdSnap[i].data(), fdParams[i]->nbytes());
+                auto fdLoss = [&]() -> float {
+                    MTensor rgb = model.render(cam, (int)step);
+                    msplat_gpu_sync();
+                    MTensor rgbCpu = rgb.cpu();
+                    MTensor gtCpu = dequantize_gt(cam.getGPUImage());
+                    float ss = ssim_eval(rgbCpu, gtCpu);
+                    float l1 = l1_loss(rgbCpu, gtCpu);
+                    return ssimWeight * (1.0f - ss) + (1.0f - ssimWeight) * l1;
+                };
+                const char* nm[6] = {"rho_x","rho_y","rho_z","omega_x","omega_y","omega_z"};
+                float L0 = fdLoss();
+                fprintf(stderr, "FD pose-gradient check (image %d, step %zu, splats %lld) L0=%.8e\n",
+                        cam.poseIndex, (size_t)step, (long long)model.means.size(0), L0);
+                for (int k = 0; k < 6; ++k) {
+                    float eps = (k < 3) ? 1e-4f : 1e-5f;
+                    float& xi = model.poseOpt->xiImageRef(cam.poseIndex, k);
+                    float x0 = xi;
+                    xi = x0 + eps; float Lp = fdLoss();
+                    xi = x0 - eps; float Lm = fdLoss();
+                    xi = x0;
+                    float num = (Lp - Lm) / (2.0f * eps);
+                    float denom = std::max(std::fabs(analytic[k]), std::fabs(num));
+                    float rel = denom > 0.0f ? std::fabs(analytic[k] - num) / denom : 0.0f;
+                    bool signOk = (analytic[k] < 0.0f) == (num < 0.0f);
+                    fprintf(stderr,
+                        "FD  k=%d %-8s analytic=% .6e  numeric=% .6e  rel=%.3f  %s  Lp=%.8e Lm=%.8e dL=%.3e\n",
+                        k, nm[k], analytic[k], num, rel, signOk ? "sign_ok" : "SIGN_MISMATCH",
+                        Lp, Lm, Lp - Lm);
+                }
+                // Params intentionally left at P0 (the test run's output is discarded).
+            }
+
             model.schedulersStep(step);
             model.mcmcAfterTrain(step);
             msplat_commit();

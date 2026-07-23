@@ -119,6 +119,17 @@ struct Model{
   // is active). Untouched (left undefined) on the flag-off / zero-delta path.
   MTensor poseScratchViewMat, poseScratchProjViewMat;
 
+  // Pose-opt (Task 4): analytic per-image pose gradient dL/dxi for the last
+  // fullIteration where pose-opt was enabled. Layout [rho_xyz, omega_xyz].
+  // Computed as a byproduct of the projection backward (GPU per-threadgroup
+  // reduction into a partials buffer, CPU-summed here). Consumed by Task 5's
+  // optimizer step. Zero on the flag-off path.
+  float lastPoseGrad[6] = {};
+  // Non-owning handle to the GPU per-threadgroup pose-gradient partials buffer
+  // (owned by the engine's tensor cache); filled by msplat_train_step when
+  // pose-opt is enabled so fullIteration can CPU-sum it. Untouched when off.
+  MTensor poseGradPartials;
+
 private:
   void relocate(const std::vector<int>& dead_indices, const std::vector<int>& alive_indices);
   int addNewGaussians();

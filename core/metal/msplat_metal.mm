@@ -526,6 +526,13 @@ struct FusedTensorCache {
     MTensor v_xy, v_conic, v_colors_rast, v_opacity, v_depth;
     MTensor v_mean3d, v_scale, v_quat, v_features_dc, v_features_rest;
 
+    // Pose-opt (Task 4): per-threadgroup pose-gradient partials, laid out as
+    // float[numThreadgroups][6] = [rho_xyz, omega_xyz]. Sized for the max
+    // threadgroup count at a 256-thread cap plus a small pad; the backward
+    // kernel forces tpg<=256 when pose-opt is on, so ceil(np/256) groups is the
+    // exact write count and the pad groups stay zero (memset each encode).
+    MTensor pose_partials;
+
     // Cumulative NaN-gate counters (never zeroed; CPU logs deltas).
     // Slots: 0=v_mean3d 1=v_scale 2=v_quat 3=v_colors(SH) 4=spare
     //        5=v_opacity 6=v_rendered pixels 7=spare
@@ -607,6 +614,11 @@ struct FusedTensorCache {
             v_quat.reset();          v_quat = mtensor_empty(dev, {np, 4}, DType::Float32);
             v_features_dc.reset();   v_features_dc = mtensor_empty(dev, {np, 3}, DType::Float32);
             v_features_rest.reset(); v_features_rest = mtensor_empty(dev, {(int64_t)np, (int64_t)frb, 3}, DType::Float32);
+            // Pose-opt (Task 4): (ceil(np/256) + 2) groups * 6 floats. The +2
+            // pad guarantees room for the exact ceil(np/256) written groups plus
+            // slack, so a fixed-formula CPU sum never reads past the buffer.
+            int64_t pose_groups = (int64_t)(np + 255) / 256 + 2;
+            pose_partials.reset();   pose_partials = mtensor_empty(dev, {pose_groups * 6}, DType::Float32);
         }
     }
 };
@@ -965,7 +977,8 @@ std::tuple<MTensor, float> msplat_train_step(
     int num_adam_groups,
     MTensor adam_params[], MTensor adam_exp_avg[], MTensor adam_exp_avg_sq[],
     float adam_step_sizes[], float adam_bc2_sqrts[],
-    float adam_beta1, float adam_beta2, float adam_eps
+    float adam_beta1, float adam_beta2, float adam_eps,
+    MTensor* pose_grad_partials, int pose_opt_enabled
 ) {
     MetalContext* ctx = get_global_context();
     int tile_bounds_x = std::get<0>(tile_bounds);
@@ -1290,6 +1303,10 @@ std::tuple<MTensor, float> msplat_train_step(
 
     auto encode_proj_sh_bwd_adam = [&](id<MTLComputeCommandEncoder> enc) {
         NSUInteger tpg = MIN(ctx->project_and_sh_backward_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
+        // Pose-opt (Task 4): the threadgroup reduction uses a tg_pose[256][6]
+        // array, so the threadgroup MUST NOT exceed 256 threads when pose-opt is
+        // on. Cap it here; ceil(num_points/tpg) then matches the partials sizing.
+        if (pose_opt_enabled) tpg = MIN(tpg, (NSUInteger)256);
         [enc setComputePipelineState:ctx->project_and_sh_backward_kernel_cpso];
         ENC_SCALAR(enc, num_points, 0); ENC_BUF(enc, means3d, 1); ENC_BUF(enc, scales, 2);
         ENC_SCALAR(enc, glob_scale, 3); ENC_BUF(enc, quats, 4);
@@ -1311,7 +1328,22 @@ std::tuple<MTensor, float> msplat_train_step(
         [enc setBuffer:adam_exp_avg_sq[4].buffer() offset:0 atIndex:26]; // rest exp_avg_sq
         [enc setBytes:sh_adam_hp.get() length:sizeof(SHAdamParams) atIndex:27];
         ENC_BUF(enc, g_tcache.grad_nan_counts, 28);
-        [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        // Pose-opt (Task 4): partials buffer (index 29) + enable flag (index 30).
+        // When disabled, bind a live buffer as a dummy at 29 (Metal requires all
+        // declared buffer args bound) and 0 at 30 — the kernel never reads it.
+        ENC_BUF(enc, g_tcache.pose_partials, 29);
+        ENC_SCALAR(enc, pose_opt_enabled, 30);
+        if (pose_opt_enabled) {
+            // Apple7 discipline: dispatchThreadgroups with a ceil grid so EVERY
+            // threadgroup is a full `tpg` threads (no truncated edge group whose
+            // [[threads_per_threadgroup]] and uninitialized tg_pose slots would
+            // corrupt the reduction). Padding threads (idx >= num_points) are
+            // launched, take active==false, write zeros, and reach the barriers.
+            NSUInteger nTG = (num_points + tpg - 1) / tpg;
+            [enc dispatchThreadgroups:MTLSizeMake(nTG, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        } else {
+            [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        }
         // Adam for remaining groups (skip 3=featuresDc, 4=featuresRest — fused above)
         if (num_adam_groups > 0) {
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -1359,6 +1391,13 @@ std::tuple<MTensor, float> msplat_train_step(
         [blit fillBuffer:v_scale.buffer() range:NSMakeRange(0, v_scale.nbytes()) value:0];
         [blit fillBuffer:v_quat.buffer() range:NSMakeRange(0, v_quat.nbytes()) value:0];
         // v_features_dc and v_features_rest no longer needed — SH grads fused into Adam
+        // Pose-opt (Task 4): clear the pose-gradient partials before the backward
+        // writes them. Sequenced on the GPU timeline (blit precedes the compute
+        // encoders) so pad groups the kernel never writes stay exactly zero.
+        if (pose_opt_enabled) {
+            [blit fillBuffer:g_tcache.pose_partials.buffer()
+                       range:NSMakeRange(0, g_tcache.pose_partials.nbytes()) value:0];
+        }
         [blit endEncoding];
     };
 
@@ -1506,6 +1545,13 @@ std::tuple<MTensor, float> msplat_train_step(
 
             [enc endEncoding];
         });
+    }
+
+    // Pose-opt (Task 4): hand the caller a non-owning alias to the partials
+    // buffer so it can CPU-sum the pose gradient once this step's command buffer
+    // completes (the caller is responsible for draining before reading).
+    if (pose_opt_enabled && pose_grad_partials) {
+        *pose_grad_partials = g_tcache.pose_partials;
     }
 
     float loss_val = *loss_sum.data<float>() / (float)(img_height * img_width);
