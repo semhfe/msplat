@@ -539,6 +539,20 @@ int main(int argc, char *argv[]) {
 
         // Validation
         if (valCam) {
+            // Pose-TTA (Task 5): a handful of held-out-view alignment steps.
+            // freezeGaussians=true means only the val view's own pose (xi_i)
+            // moves — no Gaussian parameter is touched (stepImageOnly, not
+            // the full hierarchical step, and undecayed at half-lr; see
+            // PoseOpt::stepImageOnly).
+            if (model.poseOpt && poseTta > 0) {
+                for (int t = 0; t < poseTta; t++) {
+                    MTensor gt = valCam->getGPUImage();
+                    model.fullIteration(*valCam, finalStep, gt, ssimWeight, /*freezeGaussians=*/true);
+                    model.poseOpt->stepImageOnly(valCam->poseIndex, model.lastPoseGrad);
+                }
+                std::cout << "Pose-TTA: " << poseTta << " alignment steps on val view" << std::endl;
+            }
+
             MTensor rgb = model.render(*valCam, finalStep);
             msplat_gpu_sync();
             MTensor rgb_cpu = rgb.cpu();

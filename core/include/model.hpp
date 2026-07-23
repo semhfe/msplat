@@ -50,7 +50,12 @@ struct Model{
     MTensor viewMat, projViewMat;
   };
   CamSetup prepareCam(Camera& cam, int step);
-  void fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight);
+  // freezeGaussians (Task 5): when true, zeroes every Gaussian Adam step size
+  // (means/scales/quats/featuresDc/featuresRest/opacities all share the same
+  // adam_ss[] array, so this covers the SH path too) and skips the SGLD noise
+  // + MCMC regularization calls, leaving every Gaussian parameter unchanged.
+  // Used by TTA (val-view pose alignment) and later by Task 6's eval path.
+  void fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight, bool freezeGaussians = false);
   MTensor render(Camera& cam, int step);
 
   MTensor means;

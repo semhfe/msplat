@@ -860,7 +860,7 @@ MTensor Model::render(Camera& cam, int step){
         opacities, backgroundColor);
 }
 
-void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
+void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight, bool freezeGaussians){
     auto s = prepareCam(cam, step);
     lastHeight = s.height; lastWidth = s.width;
     int numPoints = means.size(0);
@@ -884,7 +884,12 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
         adam_p[i] = *params[i];
         adam_ea[i] = adam_exp_avg[i];
         adam_eas[i] = adam_exp_avg_sq[i];
-        adam_ss[i] = adam_lr[i] / bc1;
+        // freezeGaussians (Task 5, TTA): zero every Gaussian Adam step size
+        // (this array covers means/scales/quats/featuresDc/featuresRest/
+        // opacities, so the SH groups are zeroed here too) so the fused
+        // train-step backward still runs (for the pose gradient) but no
+        // Gaussian parameter moves.
+        adam_ss[i] = freezeGaussians ? 0.0f : (adam_lr[i] / bc1);
         adam_bc2s[i] = std::sqrt(bc2);
     }
 
@@ -930,7 +935,21 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
         for (int64_t gi = 0; gi < nGroups; ++gi)
             for (int k = 0; k < 6; ++k) grad6[k] += pg[gi * 6 + k];
         for (int k = 0; k < 6; ++k) lastPoseGrad[k] = grad6[k];
+
+        // Task 5: apply the pose-opt Adam step once pose-opt's own warmup
+        // (startStep) has elapsed. Skipped under freezeGaussians — TTA drives
+        // stepImageOnly explicitly from the CLI instead (undecayed, image-only).
+        if (poseOpt && step >= poseOpt->startStep && !freezeGaussians) {
+            poseOpt->step(cam.poseIndex, cam.rigCamId, lastPoseGrad, step, maxSteps);
+        }
     }
+
+    // freezeGaussians (Task 5, TTA): the Adam step sizes above are already
+    // zeroed, so means/scales/quats/features/opacities are untouched by the
+    // train-step call. The SGLD noise perturbs means directly and the MCMC
+    // regularization mutates opacities/scales, so both must be skipped too —
+    // otherwise Gaussians would still move on a "frozen" iteration.
+    if (freezeGaussians) return;
 
     // MCMC: SGLD noise perturbation, then post-Adam opacity/scale regularization.
     // Noise is generated on GPU (PCG+Box-Muller, seeded by step) — previously this
