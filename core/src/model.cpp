@@ -881,7 +881,8 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
         N_ADAM_GROUPS,
         adam_p, adam_ea, adam_eas,
         adam_ss, adam_bc2s,
-        adam_beta1, adam_beta2, adam_eps);
+        adam_beta1, adam_beta2, adam_eps,
+        opacity_reg, scale_reg);
 
     radii = r;
 
@@ -898,8 +899,9 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
     msplat_sgld_noise_gen(num_active, sgld_noise_buf, (uint32_t)step);
     msplat_sgld_noise(num_active, means, scales, quats, opacities,
                       sgld_noise_buf, noise_lr, adam_lr[0], max_disp);
-    // Reg-parity: opacity and scale reg at their own Adam group LRs (0.05 / 0.005),
-    // matching reference 3dgs-mcmc, instead of the decaying position LR adam_lr[0].
-    msplat_mcmc_regularization(num_active, opacities, scales,
-                               adam_lr[5], adam_lr[1], opacity_reg, scale_reg);
+    // Reg-parity: the opacity/scale regularizer now flows through Adam inside
+    // msplat_train_step (mcmc_reg_grad_kernel, reference 3dgs-mcmc semantics).
+    // The legacy post-Adam nudge (msplat_mcmc_regularization) is no longer called:
+    // E0 measured it insufficient — direct nudging at the group LR kills junk
+    // ~4,000× slower than Adam-normalized reg (frozen 43%→24%, not →0%).
 }

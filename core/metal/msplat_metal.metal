@@ -3952,13 +3952,40 @@ kernel void sgld_noise_kernel(
     means[idx*3+2] += v2;
 }
 
-// MCMC regularization: post-Adam nudge for opacity and scale.
+// MCMC reg-parity (TRUE routing): add the regularizer's gradient to the photometric
+// gradient buffers BEFORE fused Adam, exactly like reference 3dgs-mcmc's
+//   loss += op_reg * |sigmoid(op)|.mean() + sc_reg * |exp(s)|.mean()
+// Per-element grads (torch mean() normalization): op_reg*sig*(1-sig)/N and
+// sc_reg*exp(s)/(3N). Adam's scale-invariance then gives never-rendered Gaussians
+// (photometric grad exactly 0) a near-full-LR death march: with eps=1e-8 they cross
+// the 0.005 death threshold in ~500 steps at N=1M — junk is mortal again. Trained
+// Gaussians are unaffected to first order (photometric grads dominate the tiny /N term).
+kernel void mcmc_reg_grad_kernel(
+    device const float* opacities [[buffer(0)]],  // [N] logit-opacity (params)
+    device const float* scales    [[buffer(1)]],  // [N,3] log-scale (params)
+    device float* v_opacity       [[buffer(2)]],  // [N] opacity grad (+=)
+    device float* v_scale         [[buffer(3)]],  // [N,3] scale grad (+=)
+    constant int& N               [[buffer(4)]],
+    constant float& op_reg        [[buffer(5)]],
+    constant float& sc_reg        [[buffer(6)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= (uint)N) return;
+    float invN = 1.0f / (float)N;
+    float sig = 1.0f / (1.0f + exp(-opacities[idx]));
+    v_opacity[idx] += op_reg * sig * (1.0f - sig) * invN;
+    float inv3N = invN * (1.0f / 3.0f);
+    for (int i = 0; i < 3; i++) {
+        float s = scales[idx*3 + i];
+        // Clamp the exp input (an overflowed exp would poison the Adam state).
+        v_scale[idx*3 + i] += sc_reg * exp(clamp(s, -15.0f, 15.0f)) * inv3N;
+    }
+}
+
+// LEGACY post-Adam nudge (superseded by mcmc_reg_grad_kernel above; kept for ABI/PSO
+// stability, no longer dispatched from the training loop).
 // Equivalent to one SGD step on: loss_reg = opacity_reg * |sigmoid(op)| + scale_reg * |exp(s)|
 // Gradients: d/d_logit(sigmoid(x)) = sigmoid(x)*(1-sigmoid(x)),  d/d_log_s(exp(s)) = exp(s)
-// Reg-parity: each parameter is nudged at ITS OWN Adam LR (opacity 0.05, scale 0.005),
-// matching reference 3dgs-mcmc where the reg term flows through Adam at full group LR.
-// The old single `lr` was the decaying position LR (1.6e-4 → 1.6e-6): 312×–31,250×
-// too weak — junk clones never died (the frozen-clone flooding pathology).
 kernel void mcmc_regularization_kernel(
     device float* opacities   [[buffer(0)]],   // [N, 1] logit-opacity
     device float* scales      [[buffer(1)]],   // [N, 3] log-scale

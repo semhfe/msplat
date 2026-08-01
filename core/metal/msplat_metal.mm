@@ -179,6 +179,7 @@ struct MetalContext {
     id<MTLComputePipelineState> sgld_noise_gen_kernel_cpso;
     id<MTLComputePipelineState> sgld_noise_kernel_cpso;
     id<MTLComputePipelineState> mcmc_regularization_kernel_cpso;
+    id<MTLComputePipelineState> mcmc_reg_grad_kernel_cpso;
 };
 
 // Explicit metallib path (set by Swift/Python wrappers before first use)
@@ -325,6 +326,7 @@ MetalContext* init_msplat_metal_context() {
     ctx->sgld_noise_gen_kernel_cpso               = load(@"sgld_noise_gen_kernel");
     ctx->sgld_noise_kernel_cpso                   = load(@"sgld_noise_kernel");
     ctx->mcmc_regularization_kernel_cpso          = load(@"mcmc_regularization_kernel");
+    ctx->mcmc_reg_grad_kernel_cpso                = load(@"mcmc_reg_grad_kernel");
 
     // Device + engine provenance. Emitted once per run so every workspace log
     // records which GPU family and per-PSO thread limits produced the result
@@ -965,7 +967,8 @@ std::tuple<MTensor, float> msplat_train_step(
     int num_adam_groups,
     MTensor adam_params[], MTensor adam_exp_avg[], MTensor adam_exp_avg_sq[],
     float adam_step_sizes[], float adam_bc2_sqrts[],
-    float adam_beta1, float adam_beta2, float adam_eps
+    float adam_beta1, float adam_beta2, float adam_eps,
+    float mcmc_op_reg, float mcmc_sc_reg
 ) {
     MetalContext* ctx = get_global_context();
     int tile_bounds_x = std::get<0>(tile_bounds);
@@ -1312,6 +1315,23 @@ std::tuple<MTensor, float> msplat_train_step(
         [enc setBytes:sh_adam_hp.get() length:sizeof(SHAdamParams) atIndex:27];
         ENC_BUF(enc, g_tcache.grad_nan_counts, 28);
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        // MCMC reg-parity: add regularizer gradients to v_opacity / v_scale BEFORE the
+        // Adam updates below (reference 3dgs-mcmc semantics — the reg term is part of
+        // the loss, so Adam normalizes photometric+reg together). Never-rendered
+        // Gaussians (photometric grad == 0) thus receive near-full-LR downward steps.
+        if (mcmc_op_reg > 0.0f || mcmc_sc_reg > 0.0f) {
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            NSUInteger rtpg = MIN(ctx->mcmc_reg_grad_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
+            [enc setComputePipelineState:ctx->mcmc_reg_grad_kernel_cpso];
+            [enc setBuffer:adam_params[5].buffer() offset:0 atIndex:0];  // opacity params
+            [enc setBuffer:adam_params[1].buffer() offset:0 atIndex:1];  // scale params
+            ENC_BUF(enc, v_opacity, 2);
+            ENC_BUF(enc, v_scale, 3);
+            ENC_SCALAR(enc, num_points, 4);
+            ENC_SCALAR(enc, mcmc_op_reg, 5);
+            ENC_SCALAR(enc, mcmc_sc_reg, 6);
+            [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(rtpg, 1, 1)];
+        }
         // Adam for remaining groups (skip 3=featuresDc, 4=featuresRest — fused above)
         if (num_adam_groups > 0) {
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];

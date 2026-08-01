@@ -71,7 +71,10 @@ std::tuple<MTensor, float> msplat_train_step(
     int num_adam_groups,
     MTensor adam_params[], MTensor adam_exp_avg[], MTensor adam_exp_avg_sq[],
     float adam_step_sizes[], float adam_bc2_sqrts[],
-    float adam_beta1, float adam_beta2, float adam_eps
+    float adam_beta1, float adam_beta2, float adam_eps,
+    // MCMC reg-parity: reg gradients injected pre-Adam (reference 3dgs-mcmc loss
+    // terms, torch-mean normalization). Pass 0,0 to disable.
+    float mcmc_op_reg, float mcmc_sc_reg
 );
 
 // MCMC: fill an N*3 noise buffer with N(0,1) samples on GPU (PCG+Box-Muller).
