@@ -20,7 +20,10 @@ struct Model{
         int capMax, float noiseLr, float opacityReg, float scaleReg,
         int maxSteps, bool keepCrs,
         const float* bgColor = nullptr,
-        int positionLrMaxSteps = 30000);
+        int positionLrMaxSteps = 30000,
+        // false = disable the 75%→50% seed auto-subsample (fixed-seed experiments;
+        // app-side decimation then owns the seed count entirely).
+        bool decimateSeeds = true);
 
   ~Model(){ releaseOptimizers(); }
 

@@ -91,6 +91,11 @@ int main(int argc, char *argv[]) {
         ->check(CLI::Range(0.0f, 1.0f));
     bool keepCrs = false;
     app.add_flag("--keep-crs", keepCrs, "Retain input coordinate reference system");
+    bool noSeedDecimation = false;
+    app.add_flag("--no-seed-decimation", noSeedDecimation,
+                 "Disable the automatic seed subsample (seeds > 75% of cap-max → keep "
+                 "cap/2). For fixed-seed experiments where app-side decimation owns the "
+                 "seed count.");
     std::vector<float> bgColor = {0.6130f, 0.0101f, 0.3984f};
     app.add_option("--bg-color", bgColor, "Background RGB (0-1), default magenta")
         ->expected(3);
@@ -164,7 +169,8 @@ int main(int argc, char *argv[]) {
                      capMax, noiseLr, opacityReg, scaleReg,
                      numIters, keepCrs,
                      bgColor.data(),
-                     positionLrMaxSteps);
+                     positionLrMaxSteps,
+                     !noSeedDecimation);
         model.cull_radius = cullRadius;
         model.reg_visibility_duty = regVisibilityDuty;
         if (regVisibilityDuty < 1.0f) {

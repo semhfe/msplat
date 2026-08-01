@@ -83,7 +83,8 @@ Model::Model(const InputData &inputData, int numCameras,
     int capMax, float noiseLr, float opacityReg, float scaleReg,
     int maxSteps, bool keepCrs,
     const float* bgColor,
-    int positionLrMaxSteps)
+    int positionLrMaxSteps,
+    bool decimateSeeds)
     : numCameras(numCameras),
       shDegree(shDegree), shDegreeInterval(shDegreeInterval),
       maxSteps(maxSteps), keepCrs(keepCrs),
@@ -150,7 +151,7 @@ Model::Model(const InputData &inputData, int numCameras,
     backgroundColor = gpu_empty({3}, DType::Float32);
     static const float defaultBg[3] = {0.6130f, 0.0101f, 0.3984f};
     memcpy(backgroundColor.data_ptr(), bgColor ? bgColor : defaultBg, 3 * sizeof(float));
-    setupOptimizers();
+    setupOptimizers(decimateSeeds);
 }
 
 void Model::setupOptimizers(bool decimateSeeds){
