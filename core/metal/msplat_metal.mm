@@ -1564,7 +1564,7 @@ void msplat_sgld_noise(
 // ============================================================================
 void msplat_mcmc_regularization(
     int N, MTensor &opacities, MTensor &scales,
-    float lr, float opacity_reg, float scale_reg
+    float op_lr, float sc_lr, float opacity_reg, float scale_reg
 ) {
     MetalContext* ctx = get_global_context();
     dispatch_sync(ctx->d_queue, ^(){
@@ -1575,9 +1575,10 @@ void msplat_mcmc_regularization(
         ENC_BUF(enc, opacities, 0);
         ENC_BUF(enc, scales, 1);
         ENC_SCALAR(enc, N, 2);
-        ENC_SCALAR(enc, lr, 3);
+        ENC_SCALAR(enc, op_lr, 3);
         ENC_SCALAR(enc, opacity_reg, 4);
         ENC_SCALAR(enc, scale_reg, 5);
+        ENC_SCALAR(enc, sc_lr, 6);
         [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         [enc endEncoding];
     });

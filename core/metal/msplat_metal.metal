@@ -3955,13 +3955,18 @@ kernel void sgld_noise_kernel(
 // MCMC regularization: post-Adam nudge for opacity and scale.
 // Equivalent to one SGD step on: loss_reg = opacity_reg * |sigmoid(op)| + scale_reg * |exp(s)|
 // Gradients: d/d_logit(sigmoid(x)) = sigmoid(x)*(1-sigmoid(x)),  d/d_log_s(exp(s)) = exp(s)
+// Reg-parity: each parameter is nudged at ITS OWN Adam LR (opacity 0.05, scale 0.005),
+// matching reference 3dgs-mcmc where the reg term flows through Adam at full group LR.
+// The old single `lr` was the decaying position LR (1.6e-4 → 1.6e-6): 312×–31,250×
+// too weak — junk clones never died (the frozen-clone flooding pathology).
 kernel void mcmc_regularization_kernel(
     device float* opacities   [[buffer(0)]],   // [N, 1] logit-opacity
     device float* scales      [[buffer(1)]],   // [N, 3] log-scale
     constant int& N           [[buffer(2)]],
-    constant float& lr        [[buffer(3)]],   // learning rate (mean of position LR)
+    constant float& op_lr     [[buffer(3)]],   // opacity Adam LR (adam_lr[5])
     constant float& op_reg    [[buffer(4)]],   // opacity regularization weight
     constant float& sc_reg    [[buffer(5)]],   // scale regularization weight
+    constant float& sc_lr     [[buffer(6)]],   // scale Adam LR (adam_lr[1])
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= (uint)N) return;
@@ -3969,14 +3974,14 @@ kernel void mcmc_regularization_kernel(
     // Opacity regularization: nudge toward lower opacity
     float op = opacities[idx];
     float sig = 1.0f / (1.0f + exp(-op));
-    opacities[idx] -= lr * op_reg * sig * (1.0f - sig);
+    opacities[idx] -= op_lr * op_reg * sig * (1.0f - sig);
 
     // Scale regularization: nudge toward smaller scale.
     // Clamp the exp input: this writes straight back into the parameter, so an
     // overflowed exp(s) would turn the scale -Inf permanently (NaN epidemic seed).
     for (int i = 0; i < 3; i++) {
         float s = scales[idx*3 + i];
-        scales[idx*3 + i] -= lr * sc_reg * exp(clamp(s, -15.0f, 15.0f));
+        scales[idx*3 + i] -= sc_lr * sc_reg * exp(clamp(s, -15.0f, 15.0f));
     }
 }
 

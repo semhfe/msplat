@@ -84,10 +84,11 @@ void msplat_sgld_noise(
     float noise_lr, float xyz_lr, float max_disp
 );
 
-// MCMC: Apply opacity and scale regularization as post-Adam parameter nudge
+// MCMC: Apply opacity and scale regularization as post-Adam parameter nudge.
+// Reg-parity: op_lr / sc_lr are the opacity and scale Adam group LRs.
 void msplat_mcmc_regularization(
     int N, MTensor &opacities, MTensor &scales,
-    float lr, float opacity_reg, float scale_reg
+    float op_lr, float sc_lr, float opacity_reg, float scale_reg
 );
 
 #endif
