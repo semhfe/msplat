@@ -512,12 +512,22 @@ void Model::mcmcAfterTrain(int step) {
 
     // Throttle stdout to every 1000 steps — matches the step-timer output cadence.
     if (step % 1000 == 0) {
+        // Diagnostic: how many slots does the junk-reg discriminator currently class
+        // as never-effectively-rendered (features_dc exp_avg_sq sum == 0)?
+        int junk_dc = 0;
+        {
+            const float* dcv = adam_exp_avg_sq[3].data<float>();
+            for (int i = 0; i < num_active; ++i) {
+                if (dcv[i*3] + dcv[i*3+1] + dcv[i*3+2] == 0.0f) junk_dc++;
+            }
+        }
         std::cout << "MCMC step=" << step
                   << " active=" << num_active
                   << " dead=" << dead_count
                   << " culled=" << culled
                   << " nonfinite=" << nonfinite
-                  << " grown=" << grown << std::endl;
+                  << " grown=" << grown
+                  << " junkdc=" << junk_dc << std::endl;
     }
     // Unthrottled 100-step breakdown, but only when something is actually wrong —
     // healthy runs emit nothing, an epidemic gets per-class 100-step resolution.
@@ -882,7 +892,16 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
         adam_p, adam_ea, adam_eas,
         adam_ss, adam_bc2s,
         adam_beta1, adam_beta2, adam_eps,
-        opacity_reg, scale_reg);
+        // Reg grace period, mirroring mcmcAfterTrain's growth-start gate (step < 500):
+        // junk cannot exist before cloning begins, and at step 1 the never-trained test
+        // correctly classifies EVERY seed as untrained — with early Adam bias
+        // correction (lr/bc1 ≈ 10× LR) the population got crushed to opacity ~0.01
+        // before first renders could protect it (measured, room 3k A/Bs). Seeds use
+        // the pre-growth window to differentiate (the OB3D-protective mechanism);
+        // from step 500 the quat-moment junk test is meaningful.
+        (step >= 500) ? opacity_reg : 0.0f,
+        (step >= 500) ? scale_reg : 0.0f,
+        reg_visibility_duty);
 
     radii = r;
 

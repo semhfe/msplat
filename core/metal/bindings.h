@@ -73,8 +73,10 @@ std::tuple<MTensor, float> msplat_train_step(
     float adam_step_sizes[], float adam_bc2_sqrts[],
     float adam_beta1, float adam_beta2, float adam_eps,
     // MCMC reg-parity: reg gradients injected pre-Adam (reference 3dgs-mcmc loss
-    // terms, torch-mean normalization). Pass 0,0 to disable.
-    float mcmc_op_reg, float mcmc_sc_reg
+    // terms, torch-mean normalization). Pass 0,0 to disable. invis_scale = reg
+    // multiplier for Gaussians invisible in the current view (visibility duty-cycle
+    // correction for sparse-visibility captures; 1.0 = exact reference).
+    float mcmc_op_reg, float mcmc_sc_reg, float mcmc_reg_invis_scale
 );
 
 // MCMC: fill an N*3 noise buffer with N(0,1) samples on GPU (PCG+Box-Muller).

@@ -93,6 +93,12 @@ struct Model{
   float noise_lr;
   float opacity_reg;
   float scale_reg;
+  // Reg visibility duty-cycle: reg-gradient multiplier for Gaussians NOT visible in
+  // the current training view. 1.0 = exact reference 3dgs-mcmc (assumes dense per-step
+  // visibility); for sparse-visibility captures (360 crop rigs) set to the scene's
+  // measured duty f = meanObservationMultiplicity / nImages (tools/metrics/cap_formula.py)
+  // or live Gaussians starve (~1/f reg-down steps per photometric step).
+  float reg_visibility_duty = 1.0f;
   // MCMC: cull Gaussians whose normalized-space position ||mean|| > cull_radius.
   // 0 (or negative) disables the cull. Default 3.0 = 3× the scene's unit-sphere.
   float cull_radius = 0.0f;

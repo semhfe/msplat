@@ -82,6 +82,13 @@ int main(int argc, char *argv[]) {
     float cullRadius = 3.0f;
     app.add_option("--cull-radius", cullRadius, "Cull splats with ||mean|| > r in normalized space (0 = off)")
         ->check(CLI::Range(0.0f, 100.0f));
+    float regVisibilityDuty = 1.0f;
+    app.add_option("--reg-visibility-duty", regVisibilityDuty,
+                   "Reg multiplier for Gaussians invisible in the current view that HAVE "
+                   "photometric training history (never-trained junk always gets full reg). "
+                   "1.0 = reference 3dgs-mcmc; 0.0 = visibility-gated reg for "
+                   "sparse-visibility captures (360 rigs)")
+        ->check(CLI::Range(0.0f, 1.0f));
     bool keepCrs = false;
     app.add_flag("--keep-crs", keepCrs, "Retain input coordinate reference system");
     std::vector<float> bgColor = {0.6130f, 0.0101f, 0.3984f};
@@ -159,6 +166,11 @@ int main(int argc, char *argv[]) {
                      bgColor.data(),
                      positionLrMaxSteps);
         model.cull_radius = cullRadius;
+        model.reg_visibility_duty = regVisibilityDuty;
+        if (regVisibilityDuty < 1.0f) {
+            std::cout << "[mcmc] reg visibility duty = " << regVisibilityDuty
+                      << " (invisible-Gaussian reg scaled; 1.0 = reference)" << std::endl;
+        }
 
         log_memory("model init");
 

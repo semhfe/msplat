@@ -3960,6 +3960,16 @@ kernel void sgld_noise_kernel(
 // (photometric grad exactly 0) a near-full-LR death march: with eps=1e-8 they cross
 // the 0.005 death threshold in ~500 steps at N=1M — junk is mortal again. Trained
 // Gaussians are unaffected to first order (photometric grads dominate the tiny /N term).
+// Visibility duty-cycle correction (measured necessity, room 360-rig A/B 2026-08-01):
+// reference semantics assume dense per-step visibility (each image sees ~half the
+// scene). In sparse-visibility captures (360 crop rigs: ~7% of the scene per image) a
+// LIVE Gaussian takes ~12 Adam-normalized reg-down steps per photometric step → mass
+// opacity starvation (population median crashed to 0.008 in 3k steps), quality loss,
+// and unbounded blend-depth/pace growth. Correction: currently-VISIBLE Gaussians
+// (radii > 0 this view) get full reg — 1:1 tension with their photometric gradient;
+// invisible ones get reg × invis_scale, where invis_scale = the scene's visibility
+// duty cycle f = M̄/nImages (measured by tools/metrics/cap_formula.py; 1.0 = exact
+// reference behavior). Never-rendered junk still dies in ~500/f steps.
 kernel void mcmc_reg_grad_kernel(
     device const float* opacities [[buffer(0)]],  // [N] logit-opacity (params)
     device const float* scales    [[buffer(1)]],  // [N,3] log-scale (params)
@@ -3968,10 +3978,29 @@ kernel void mcmc_reg_grad_kernel(
     constant int& N               [[buffer(4)]],
     constant float& op_reg        [[buffer(5)]],
     constant float& sc_reg        [[buffer(6)]],
+    device const int* radii       [[buffer(7)]],  // [N] projected radius this view (0 = invisible)
+    constant float& invis_scale   [[buffer(8)]],  // reg for TRAINED Gaussians (1.0 = reference, 0.0 = junk-only)
+    device const float* v_dc_sq   [[buffer(9)]],  // [N,3] features_dc Adam exp_avg_sq: sum==0 ⟺ never effectively rendered
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= (uint)N) return;
-    float invN = 1.0f / (float)N;
+    // Duty rule (4th iteration — each prior discriminator was falsified by a measured
+    // room 360-rig A/B): junk-mortality-only reg. "Junk" = never EFFECTIVELY rendered,
+    // detected by the DC-color Adam moments, which (a) reg never writes — unpoisonable
+    // (the opacity-moment variant self-poisoned), and (b) every Gaussian that
+    // contributes any alpha to any pixel receives — unlike quat moments, which are
+    // IDENTICALLY zero for isotropic Gaussians (rotating a sphere changes nothing), so
+    // the quat variant permanently branded every still-isotropic seed/clone as junk
+    // and crushed the population (median 0.5 → 0.0075-0.010). Never-rendered slots get
+    // full reg (Adam-normalized death — mortality proven, 49.3%→0.0003% frozen);
+    // trained Gaussians get reg × invis_scale (0.0 = none, the project's historically
+    // healthy operating mode; 1.0 = reference semantics). Host additionally gates reg
+    // to step ≥ growth-start (junk cannot exist before cloning; early Adam bias
+    // correction amplifies steps ~10× and crushed ungated seeds).
+    float vdc = v_dc_sq[idx * 3] + v_dc_sq[idx * 3 + 1] + v_dc_sq[idx * 3 + 2];
+    float duty = (vdc == 0.0f) ? 1.0f : invis_scale;
+    (void)radii;
+    float invN = duty / (float)N;
     float sig = 1.0f / (1.0f + exp(-opacities[idx]));
     v_opacity[idx] += op_reg * sig * (1.0f - sig) * invN;
     float inv3N = invN * (1.0f / 3.0f);

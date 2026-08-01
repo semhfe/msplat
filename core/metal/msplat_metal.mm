@@ -968,7 +968,7 @@ std::tuple<MTensor, float> msplat_train_step(
     MTensor adam_params[], MTensor adam_exp_avg[], MTensor adam_exp_avg_sq[],
     float adam_step_sizes[], float adam_bc2_sqrts[],
     float adam_beta1, float adam_beta2, float adam_eps,
-    float mcmc_op_reg, float mcmc_sc_reg
+    float mcmc_op_reg, float mcmc_sc_reg, float mcmc_reg_invis_scale
 ) {
     MetalContext* ctx = get_global_context();
     int tile_bounds_x = std::get<0>(tile_bounds);
@@ -1330,6 +1330,9 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_SCALAR(enc, num_points, 4);
             ENC_SCALAR(enc, mcmc_op_reg, 5);
             ENC_SCALAR(enc, mcmc_sc_reg, 6);
+            ENC_BUF(enc, radii_out, 7);
+            ENC_SCALAR(enc, mcmc_reg_invis_scale, 8);
+            [enc setBuffer:adam_exp_avg_sq[3].buffer() offset:0 atIndex:9];  // features_dc v: sum==0 ⟺ never effectively rendered (reg can't poison; nonzero for any alpha-contributing Gaussian, isotropic or not)
             [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(rtpg, 1, 1)];
         }
         // Adam for remaining groups (skip 3=featuresDc, 4=featuresRest — fused above)
