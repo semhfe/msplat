@@ -105,6 +105,10 @@ struct Model{
   // MCMC: cull Gaussians whose normalized-space position ||mean|| > cull_radius.
   // 0 (or negative) disables the cull. Default 3.0 = 3× the scene's unit-sphere.
   float cull_radius = 0.0f;
+  // (Eq. 9 relocation is unconditional — see Model::computeRelocation. The
+  // 2026-08-15 audit found two coupled defects there: the ensemble size was
+  // off by one, and the scale rule was a naive sqrt(1/N). Both are fixed;
+  // A/B at 30k on garden -d4 cap 2M measured neutral-to-better.)
   // Position LR schedule endpoint: LR decays from lr_init to lr_final over this many steps.
   // Default 30000 (reference MCMC). Partitioned training sets this to the cell's iteration count.
   int position_lr_max_steps_ = 30000;

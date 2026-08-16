@@ -274,11 +274,50 @@ int Model::getDownscaleFactor(int step) {
 
 // Equation 9 of the MCMC paper: when N samples are drawn from a single Gaussian,
 // reduce each clone's opacity/scale so that the ensemble preserves total weight.
+//
+// Opacity is the closed form o_new = 1 - (1-o_old)^(1/N): at the centre the
+// N-fold composite 1-(1-o_new)^N then reproduces o_old exactly.
+//
+// The SCALE is not sqrt(1/N). That naive rule (msplat's original) over-shrinks
+// every split — 0.707 where the correct coefficient is 0.87-0.99 — and
+// compounds over the ~12 times a splat is resampled in a 30k run. It was
+// harmless only while the Eq. 9 ensemble size was off by one (N == 1 made
+// sqrt(1/N) == 1, so the rule never fired); correcting N exposed it as a
+// coverage collapse (garden -1.2 dB). Matching the integral of composite alpha
+// against the original Gaussian,
+//
+//   int [1 - (1 - o_new e^{-x^2/2 s_new^2})^N] dx  =  o_old s_old sqrt(2 pi)
+//
+// expand the binomial and integrate term by term (int e^{-k x^2/2s^2} dx =
+// s sqrt(2 pi / k)):
+//
+//   s_new = s_old * o_old / sum_{k=1..N} C(N,k) (-1)^{k+1} o_new^k / sqrt(k)
+//
+// which is the reference 3dgs-mcmc relocation kernel's binomial sum (its
+// double sum over i,k is the same series regrouped) and gives exactly 1 at
+// N = 1. Accumulated in double: the series alternates and the binomials grow,
+// so float loses the small residual at large N.
 void Model::computeRelocation(float opacity_old_sig, float* scale_old_exp, int N,
                               float& opacity_new_sig, float* scale_new_exp) {
+    // Reference clamps the ensemble at n_max = 51; beyond that the alternating
+    // binomial series is numerically worthless and the coefficient has already
+    // flattened.
+    if (N < 1) N = 1;
+    if (N > 51) N = 51;
     opacity_new_sig = 1.0f - std::pow(1.0f - opacity_old_sig, 1.0f / (float)N);
-    float s = std::sqrt(1.0f / (float)N);
-    for (int i = 0; i < 3; i++) scale_new_exp[i] = scale_old_exp[i] * s;
+
+    const double o_new = (double)opacity_new_sig;
+    double denom = 0.0, binom = 1.0;          // binom = C(N,k), built iteratively
+    for (int k = 1; k <= N; k++) {
+        binom = binom * (double)(N - k + 1) / (double)k;
+        const double term = binom * std::pow(o_new, (double)k) / std::sqrt((double)k);
+        denom += (k % 2 == 1) ? term : -term;
+    }
+    // denom -> o_old as N -> 1; guard the degenerate near-zero-opacity case.
+    double coeff = (denom > 1e-12) ? ((double)opacity_old_sig / denom) : 1.0;
+    if (!std::isfinite(coeff) || coeff <= 0.0) coeff = 1.0;
+    for (int i = 0; i < 3; i++)
+        scale_new_exp[i] = (float)((double)scale_old_exp[i] * coeff);
 }
 
 // Move dead Gaussians onto alive ones (weighted by opacity) and redistribute
@@ -328,10 +367,13 @@ void Model::relocate(const std::vector<int>& dead, const std::vector<int>& alive
 
     // Apply Eq. 9 to each source with count > 0 (writes updated opacity/scale
     // back to source so dead slots can copy the post-relocation values).
+    // Ensemble size counts the source itself: it stays in place and is one of
+    // the N Gaussians the original is split into (reference 3dgs-mcmc:
+    // bincount(idx)[idx] + 1).
     for (size_t a = 0; a < alive.size(); a++) {
         if (scratch_count_[a] == 0) continue;
         int src = alive[a];
-        int N = scratch_count_[a];
+        int N = scratch_count_[a] + 1;
 
         float op_old_sig = 1.0f / (1.0f + std::exp(-obuf[src]));
         float s_old_exp[3] = {
@@ -405,11 +447,11 @@ int Model::addNewGaussians() {
         scratch_count_[s]++;
     }
 
-    // Apply Eq. 9 to each source with count > 0 (source's N counts itself via
-    // each sample drawn — the new slots then copy its post-relocation values).
+    // Apply Eq. 9 to each source with count > 0 — the new slots then copy its
+    // post-relocation values. Ensemble size counts the source (see relocate()).
     for (int src = 0; src < num_active; src++) {
         if (scratch_count_[src] == 0) continue;
-        int N = scratch_count_[src];
+        int N = scratch_count_[src] + 1;
 
         float op_old_sig = 1.0f / (1.0f + std::exp(-obuf[src]));
         float s_old_exp[3] = {
