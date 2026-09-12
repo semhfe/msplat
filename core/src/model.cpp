@@ -84,7 +84,9 @@ Model::Model(const InputData &inputData, int numCameras,
     int maxSteps, bool keepCrs,
     const float* bgColor,
     int positionLrMaxSteps,
-    bool decimateSeeds)
+    bool decimateSeeds,
+    float initOpacity,
+    float initScaleMult)
     : numCameras(numCameras),
       shDegree(shDegree), shDegreeInterval(shDegreeInterval),
       maxSteps(maxSteps), keepCrs(keepCrs),
@@ -99,14 +101,22 @@ Model::Model(const InputData &inputData, int numCameras,
     means = gpu_empty({numPoints, 3}, DType::Float32);
     memcpy(means.data_ptr(), inputData.points.xyz.data(), numPoints * 3 * sizeof(float));
 
-    // Scales: KD-tree nearest neighbor distances, log'd, repeated 3x
+    // Scales: initScaleMult x the mean distance to the 3 nearest seeds, log'd, isotropic.
+    // Reference 3dgs-mcmc (create_from_pcd) uses 0.1 x that spacing; the original 3DGS
+    // uses 1.0 x but seeds at opacity 0.1. Full spacing at opacity 0.5 (neither reference)
+    // turns the isolated seeds that SfM leaves near the camera path into an opaque stack
+    // that saturates every pixel (T <= 1e-4 after ~85 splats) before the rasterizer
+    // reaches the real surface: 76 % of the population received exactly zero gradient,
+    // the opacity regularizer then killed it and relocation cloned the fog (tnt_meetingroom
+    // 11 dB collapse, 2026-09-12; tests/smoke_seed_fog.sh). 0.1 x keeps the initial scene
+    // translucent (99.6 % of in-frustum seeds reached).
     {
         PointsTensor pt(inputData.points.xyz.data(), numPoints);
         auto sc = pt.scales();  // vector<float> of length numPoints
         scales = gpu_empty({numPoints, 3}, DType::Float32);
         float *sp = scales.data<float>();
         for (int64_t i = 0; i < numPoints; i++) {
-            float v = std::log(sc[i]);
+            float v = std::log(sc[i] * initScaleMult);
             sp[i*3] = sp[i*3+1] = sp[i*3+2] = v;
         }
     }
@@ -139,11 +149,12 @@ Model::Model(const InputData &inputData, int numCameras,
         featuresRest = gpu_zeros({numPoints, (int64_t)(dimSh - 1), 3}, DType::Float32);
     }
 
-    // Opacities: logit(0.5) = 0.0 — MCMC initialization
+    // Opacities: logit(initOpacity); reference 3dgs-mcmc seeds at 0.5.
     {
         opacities = gpu_empty({numPoints, 1}, DType::Float32);
         float *op = opacities.data<float>();
-        for (int64_t i = 0; i < numPoints; i++) op[i] = 0.0f;
+        const float op_logit = std::log(initOpacity / (1.0f - initOpacity));
+        for (int64_t i = 0; i < numPoints; i++) op[i] = op_logit;
     }
 
     // Background color — default is magenta (high-contrast against typical scenes,

@@ -116,6 +116,16 @@ int main(int argc, char *argv[]) {
                    "Stop when test-subset PSNR improves less than this (dB) over 5000 steps (requires --eval; 0 = off)")
         ->check(CLI::Range(0.0f, 10.0f));
 
+    // Seed initialization (reference 3dgs-mcmc: opacity 0.5, scale 0.1 x kNN spacing).
+    // --init-scale 1.0 reproduces the pre-2026-09-12 engine (seed-fog collapse on indoor
+    // captures with isolated near-camera SfM points, e.g. tnt_meetingroom).
+    float initOpacity = 0.5f;
+    app.add_option("--init-opacity", initOpacity, "Seed opacity at init")
+        ->check(CLI::Range(0.001f, 0.999f));
+    float initScaleMult = 0.1f;
+    app.add_option("--init-scale", initScaleMult, "Seed scale multiplier on the kNN spacing")
+        ->check(CLI::Range(0.001f, 10.0f));
+
     // Memory characterization: grow to cap, allocate every real buffer, print the
     // exact Metal allocation, and exit — used to fit the app's RAM estimator to the
     // engine's actual allocator (regenerated per build). No training/eval.
@@ -170,7 +180,8 @@ int main(int argc, char *argv[]) {
                      numIters, keepCrs,
                      bgColor.data(),
                      positionLrMaxSteps,
-                     !noSeedDecimation);
+                     !noSeedDecimation,
+                     initOpacity, initScaleMult);
         model.cull_radius = cullRadius;
         model.reg_visibility_duty = regVisibilityDuty;
         if (regVisibilityDuty < 1.0f) {

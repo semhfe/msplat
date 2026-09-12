@@ -23,7 +23,11 @@ struct Model{
         int positionLrMaxSteps = 30000,
         // false = disable the 75%→50% seed auto-subsample (fixed-seed experiments;
         // app-side decimation then owns the seed count entirely).
-        bool decimateSeeds = true);
+        bool decimateSeeds = true,
+        // Seed initialization, reference 3dgs-mcmc create_from_pcd: opacity 0.5,
+        // scale 0.1 x the kNN spacing (see the seed-fog note in the constructor).
+        float initOpacity = 0.5f,
+        float initScaleMult = 0.1f);
 
   ~Model(){ releaseOptimizers(); }
 

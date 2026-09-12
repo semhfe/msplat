@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- **Seed init: reference 3dgs-mcmc scale rule (0.1 x kNN spacing)** — seeds were
+  initialized at the full kNN spacing with opacity 0.5, a combination neither reference
+  uses (3dgs-mcmc: 0.1 x spacing at 0.5; gsplat: full spacing at 0.1). On indoor
+  captures whose SfM cloud has isolated points near the camera path (tnt_meetingroom)
+  those seeds formed an opaque stack that saturated every pixel (T <= 1e-4 after ~85
+  splats): 76 % of the population received exactly zero gradient, the opacity
+  regularizer killed it and relocation cloned the fog — training locked at 11 dB.
+  With the reference rule the scene starts translucent (99.6 % of in-frustum seeds
+  reached): meetingroom 11.5 -> 21.8 dB at 3k steps; tnt_barn 23.3 -> 25.0 dB at 3k.
+  New CLI knobs `--init-scale` (default 0.1) and `--init-opacity` (default 0.5);
+  `--init-scale 1.0` reproduces the old engine. Regression check: `tests/smoke_seed_fog.sh`.
+
 ## v1.1.3 — Fused kernels + pre-allocated tile bins
 
 - **Fused SH backward into Adam optimizer** — spherical harmonics gradients are now
