@@ -38,8 +38,11 @@ void Camera::loadImage(float downscaleFactor) {
         int newW = (int)(width / downscaleFactor);
         int newH = (int)(height / downscaleFactor);
         raw = resizeArea(raw, newW, newH);
-        float s = 1.0f / downscaleFactor;
-        fx *= s; fy *= s; cx *= s; cy *= s;
+        // Scale intrinsics by the true resize ratio: int(W/d) truncates, so
+        // 1/d misregisters camera and image by up to 0.5–0.75 px at the far edge.
+        float sx = (float)newW / (float)width;
+        float sy = (float)newH / (float)height;
+        fx *= sx; fy *= sy; cx *= sx; cy *= sy;
         width = newW; height = newH;
     }
 
