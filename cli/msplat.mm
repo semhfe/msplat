@@ -46,13 +46,17 @@ int main(int argc, char *argv[]) {
     app.add_option("--val-image", valImage, "Validation image filename");
     std::string valRender;
     app.add_option("--val-render", valRender, "Directory to render validation images");
+    // Output only: with --resume <trained.ply> and -n at its step no training step runs,
+    // so this re-renders a finished model's eval views for external metrics (LPIPS).
+    std::string evalRender;
+    app.add_option("--eval-render", evalRender, "Directory to write each eval view's render and ground truth (PNG)");
 
     // Evaluation
     bool evalMode = false;
     app.add_flag("--eval", evalMode, "Evaluate on held-out test views");
     int testEvery = 8;
     app.add_option("--test-every", testEvery, "Hold out every Nth image for eval")
-        ->check(CLI::Range(2, 100));
+        ->check(CLI::Range(1, 100));   // 1 = every view is an eval view (all-frame re-render with --resume)
 
     // Training hyperparameters
     int numIters = 30000;
@@ -196,6 +200,10 @@ int main(int argc, char *argv[]) {
         InfiniteRandomIterator<size_t> camsIter(camIndices);
 
         // ── Memory probe: reach peak allocation (num_active = cap), then report ──
+        if (probeMemory && cams.empty()) {
+            std::cerr << "No training views (--test-every 1): --probe-memory needs training views" << std::endl;
+            return 1;
+        }
         if (probeMemory) {
             // MCMC grows ~5%/100 steps toward cap; run until we reach it (or a safety
             // ceiling), touching the full forward+backward+sort path so every buffer
@@ -244,6 +252,11 @@ int main(int argc, char *argv[]) {
 
         size_t step = 1;
         if (!resume.empty()) step = model.loadPly(resume) + 1;
+        if (cams.empty() && step <= (size_t)numIters) {
+            // --test-every 1 puts every view in the test set: only valid for a no-training re-render (--resume at its step)
+            std::cerr << "No training views (--test-every 1) but " << (numIters - step + 1) << " training steps requested" << std::endl;
+            return 1;
+        }
 
         double lastGatePsnr = -1e9;   // early-stop: previous 5k-step subset PSNR
         int gateMisses = 0;           // early-stop: consecutive sub-threshold gates
@@ -284,7 +297,8 @@ int main(int argc, char *argv[]) {
                 std::cout << "step=" << step
                           << " splats=" << model.means.size(0)
                           << " " << std::fixed << std::setprecision(1)
-                          << ms << "ms/step (single-iter, gpu-synced)" << std::endl;
+                          << ms << "ms/step (single-iter, gpu-synced)"
+                          << std::defaultfloat << std::setprecision(6) << std::endl;
             }
 
             if (benchmarking && step > (size_t)bench_warmup) {
@@ -446,6 +460,7 @@ int main(int argc, char *argv[]) {
             int nTest = testCams.size();
 
             std::cout << "\n=== Evaluation (" << nTest << " test views) ===" << std::endl;
+            std::cout << std::fixed << std::setprecision(4);
             for (int i = 0; i < nTest; i++) {
                 MTensor rgb = model.render(testCams[i], finalStep);
                 msplat_gpu_sync();
@@ -457,6 +472,19 @@ int main(int argc, char *argv[]) {
                 float l = l1_loss(rgb_cpu, gt_cpu);
                 sumPsnr += p; sumSsim += s; sumL1 += l;
 
+                if (!evalRender.empty()) {
+                    fs::create_directories(evalRender);
+                    auto stem = fs::path(evalRender) / fs::path(testCams[i].filePath).stem();
+                    for (auto [t, suffix] : {std::pair{&rgb_cpu, "_render.png"}, std::pair{&gt_cpu, "_gt.png"}}) {
+                        Image img;
+                        img.width = (int)t->size(1);
+                        img.height = (int)t->size(0);
+                        img.data.resize(img.width * img.height * 3);
+                        memcpy(img.ptr(), t->data_ptr(), img.data.size() * sizeof(float));
+                        imwriteRGB(stem.string() + suffix, img);
+                    }
+                }
+
                 std::cout << "  [" << (i+1) << "/" << nTest << "] "
                           << fs::path(testCams[i].filePath).filename().string()
                           << "  PSNR=" << p << "  SSIM=" << s << "  L1=" << l << std::endl;
@@ -465,6 +493,7 @@ int main(int argc, char *argv[]) {
                       << "  SSIM:  " << (sumSsim / nTest)
                       << "  L1:  " << (sumL1 / nTest)
                       << "  Gaussians: " << model.means.size(0) << std::endl;
+            std::cout << std::defaultfloat << std::setprecision(6);
         }
 
         // Validation
@@ -475,10 +504,12 @@ int main(int argc, char *argv[]) {
             MTensor gt_cpu = dequantize_gt(valCam->getGPUImage());
 
             std::cout << "\n=== Validation (" << valCam->filePath << ") ===" << std::endl;
+            std::cout << std::fixed << std::setprecision(4);
             std::cout << "  PSNR:  " << psnr(rgb_cpu, gt_cpu)
                       << "  SSIM:  " << ssim_eval(rgb_cpu, gt_cpu)
                       << "  L1:  " << l1_loss(rgb_cpu, gt_cpu)
                       << "  Gaussians: " << model.means.size(0) << std::endl;
+            std::cout << std::defaultfloat << std::setprecision(6);
         }
 
         cleanup_msplat_metal();
