@@ -509,6 +509,7 @@ kernel void nd_rasterize_forward_kernel(
     device float* out_img,
     constant float* background,
     constant uint2& blockDim,
+    constant uint2& tile_range,  // tile group [x, y): other pixels are left untouched
     uint2 blockIdx [[threadgroup_position_in_grid]],
     uint2 threadIdx [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]]
@@ -519,6 +520,8 @@ kernel void nd_rasterize_forward_kernel(
     int32_t j = blockIdx.x * blockDim.x + threadIdx.x;
     // Map pixel coords back to parent 16x16 tile for tile_bins lookup
     int32_t tile_id = ((int)i / BLOCK_Y) * tile_bounds.x + ((int)j / BLOCK_X);
+    // an 8x8 threadgroup lies inside one 16x16 tile: uniform exit, before any barrier
+    if ((uint)tile_id < tile_range.x || (uint)tile_id >= tile_range.y) return;
     float px = (float)j;
     float py = (float)i;
     int32_t pix_id = i * (int)img_size.x + j;
@@ -941,6 +944,7 @@ kernel void rasterize_backward_kernel(
     device atomic_float* v_conic, // float3
     device atomic_float* v_rgb, // float3
     device atomic_float* v_opacity,
+    constant uint2& tile_range,  // tile group [x, y)
     uint3 gp [[thread_position_in_grid]],
     uint3 blockIdx [[threadgroup_position_in_grid]],
     uint tr [[thread_index_in_threadgroup]],
@@ -951,6 +955,8 @@ kernel void rasterize_backward_kernel(
     uint j = gp.x;
     // Map pixel coords back to parent 16x16 tile for tile_bins lookup
     int32_t tile_id = ((int)i / BLOCK_Y) * tile_bounds.x + ((int)j / BLOCK_X);
+    // an 8x8 threadgroup lies inside one 16x16 tile: uniform exit, before any barrier
+    if ((uint)tile_id < tile_range.x || (uint)tile_id >= tile_range.y) return;
 
     const float px = (float)j;
     const float py = (float)i;
@@ -2374,6 +2380,7 @@ kernel void prefix_sum_tiles_kernel(
     device   int*    tile_bins          [[buffer(3)]],   // int2, size num_tiles
     constant uint&   num_tiles          [[buffer(4)]],
     constant uint&   capacity           [[buffer(5)]],   // isect/packed buffer size (clamp target)
+    constant uint2&  tile_range         [[buffer(6)]],   // tile group [x, y); tiles outside get empty bins
     uint tid [[thread_position_in_threadgroup]]
 ) {
     // Allocate threadgroup memory for the scan.
@@ -2391,7 +2398,7 @@ kernel void prefix_sum_tiles_kernel(
     for (uint c = 0; c < num_chunks; ++c) {
         uint t = c * HYBRID_SORT_TG_THREADS + tid;
         
-        uint val = (t < num_tiles) ? tile_counts_in[t] : 0;
+        uint val = (t < num_tiles && t >= tile_range.x && t < tile_range.y) ? tile_counts_in[t] : 0;
         uint pad_val = pad_count(val);
 
         tg_exact_scan[tid] = val;
@@ -2441,6 +2448,7 @@ kernel void scatter_intersections_kernel(
     constant uint&        num_points     [[buffer(7)]],
     constant float*       aabb           [[buffer(8)]],    // float2: per-axis pixel extents
     constant uint&        capacity       [[buffer(9)]],    // isect_keys_unsorted size (bounds guard)
+    constant uint2&       tile_range     [[buffer(10)]],   // tile group [x, y)
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= num_points) return;
@@ -2453,9 +2461,12 @@ kernel void scatter_intersections_kernel(
     uint2 tile_min, tile_max;
     get_tile_bbox(center, read_packed_float2(aabb, gid), (int3)tile_bounds, tile_min, tile_max);
 
-    for (uint y = tile_min.y; y < tile_max.y; ++y) {
+    // only rows of the tile group; Gaussians outside them loop zero times
+    uint row_lo = tile_range.x / tile_bounds.x, row_hi = (tile_range.y + tile_bounds.x - 1) / tile_bounds.x;
+    for (uint y = max(tile_min.y, row_lo); y < min(tile_max.y, row_hi); ++y) {
         for (uint x = tile_min.x; x < tile_max.x; ++x) {
             uint tile_id = y * tile_bounds.x + x;
+            if (tile_id < tile_range.x || tile_id >= tile_range.y) continue;
             uint pos = atomic_fetch_add_explicit(&tile_write_counters[tile_id], 1u, memory_order_relaxed);
             // Durable hardening: drop intersections that would overflow the buffer
             // instead of writing out of bounds (which faults the GPU). Healthy scenes
@@ -2491,9 +2502,12 @@ kernel void hybrid_sort_pack_kernel(
     constant uint&      capacity             [[buffer(12)]],  // isect/packed buffer size
     constant uint&      num_points           [[buffer(13)]],  // decoded-id bounds guard
     device atomic_uint* nan_counts           [[buffer(14)]],  // 13=pack-gate total, 14=nonfinite opacity
+    constant uint2&     tile_range           [[buffer(15)]],  // tile group [x, y)
+    constant uint&      key_capacity         [[buffer(16)]],  // isect_keys_unsorted size; capacity = output size
     uint tg_id [[threadgroup_position_in_grid]],
     uint tid   [[thread_position_in_threadgroup]]
 ) {
+    if (tg_id < tile_range.x || tg_id >= tile_range.y) return;  // uniform per threadgroup
     uint count  = tile_counts_in[tg_id];
     if (count == 0) return;
     uint padded = sort_offsets[tg_id + 1] - sort_offsets[tg_id];
@@ -2506,7 +2520,7 @@ kernel void hybrid_sort_pack_kernel(
     // invisible data instead of stale garbage. region_ok is uniform across the
     // threadgroup (sort_offsets[tg_id+1] == src + padded), so all threads return
     // together — no barrier divergence. No-op on healthy scenes.
-    bool region_ok = (sort_offsets[tg_id + 1] <= capacity);
+    bool region_ok = (sort_offsets[tg_id + 1] <= key_capacity) && (dst + count <= capacity);
     if (!region_ok) {
         for (uint i = tid; i < count; i += HYBRID_SORT_TG_THREADS) {
             uint d = dst + i;

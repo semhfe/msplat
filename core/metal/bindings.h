@@ -34,6 +34,17 @@ void msplat_gpu_sync();
 extern "C" int msplat_last_tile_counts(const uint32_t **counts, int *num_points,
                                        int64_t *capacity, uint32_t *k_max);
 
+// Fixed intersection buffers: key slots (8 B) and output slots (40 B), set before the first
+// step; 0, 0 = legacy capacity 48·N. Views that do not fit run in tile groups (K = 1 only).
+extern "C" void msplat_set_isect_budget(int64_t key_slots, int64_t out_slots);
+extern "C" void msplat_isect_group_stats(uint64_t *steps, uint64_t *groups, uint32_t *max_groups);
+// Diagnostic: whole-view lists, backward run in these groups without rebuilds (order-matched test).
+extern "C" void msplat_set_isect_order_groups(int64_t key_slots, int64_t out_slots);
+// Diagnostic: fixed-buffer cache state (after msplat_gpu_sync()): forward/backward N, key/output slots.
+extern "C" void msplat_isect_cache_state(int64_t out[4]);
+// Diagnostic: last step's image, transmittance and gradients as raw files (after msplat_gpu_sync()).
+extern "C" void msplat_dump_step_buffers(const char *dir);
+
 // GPU timing — non-invasive, uses completion handlers on committed CBs
 void msplat_enable_gpu_timing(bool enable);
 // Drains accumulated GPU times (ms per CB) into the provided vector. Thread-safe.

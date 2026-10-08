@@ -195,6 +195,32 @@ int main(int argc, char *argv[]) {
 
         log_memory("model init");
 
+        // Fixed intersection buffers (prototype, default off). MSPLAT_ISECT_BUDGET=<bytes per Gaussian
+        // of --cap-max>, split 1.5 key slots : 1 output slot and floored at the single-tile guarantee
+        // (pad(cap) keys, cap outputs); MSPLAT_ISECT_SLOTS=<keys>,<outputs> sets them exactly (tests).
+        int64_t isectKeys = 0, isectOuts = 0;
+        if (const char *b = std::getenv("MSPLAT_ISECT_BUDGET")) {
+            int64_t padCap = 32;
+            while (padCap < capMax) padCap <<= 1;
+            double outs = std::atof(b) * capMax / (8 * 1.5 + 40);
+            isectKeys = std::max<int64_t>(padCap, (int64_t)(1.5 * outs));
+            isectOuts = std::max<int64_t>(capMax, (int64_t)outs);
+        }
+        if (const char *s = std::getenv("MSPLAT_ISECT_SLOTS")) {
+            long long k = 0, o = 0;
+            if (sscanf(s, "%lld,%lld", &k, &o) == 2 && k > 0 && o > 0) { isectKeys = k; isectOuts = o; }
+        }
+        if (const char *s = std::getenv("MSPLAT_ISECT_ORDER_SLOTS")) {  // correctness test only
+            long long k = 0, o = 0;
+            if (sscanf(s, "%lld,%lld", &k, &o) == 2 && k > 0 && o > 0) msplat_set_isect_order_groups(k, o);
+        }
+        if (isectKeys > 0) {
+            msplat_set_isect_budget(isectKeys, isectOuts);
+            std::cout << "[isect] fixed buffers: " << isectKeys << " key + " << isectOuts << " output slots = "
+                      << std::fixed << std::setprecision(1) << (8.0 * isectKeys + 40.0 * isectOuts) / 1e6 << " MB"
+                      << std::defaultfloat << std::setprecision(6) << std::endl;
+        }
+
         std::vector<size_t> camIndices(cams.size());
         std::iota(camIndices.begin(), camIndices.end(), 0);
         InfiniteRandomIterator<size_t> camsIter(camIndices);
@@ -245,6 +271,11 @@ int main(int argc, char *argv[]) {
                       << " device_allocated=" << deviceAllocated
                       << " phys=" << phys
                       << std::endl;
+            // separate line (the app parses [[PROBE]]): the cache state the allocation model must use
+            int64_t cs[4];
+            msplat_isect_cache_state(cs);
+            std::cout << "[isect-probe] fwd_n=" << cs[0] << " bwd_n=" << cs[1] << " key_slots=" << cs[2]
+                      << " out_slots=" << cs[3] << std::endl;
             cleanup_msplat_metal();
             msplat_gpu_sync();
             return 0;
@@ -316,6 +347,63 @@ int main(int argc, char *argv[]) {
                           << " " << std::fixed << std::setprecision(1)
                           << ms << "ms/step (single-iter, gpu-synced)"
                           << std::defaultfloat << std::setprecision(6) << std::endl;
+                if (isectKeys > 0) {
+                    uint64_t gSteps, gTotal; uint32_t gMax;
+                    msplat_isect_group_stats(&gSteps, &gTotal, &gMax);
+                    std::cout << "[isect] tile groups: steps=" << gSteps << " total=" << gTotal
+                              << " max=" << gMax << std::endl;
+                }
+            }
+
+            // Diagnostic: MSPLAT_STEP_DUMP=<dir> writes the image, gradients, post-step parameters and Adam
+            // moments of step MSPLAT_STEP_DUMP_AT (default: the first step run) for the fixed-buffer
+            // correctness test; a comma list of steps writes each to <dir>/step<N>.
+            if (const char *dumpRoot = std::getenv("MSPLAT_STEP_DUMP")) {
+                static const std::vector<size_t> dumpSteps = [&] {
+                    std::vector<size_t> v;
+                    char *p = std::getenv("MSPLAT_STEP_DUMP_AT");
+                    while (p && *p) {
+                        v.push_back((size_t)strtoull(p, &p, 10));
+                        if (*p != ',') break;
+                        p++;
+                    }
+                    if (v.empty()) v.push_back(step);
+                    return v;
+                }();
+                if (std::find(dumpSteps.begin(), dumpSteps.end(), step) != dumpSteps.end()) {
+                    const std::string dir = dumpSteps.size() > 1 ? std::string(dumpRoot) + "/step" + std::to_string(step)
+                                                                 : std::string(dumpRoot);
+                    fs::create_directories(dir);
+                    const char *dumpDir = dir.c_str();
+                    msplat_gpu_sync();
+                    msplat_dump_step_buffers(dumpDir);
+                    const std::pair<const char *, MTensor *> params[] = {
+                        {"means", &model.means}, {"scales", &model.scales}, {"quats", &model.quats},
+                        {"featuresDc", &model.featuresDc}, {"featuresRest", &model.featuresRest},
+                        {"opacities", &model.opacities}};
+                    for (auto &p : params) {
+                        FILE *f = fopen((std::string(dumpDir) + "/" + p.first + ".bin").c_str(), "wb");
+                        if (f) { fwrite(p.second->data_ptr(), 1, p.second->nbytes(), f); fclose(f); }
+                    }
+                    // Adam moments (groups as in fullIteration: means, scales, quats, featuresDc, featuresRest,
+                    // opacities); the SH groups are the only record of the fused SH gradients
+                    for (int g = 0; g < Model::N_ADAM_GROUPS; g++) {
+                        for (int sq = 0; sq < 2; sq++) {
+                            MTensor &m = sq ? model.adam_exp_avg_sq[g] : model.adam_exp_avg[g];
+                            FILE *f = fopen((std::string(dumpDir) + "/adam" + (sq ? "_sq" : "_m") + std::to_string(g) + ".bin").c_str(), "wb");
+                            if (f) { fwrite(m.data_ptr(), 1, m.nbytes(), f); fclose(f); }
+                        }
+                    }
+                    uint64_t gSteps = 0, gTotal = 0; uint32_t gMax = 0;
+                    msplat_isect_group_stats(&gSteps, &gTotal, &gMax);
+                    FILE *f = fopen((std::string(dumpDir) + "/meta.txt").c_str(), "w");
+                    if (f) {
+                        fprintf(f, "step %zu cam %d n %lld w %d h %d group_steps %llu groups %llu max_groups %u\n",
+                                step, (int)(&cam - cams.data()), (long long)model.means.size(0), model.lastWidth,
+                                model.lastHeight, (unsigned long long)gSteps, (unsigned long long)gTotal, gMax);
+                        fclose(f);
+                    }
+                }
             }
 
             if (benchmarking && step > (size_t)bench_warmup) {
