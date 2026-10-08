@@ -30,6 +30,10 @@ void msplat_commit_nosync();
 // Synchronize (commit + wait for completion)
 void msplat_gpu_sync();
 
+// Diagnostic: last forward's per-tile intersection counts (after msplat_gpu_sync()).
+extern "C" int msplat_last_tile_counts(const uint32_t **counts, int *num_points,
+                                       int64_t *capacity, uint32_t *k_max);
+
 // GPU timing — non-invasive, uses completion handlers on committed CBs
 void msplat_enable_gpu_timing(bool enable);
 // Drains accumulated GPU times (ms per CB) into the provided vector. Thread-safe.

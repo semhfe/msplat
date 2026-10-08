@@ -628,6 +628,19 @@ extern "C" void msplat_grad_nan_counts(uint32_t out[16]) {
     std::memcpy(out, g_tcache.grad_nan_counts.data<int32_t>(), 16 * sizeof(uint32_t));
 }
 
+// Diagnostic (CLI MSPLAT_ISECT_LOG): per-tile intersection counts of the last forward
+// pass, read in place (shared storage; count kernel output, never clamped). Call only
+// after msplat_gpu_sync(). Returns num_tiles (0 before the first forward).
+extern "C" int msplat_last_tile_counts(const uint32_t **counts, int *num_points,
+                                       int64_t *capacity, uint32_t *k_max) {
+    if (!g_tcache.tile_counts.defined()) return 0;
+    *counts = (const uint32_t *)g_tcache.tile_counts.data<int32_t>();
+    *num_points = g_tcache.fwd_num_points;
+    *capacity = g_tcache.capacity;
+    *k_max = g_tcache.current_K_max;
+    return g_tcache.num_tiles;
+}
+
 // Internal forward pipeline — used by both msplat_render and msplat_train_step.
 // When compute_loss=false, gt/window2d/ssim_weight are ignored.
 static void forward_pipeline(

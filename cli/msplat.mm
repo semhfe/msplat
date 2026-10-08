@@ -272,6 +272,12 @@ int main(int argc, char *argv[]) {
         }
         auto cpu_now = []() { return std::chrono::high_resolution_clock::now(); };
 
+        // Diagnostic: MSPLAT_ISECT_LOG=<file> writes, every MSPLAT_ISECT_EVERY (default 10) steps, the
+        // training forward's per-tile intersection counts: int32 {step, train-cam index, forward N, W, H,
+        // tiles, K_max, capacity} then uint32[tiles]. GPU-synced, so it costs time; results are unchanged.
+        FILE *isectLog = std::getenv("MSPLAT_ISECT_LOG") ? fopen(std::getenv("MSPLAT_ISECT_LOG"), "wb") : nullptr;
+        const size_t isectEvery = std::getenv("MSPLAT_ISECT_EVERY") ? std::max(1, atoi(std::getenv("MSPLAT_ISECT_EVERY"))) : 10;
+
         auto bench_start = cpu_now();
         for (; step <= (size_t)numIters; step++) {
             @autoreleasepool {
@@ -283,6 +289,17 @@ int main(int argc, char *argv[]) {
             model.schedulersStep(step);
             model.mcmcAfterTrain(step);
             msplat_commit();
+
+            if (isectLog && step % isectEvery == 0) {
+                msplat_gpu_sync();
+                const uint32_t *counts; int np; int64_t capacity; uint32_t kMax;
+                int nt = msplat_last_tile_counts(&counts, &np, &capacity, &kMax);
+                int32_t hdr[8] = {(int32_t)step, (int32_t)(&cam - cams.data()), np, model.lastWidth, model.lastHeight,
+                                  nt, (int32_t)kMax, (int32_t)capacity};
+                fwrite(hdr, sizeof(hdr), 1, isectLog);
+                fwrite(counts, sizeof(uint32_t), nt, isectLog);
+                if (step % 1000 == 0) fflush(isectLog);
+            }
 
             // Progress output for GUI integration (every 1000 steps)
             if (step % 5000 == 0) {
