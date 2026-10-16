@@ -2,6 +2,7 @@
 #include <chrono>
 #include <algorithm>
 #include <numeric>
+#include <climits>
 #include <cmath>
 #include <iostream>
 #include <iomanip>
@@ -195,16 +196,28 @@ int main(int argc, char *argv[]) {
 
         log_memory("model init");
 
-        // Fixed intersection buffers (prototype, default off). MSPLAT_ISECT_BUDGET=<bytes per Gaussian
-        // of --cap-max>, split 1.5 key slots : 1 output slot and floored at the single-tile guarantee
-        // (pad(cap) keys, cap outputs); MSPLAT_ISECT_SLOTS=<keys>,<outputs> sets them exactly (tests).
+        // Fixed intersection buffers, sized once before training: default 1000 B per Gaussian of
+        // --cap-max (2.0 GB at 2M) instead of the legacy 48 slots x 48 B = 2304 B/G grown with N. A view
+        // that does not fit is rastered in tile groups (extra passes, same image). MSPLAT_ISECT_BUDGET=
+        // <B/G> overrides, 0 = legacy. Split 1.5 key slots : 1 output slot, floored at the single-tile
+        // guarantee (pad(N) keys, N outputs, N = max(cap, seeds) so --no-seed-decimation stays safe);
+        // MSPLAT_ISECT_SLOTS=<keys>,<outputs> sets them exactly (tests). Views under 400 tiles need the
+        // chunked K > 1 rasterizer, which only the legacy path has, so such datasets stay legacy.
         int64_t isectKeys = 0, isectOuts = 0;
-        if (const char *b = std::getenv("MSPLAT_ISECT_BUDGET")) {
-            int64_t padCap = 32;
-            while (padCap < capMax) padCap <<= 1;
-            double outs = std::atof(b) * capMax / (8 * 1.5 + 40);
-            isectKeys = std::max<int64_t>(padCap, (int64_t)(1.5 * outs));
-            isectOuts = std::max<int64_t>(capMax, (int64_t)outs);
+        double isectBudget = 1000;
+        if (const char *b = std::getenv("MSPLAT_ISECT_BUDGET")) isectBudget = std::atof(b);
+        int minTiles = INT_MAX;
+        for (const auto &c : inputData.cameras)
+            minTiles = std::min(minTiles, ((c.width + BLOCK_X - 1) / BLOCK_X) * ((c.height + BLOCK_Y - 1) / BLOCK_Y));
+        if (isectBudget > 0 && minTiles < 400) {
+            std::cout << "[isect] legacy buffers: smallest view has " << minTiles << " tiles (< 400)" << std::endl;
+        } else if (isectBudget > 0) {
+            const int64_t n = std::max<int64_t>(capMax, model.means.size(0));
+            int64_t padN = 32;
+            while (padN < n) padN <<= 1;
+            double outs = isectBudget * capMax / (8 * 1.5 + 40);
+            isectKeys = std::max<int64_t>(padN, (int64_t)(1.5 * outs));
+            isectOuts = std::max<int64_t>(n, (int64_t)outs);
         }
         if (const char *s = std::getenv("MSPLAT_ISECT_SLOTS")) {
             long long k = 0, o = 0;
@@ -551,6 +564,13 @@ int main(int argc, char *argv[]) {
                           << std::fixed << std::setprecision(3) << total_med << "ms\n";
             }
             std::cout << "\n";
+        }
+
+        if (isectKeys > 0) {
+            uint64_t gSteps, gTotal; uint32_t gMax;
+            msplat_isect_group_stats(&gSteps, &gTotal, &gMax);
+            std::cout << "[isect] training: " << gSteps << " steps, " << gTotal - gSteps
+                      << " extra tile-group passes, max " << gMax << " groups in one step" << std::endl;
         }
 
         // Stamp the step actually reached (early stop may end before numIters).
