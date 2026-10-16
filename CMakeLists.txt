@@ -58,11 +58,17 @@ find_library(COREGRAPHICS_FRAMEWORK CoreGraphics REQUIRED)
 # must match the platform of the process that loads the metallib.
 set(MSPLAT_METAL_SDK "macosx" CACHE STRING "xcrun SDK for the Metal compiler (macosx|iphoneos)")
 
+# The metallib follows the binary's deployment target; without it metal targets the build host's OS.
+set(METAL_MIN_VERSION "")
+if(CMAKE_OSX_DEPLOYMENT_TARGET AND MSPLAT_METAL_SDK STREQUAL "macosx")
+    set(METAL_MIN_VERSION -mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET})
+endif()
+
 set(METAL_SOURCE ${CMAKE_SOURCE_DIR}/core/metal/msplat_metal.metal)
 configure_file(${METAL_SOURCE} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.metal COPYONLY)
 add_custom_command(
     OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib
-    COMMAND xcrun -sdk ${MSPLAT_METAL_SDK} metal -O3 -c
+    COMMAND xcrun -sdk ${MSPLAT_METAL_SDK} metal -O3 ${METAL_MIN_VERSION} -c
         ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.metal
         -o ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.air
     COMMAND xcrun -sdk ${MSPLAT_METAL_SDK} metallib
