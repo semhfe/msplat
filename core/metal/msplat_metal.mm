@@ -12,6 +12,9 @@
 #import <functional>
 #import <array>
 #import <mutex>
+#import <atomic>
+#import <os/lock.h>
+#import <memory>
 #import <mach/mach_time.h>
 
 // GPU profiling infrastructure.
@@ -38,6 +41,116 @@ static std::mutex g_stage_timing_mutex;
 static std::vector<double> g_stage_times[N_TRAIN_STAGES];
 static int g_stage_report_count = 0;
 
+// A4: deferred MTLBuffer release. MTensor's RAII hands owned buffers to this hook instead of
+// releasing them, so a buffer still referenced by uncommitted or in-flight GPU work is never
+// freed under it, whatever the command buffer's reference-retention mode:
+//  - not the last owner (retain count > 1): release now, the other owner keeps it alive;
+//  - GPU idle (after a full sync, before the next encoding): release now;
+//  - otherwise record it in a fixed slot table; the records are handed to the next command
+//    buffer committed after the release and freed when it completes (a serial queue completes
+//    in order, so all earlier work is done by then); a full sync frees whatever is recorded.
+// The hook runs from destructors and noexcept move assignment, so it never allocates or throws
+// (Codex C4 r2 #1): static slot table, os_unfair_lock. Ownership is never dropped (C4 r3): when
+// the table is full and nothing is encoded but uncommitted, it waits for the last committed
+// command buffer and frees the buffer; when work is encoded but uncommitted (the buffer may be
+// referenced by it, and committing from a destructor could cut an open encoder), it stops the
+// process with a message instead of either freeing under the GPU or losing the record. Bound:
+// at most kReleaseSlots records exist at any time and all are reclaimed at every commit
+// completion / sync. In training, last-owner releases between two commits come from the
+// per-step cache reallocations (ensure_forward/chunks/backward: under 40 buffers per step;
+// model-level reallocations run after a sync, i.e. on the idle path), far below the bound.
+// Defined before g_tcache so these outlive it during static destruction.
+static constexpr size_t kReleaseSlots = 16384;
+static os_unfair_lock g_release_lock = OS_UNFAIR_LOCK_INIT;
+static void* g_release_slots[kReleaseSlots];          // records awaiting a commit, under the lock
+static size_t g_release_n = 0;
+static size_t g_release_limit = kReleaseSlots;        // < kReleaseSlots only in the CPU check
+static id<MTLCommandBuffer> g_last_committed = nil;   // retained, under g_release_lock
+static std::atomic<bool> g_gpu_idle{true};
+static std::atomic<bool> g_cb_dirty{false};           // encoded work not yet committed
+static std::atomic<uint64_t> g_rel_deferred{0}, g_rel_waited{0}, g_rel_reclaimed{0};
+
+static void msplat_release_buffer(void* buf) noexcept {
+    if (CFGetRetainCount((CFTypeRef)buf) > 1) { CFRelease(buf); return; }
+    os_unfair_lock_lock(&g_release_lock);
+    if (g_gpu_idle.load()) { os_unfair_lock_unlock(&g_release_lock); CFRelease(buf); return; }
+    if (g_release_n < g_release_limit) {
+        g_release_slots[g_release_n++] = buf;
+        os_unfair_lock_unlock(&g_release_lock);
+        g_rel_deferred++;
+        return;
+    }
+    id<MTLCommandBuffer> last = [g_last_committed retain];
+    const bool dirty = g_cb_dirty.load();
+    os_unfair_lock_unlock(&g_release_lock);
+    if (!dirty) {
+        [last waitUntilCompleted];          // no-op when nil (nothing committed yet)
+        [last release];
+        CFRelease(buf);
+        g_rel_waited++;
+        return;
+    }
+    fprintf(stderr, "msplat: fatal: %zu GPU buffers released while GPU work is encoded but not committed; "
+            "stopping rather than freeing a buffer the GPU may still use\n", g_release_n);
+    abort();
+}
+
+// Commit path (may allocate/throw; not called from destructors): moves the recorded buffers
+// out of the slot table. If the copy cannot be allocated the records stay and go with the next
+// commit or sync.
+static std::vector<void*>* take_released_pending() {
+    os_unfair_lock_lock(&g_release_lock);
+    const size_t n = g_release_n;
+    os_unfair_lock_unlock(&g_release_lock);
+    if (n == 0) return nullptr;
+    auto v = std::make_unique<std::vector<void*>>();
+    v->reserve(n + 64);
+    os_unfair_lock_lock(&g_release_lock);
+    const size_t m = std::min(g_release_n, v->capacity());
+    v->assign(g_release_slots + g_release_n - m, g_release_slots + g_release_n);
+    g_release_n -= m;
+    os_unfair_lock_unlock(&g_release_lock);
+    return v.release();
+}
+
+static void release_list(std::vector<void*>* v) {
+    if (!v) return;
+    for (void* b : *v) CFRelease(b);
+    g_rel_reclaimed += v->size();
+    delete v;
+}
+
+// Before committing `cb` (an MPSCommandBuffer): frees, when it completes, every buffer released
+// before this commit. Returns the underlying buffer about to be committed (retained); pass it to
+// note_committed() right after the commit.
+static id<MTLCommandBuffer> release_after(MPSCommandBuffer* cb) {
+    std::vector<void*>* v = take_released_pending();
+    if (v) [cb addCompletedHandler:^(id<MTLCommandBuffer>) { release_list(v); }];
+    return [cb.commandBuffer retain];
+}
+
+// After the commit: `under` is the last committed buffer (what the full-queue fallback waits on).
+static void note_committed(id<MTLCommandBuffer> under) {
+    os_unfair_lock_lock(&g_release_lock);
+    id<MTLCommandBuffer> old = g_last_committed;
+    g_last_committed = under;
+    g_cb_dirty = false;
+    os_unfair_lock_unlock(&g_release_lock);
+    [old release];
+}
+
+// Test-only (CPU check of the release fallbacks): simulate a busy GPU / uncommitted work and
+// lower the slot limit (limit < 0 leaves it). out: deferred, waited, reclaimed, recorded, limit.
+extern "C" void msplat_release_debug(int busy, int dirty, long limit, uint64_t out[5]) {
+    os_unfair_lock_lock(&g_release_lock);
+    if (limit >= 0) g_release_limit = std::min<size_t>((size_t)limit, kReleaseSlots);
+    out[3] = g_release_n; out[4] = g_release_limit;
+    os_unfair_lock_unlock(&g_release_lock);
+    if (busy >= 0) g_gpu_idle = !busy;
+    if (dirty >= 0) g_cb_dirty = dirty != 0;
+    out[0] = g_rel_deferred; out[1] = g_rel_waited; out[2] = g_rel_reclaimed;
+}
+
 struct MetalContext {
     id<MTLDevice>       device;
     id<MTLCommandQueue> queue;
@@ -56,6 +169,8 @@ struct MetalContext {
     dispatch_semaphore_t inflight_sem;
 
     id<MTLCommandBuffer> getCommandBuffer() {
+        g_gpu_idle = false;
+        g_cb_dirty = true;
         if (!_currentCB) {
             _currentCB = [MPSCommandBuffer commandBufferFromCommandQueue:queue];
             [_currentCB retain];
@@ -73,21 +188,37 @@ struct MetalContext {
                     }
                 }];
             }
+            id<MTLCommandBuffer> under = release_after(_currentCB);
             dispatch_semaphore_t sem = inflight_sem;
             [_currentCB addCompletedHandler:^(id<MTLCommandBuffer>) {
                 dispatch_semaphore_signal(sem);
             }];
             [_currentCB commitAndContinue];
+            note_committed(under);
             dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
         }
     }
     void syncCB() {
         if (_currentCB) {
+            std::vector<void*>* v = take_released_pending();
             [_currentCB commit];
             [_currentCB waitUntilCompleted];
             [_currentCB release];
             _currentCB = nil;
+            release_list(v);
         }
+        // Everything committed before is complete (serial queue): the GPU is idle until the
+        // next getCommandBuffer(). Late arrivals (released during the wait) go now too.
+        os_unfair_lock_lock(&g_release_lock);
+        g_gpu_idle = true;
+        g_cb_dirty = false;
+        for (size_t i = 0; i < g_release_n; i++) CFRelease(g_release_slots[i]);   // GPU idle
+        g_rel_reclaimed += g_release_n;
+        g_release_n = 0;
+        id<MTLCommandBuffer> old = g_last_committed;
+        g_last_committed = nil;
+        os_unfair_lock_unlock(&g_release_lock);
+        [old release];
     }
 
     // Per-stage GPU timestamp profiling (Metal counter sample buffer)
@@ -201,6 +332,7 @@ MetalContext* init_msplat_metal_context() {
     // state explicitly (a garbage _currentCB here would crash the first commit).
     ctx->_currentCB = nil;
     ctx->inflight_sem = dispatch_semaphore_create(2);  // wait-after-commit ⇒ ≤3 in flight
+    g_mtensor_release_hook = msplat_release_buffer;     // A4: deferred buffer release
 
     // Find precompiled metallib: explicit path (XCFramework/Python) or auto-discover
     NSError *error = nil;
@@ -453,7 +585,9 @@ void msplat_commit_nosync() {
         // 1. Only 1 frame in flight at VSync cadence
         // 2. The Swift side creates its own CB on the same serial queue
         // 3. Metal guarantees submission order on a serial queue
+        id<MTLCommandBuffer> under = release_after(ctx->_currentCB);
         [ctx->_currentCB commitAndContinue];
+        note_committed(under);
     }
 }
 
@@ -529,13 +663,16 @@ struct FusedTensorCache {
     // Depth-chunked rasterization buffers
     uint32_t current_K_max = 1;
     int chunk_K_max = 0;
+    // A2: dimensions the chunk buffers are sized for. Distinct from img_height/img_width,
+    // which ensure_forward() has already updated by the time ensure_chunks() runs.
+    int chunk_h = 0, chunk_w = 0;
     MTensor chunk_T, chunk_C, chunk_final_idx;
     MTensor prefix_T, after_C;
 
     // Backward gradient accumulators
     MTensor v_rendered;
     MTensor v_xy, v_conic, v_colors_rast, v_opacity, v_depth;
-    MTensor v_mean3d, v_scale, v_quat, v_features_dc, v_features_rest;
+    MTensor v_mean3d, v_scale, v_quat;  // A5: SH grads are fused into Adam; no v_features_* buffers
 
     // Cumulative NaN-gate counters (never zeroed; CPU logs deltas).
     // Slots: 0=v_mean3d 1=v_scale 2=v_quat 3=v_colors(SH) 4=spare
@@ -544,13 +681,13 @@ struct FusedTensorCache {
 
     void ensure_forward(int np, int64_t cap, int64_t key_cap, int ih, int iw, int nt,
                         id<MTLDevice> dev) {
-        // MTensor has no destructor/move-assign: reassigning a cached buffer
-        // orphans its retained MTLBuffer (leak). During MCMC growth these ensure_*
-        // reallocs fire repeatedly, so the leaked intermediates accumulate in
-        // proportion to the seed→cap growth path — this was the dominant,
-        // un-enumerable "residual" in the RAM model. reset() the old buffer first.
+        // MTensor releases its buffer on reassignment since A4 (RAII); the explicit
+        // reset() calls below predate that (a91a45b leak fix) and are now redundant.
+        // A4: an allocation may throw (C API callers catch it and may call again), so each
+        // group's size marker is invalidated first and set only after all its buffers exist;
+        // a failed group is rebuilt on the next call instead of being skipped half-allocated.
         if (np != fwd_num_points) {
-            fwd_num_points = np;
+            fwd_num_points = -1;
             xys.reset();            xys = mtensor_empty(dev, {np, 2}, DType::Float32);
             depths.reset();         depths = mtensor_empty(dev, {np}, DType::Float32);
             radii_out.reset();      radii_out = mtensor_empty(dev, {np}, DType::Int32);
@@ -558,32 +695,35 @@ struct FusedTensorCache {
             num_tiles_hit.reset();  num_tiles_hit = mtensor_empty(dev, {np}, DType::Int32);
             colors.reset();         colors = mtensor_empty(dev, {np, 3}, DType::Float32);
             aabb.reset();           aabb = mtensor_empty(dev, {np, 2}, DType::Float32);
+            fwd_num_points = np;
         }
         if (cap != capacity || key_cap != key_capacity) {
-            capacity = cap;
-            key_capacity = key_cap;
+            capacity = -1; key_capacity = -1;
             gaussian_ids.reset();        gaussian_ids = mtensor_empty(dev, {cap}, DType::Int32);
             isect_keys_unsorted.reset(); isect_keys_unsorted = mtensor_empty(dev, {key_cap}, DType::Int64);
             packed_xy_opac.reset();      packed_xy_opac = mtensor_empty(dev, {cap, 3}, DType::Float32);
             packed_conic.reset();        packed_conic = mtensor_empty(dev, {cap, 3}, DType::Float32);
             packed_rgb.reset();          packed_rgb = mtensor_empty(dev, {cap, 3}, DType::Float32);
+            capacity = cap; key_capacity = key_cap;
         }
         if (ih != img_height || iw != img_width) {
-            img_height = ih; img_width = iw;
+            img_height = -1; img_width = -1;
             out_img.reset();            out_img = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
             final_Ts.reset();           final_Ts = mtensor_empty(dev, {ih, iw}, DType::Float32);
             final_idx.reset();          final_idx = mtensor_empty(dev, {ih, iw}, DType::Int32);
             loss_intermediates.reset(); loss_intermediates = mtensor_empty(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
             ssim_h_buf.reset();         ssim_h_buf = mtensor_empty(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
             v_rendered.reset();         v_rendered = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            img_height = ih; img_width = iw;
         }
         if (nt != num_tiles) {
-            num_tiles = nt;
+            num_tiles = -1;
             tile_bins.reset();           tile_bins = mtensor_empty(dev, {nt, 2}, DType::Int32);
             tile_counts.reset();         tile_counts = mtensor_empty(dev, {(int64_t)nt}, DType::Int32);
             tile_write_counters.reset(); tile_write_counters = mtensor_empty(dev, {(int64_t)nt}, DType::Int32);
             exact_offsets.reset();       exact_offsets = mtensor_empty(dev, {(int64_t)nt}, DType::Int32);
             sort_offsets.reset();        sort_offsets = mtensor_empty(dev, {(int64_t)(nt + 1)}, DType::Int32);
+            num_tiles = nt;
         }
         if (!loss_sum.defined()) {
             loss_sum = mtensor_empty(dev, {1}, DType::Float32);
@@ -594,20 +734,20 @@ struct FusedTensorCache {
     }
 
     void ensure_chunks(int K, int ih, int iw, id<MTLDevice> dev) {
-        if (K <= chunk_K_max && ih == img_height && iw == img_width) return;
-        chunk_K_max = K;
+        if (K <= chunk_K_max && ih == chunk_h && iw == chunk_w) return;
+        chunk_K_max = 0; chunk_h = 0; chunk_w = 0;  // markers set only after success (see ensure_forward)
         // reset() before reassign — see the leak note in ensure_forward.
         chunk_T.reset();         chunk_T = mtensor_empty(dev, {K, ih, iw}, DType::Float32);
         chunk_C.reset();         chunk_C = mtensor_empty(dev, {K, ih, iw, 3}, DType::Float32);
         chunk_final_idx.reset(); chunk_final_idx = mtensor_empty(dev, {K, ih, iw}, DType::Int32);
         prefix_T.reset();        prefix_T = mtensor_empty(dev, {K, ih, iw}, DType::Float32);
         after_C.reset();         after_C = mtensor_empty(dev, {K, ih, iw, 3}, DType::Float32);
+        chunk_K_max = K; chunk_h = ih; chunk_w = iw;
     }
 
     void ensure_backward(int np, int frb, id<MTLDevice> dev) {
         if (np != bwd_num_points || frb != features_rest_bases || !v_xy.defined()) {
-            bwd_num_points = np;
-            features_rest_bases = frb;
+            bwd_num_points = -1;  // set only after success (see ensure_forward)
             // reset() before reassign — see the leak note in ensure_forward.
             v_xy.reset();            v_xy = mtensor_empty(dev, {np, 2}, DType::Float32);
             v_conic.reset();         v_conic = mtensor_empty(dev, {np, 3}, DType::Float32);
@@ -617,14 +757,15 @@ struct FusedTensorCache {
             v_mean3d.reset();        v_mean3d = mtensor_empty(dev, {np, 3}, DType::Float32);
             v_scale.reset();         v_scale = mtensor_empty(dev, {np, 3}, DType::Float32);
             v_quat.reset();          v_quat = mtensor_empty(dev, {np, 4}, DType::Float32);
-            v_features_dc.reset();   v_features_dc = mtensor_empty(dev, {np, 3}, DType::Float32);
-            v_features_rest.reset(); v_features_rest = mtensor_empty(dev, {(int64_t)np, (int64_t)frb, 3}, DType::Float32);
+            bwd_num_points = np; features_rest_bases = frb;
         }
     }
 };
 static FusedTensorCache g_tcache;
 
 void cleanup_msplat_metal() {
+    // A4: buffers are now actually released here; let in-flight work finish first.
+    if (MetalContext* c = get_global_context()) c->syncCB();
     g_tcache = FusedTensorCache{};
 }
 
@@ -800,6 +941,32 @@ static void encode_build_isect(MetalContext *ctx, id<MTLComputeCommandEncoder> e
 
 // Internal forward pipeline — used by both msplat_render and msplat_train_step.
 // When compute_loss=false, gt/window2d/ssim_weight are ignored.
+// Depth-chunk count K for a view (K = 1: monolithic kernels; K > 1: chunked kernels).
+// Baseline rule (9720dfe) up to the A3 line, kept verbatim so the kernel choice never changes:
+// high-res views (>= 400 tiles) never chunk; otherwise 6x the average per-tile capacity, at
+// least 2, at most ceil(capacity / 512) — which is 1 only for capacity <= 512 (N <= 10 at 48 N).
+// A3: a gaussian enters a tile at most once, so no tile holds more than min(capacity, N)
+// entries and chunks past ceil(min(capacity, N) / 512) are always empty; when K > 1 they are
+// dropped, never below 2, so the chunked/monolithic choice is the baseline's. Guarantee: only
+// provably empty chunks are removed. The 6x-average estimate is NOT a completeness bound — a tile
+// holding more than K*512 entries still loses its deepest ones (pre-existing; complete K in
+// pkgA-extra-A8). Exported for the CPU check (paket-a-checks/chunk_k_check.cpp).
+extern "C" uint32_t msplat_chunk_k_max(int64_t capacity, int num_points, int num_tiles) {
+    constexpr uint32_t CHUNK_SIZE = 512;
+    if (num_tiles >= 400) return 1;  // High-res: enough tiles for good GPU occupancy, skip chunking
+    uint32_t avg_per_tile = (uint32_t)(capacity / std::max(1, num_tiles));
+    uint32_t conservative_max = avg_per_tile * 6;  // 6x average — covers heavy-tailed distributions
+    uint32_t K_max = (conservative_max + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    if (K_max < 2) K_max = 2;
+    uint32_t abs_max = (uint32_t)((capacity + CHUNK_SIZE - 1) / CHUNK_SIZE);
+    if (K_max > abs_max) K_max = abs_max;
+    if (K_max > 1) {  // A3
+        uint32_t empty_from = (uint32_t)((std::min<int64_t>(capacity, num_points) + CHUNK_SIZE - 1) / CHUNK_SIZE);
+        K_max = std::max<uint32_t>(2, std::min<uint32_t>(K_max, empty_from));
+    }
+    return K_max;
+}
+
 static void forward_pipeline(
     int num_points, MTensor &means3d, MTensor &scales, float glob_scale,
     MTensor &quats, MTensor &viewmat, MTensor &projmat,
@@ -1012,17 +1179,7 @@ static void forward_pipeline(
         fprintf(stderr, "msplat: fixed intersection buffers need >= 400 tiles per view (K = 1); this view has %d\n", num_tiles);
         std::exit(3);
     }
-    if (num_tiles >= 400) {
-        // High-res: enough tiles for good GPU occupancy, skip chunking
-        K_max = 1;
-    } else {
-        uint32_t avg_per_tile = (uint32_t)(capacity / std::max(1, num_tiles));
-        uint32_t conservative_max = avg_per_tile * 6;  // 6x average — covers heavy-tailed distributions
-        K_max = (conservative_max + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        if (K_max < 2) K_max = 2;
-        uint32_t abs_max = (uint32_t)((capacity + CHUNK_SIZE - 1) / CHUNK_SIZE);
-        if (K_max > abs_max) K_max = abs_max;
-    }
+    K_max = msplat_chunk_k_max(capacity, num_points, num_tiles);
     g_tcache.current_K_max = K_max;
     if (K_max > 1) {
         g_tcache.ensure_chunks(K_max, img_height, img_width, ctx->device);
@@ -1174,12 +1331,11 @@ std::tuple<MTensor, float> msplat_train_step(
     MTensor &v_mean3d = g_tcache.v_mean3d;
     MTensor &v_scale = g_tcache.v_scale;
     MTensor &v_quat = g_tcache.v_quat;
-    MTensor &v_features_dc = g_tcache.v_features_dc;
-    MTensor &v_features_rest = g_tcache.v_features_rest;
 
-    // Wire backward outputs as Adam grads (MTensor references for gradient buffers)
+    // Wire backward outputs as Adam grads. Groups 3/4 (SH) are fused into the backward
+    // kernel and never read from here (the Adam loop skips them), so their slots are empty.
     auto adam_grads = std::make_shared<std::array<MTensor, 6>>(
-        std::array<MTensor, 6>{v_mean3d, v_scale, v_quat, v_features_dc, v_features_rest, v_opacity});
+        std::array<MTensor, 6>{v_mean3d, v_scale, v_quat, MTensor(), MTensor(), v_opacity});
 
     // --- Constants (heap-allocated for Obj-C block capture) ---
     auto loss_img_size = std::make_shared<std::array<uint32_t, 2>>(std::array<uint32_t, 2>{img_width, img_height});
@@ -1208,16 +1364,7 @@ std::tuple<MTensor, float> msplat_train_step(
         fprintf(stderr, "msplat: fixed intersection buffers need >= 400 tiles per view (K = 1); this view has %d\n", num_tiles);
         std::exit(3);
     }
-    if (num_tiles >= 400) {
-        K_max = 1;
-    } else {
-        uint32_t avg_per_tile = (uint32_t)(capacity / std::max(1, num_tiles));
-        uint32_t conservative_max = avg_per_tile * 6;
-        K_max = (conservative_max + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        if (K_max < 2) K_max = 2;
-        uint32_t abs_max = (uint32_t)((capacity + CHUNK_SIZE - 1) / CHUNK_SIZE);
-        if (K_max > abs_max) K_max = abs_max;
-    }
+    K_max = msplat_chunk_k_max(capacity, num_points, num_tiles);
     g_tcache.current_K_max = K_max;
     if (K_max > 1) {
         g_tcache.ensure_chunks(K_max, img_height, img_width, ctx->device);

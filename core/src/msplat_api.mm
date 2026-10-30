@@ -273,6 +273,37 @@ void cleanup() { cleanup_msplat_metal(); }
 // ── C API (for Swift interop) ───────────────────────────────────────────────
 
 #include "msplat_c_api.h"
+#include <memory>
+
+// Error convention: no C++ exception crosses the C boundary. A failed call returns its
+// neutral value (NULL handle, zeroed struct, -1 for int results, nothing for void) and
+// msplat_last_error() returns the message until the next C API call on the same thread.
+// Fixed buffer, no allocation: set_error runs inside catch handlers and must not throw
+// (a std::string assignment could throw bad_alloc out of the handler). Long messages are cut.
+static thread_local char g_last_error[1024];
+static thread_local bool g_has_error = false;
+
+static void set_error(const char *prefix, const char *what) noexcept {
+    snprintf(g_last_error, sizeof(g_last_error), "%s%s", prefix, what ? what : "unknown error");
+    g_has_error = true;
+    fprintf(stderr, "%s%s\n", strncmp(g_last_error, "msplat", 6) == 0 ? "" : "msplat: ", g_last_error);
+}
+
+template <typename R, typename F>
+static R guarded(R fail, F &&f) {
+    g_has_error = false;
+    try { return f(); }
+    catch (const std::exception &e) { set_error("", e.what()); }
+    catch (...) { set_error("", "unknown C++ exception"); }
+    return fail;
+}
+
+template <typename F>
+static void guarded_void(F &&f) {
+    guarded(0, [&] { f(); return 0; });
+}
+
+const char* msplat_last_error(void) { return g_has_error ? g_last_error : nullptr; }
 
 static msplat::Config configFromC(MsplatConfig c) {
     msplat::Config cfg;
@@ -293,98 +324,109 @@ static msplat::Config configFromC(MsplatConfig c) {
 
 MsplatDataset msplat_dataset_create(const char* path, float downscaleFactor,
                                      bool evalMode, int testEvery) {
-    auto* ds = new msplat::Dataset(std::string(path), downscaleFactor, evalMode, testEvery);
-    return static_cast<MsplatDataset>(ds);
+    return guarded<MsplatDataset>(nullptr, [&] {
+        return static_cast<MsplatDataset>(new msplat::Dataset(std::string(path), downscaleFactor, evalMode, testEvery));
+    });
 }
 
 void msplat_dataset_destroy(MsplatDataset ds) {
-    delete static_cast<msplat::Dataset*>(ds);
+    guarded_void([&] { delete static_cast<msplat::Dataset*>(ds); });
 }
 
 int msplat_dataset_num_train(MsplatDataset ds) {
-    return static_cast<msplat::Dataset*>(ds)->numTrain();
+    return guarded(-1, [&] { return static_cast<msplat::Dataset*>(ds)->numTrain(); });
 }
 
 int msplat_dataset_num_test(MsplatDataset ds) {
-    return static_cast<msplat::Dataset*>(ds)->numTest();
+    return guarded(-1, [&] { return static_cast<msplat::Dataset*>(ds)->numTest(); });
 }
 
 void msplat_dataset_camera_pose(MsplatDataset ds, int cameraIndex, float camToWorld[16]) {
-    static_cast<msplat::Dataset*>(ds)->cameraPose(cameraIndex, camToWorld);
+    guarded_void([&] { static_cast<msplat::Dataset*>(ds)->cameraPose(cameraIndex, camToWorld); });
 }
 
 MsplatTrainer msplat_trainer_create(MsplatDataset ds, MsplatConfig config) {
-    auto* dataset = static_cast<msplat::Dataset*>(ds);
-    auto cfg = configFromC(config);
-    auto* trainer = new msplat::Trainer(*dataset, cfg);
-    return static_cast<MsplatTrainer>(trainer);
+    return guarded<MsplatTrainer>(nullptr, [&] {
+        auto* dataset = static_cast<msplat::Dataset*>(ds);
+        return static_cast<MsplatTrainer>(new msplat::Trainer(*dataset, configFromC(config)));
+    });
 }
 
 void msplat_trainer_destroy(MsplatTrainer t) {
-    delete static_cast<msplat::Trainer*>(t);
+    guarded_void([&] { delete static_cast<msplat::Trainer*>(t); });
 }
 
 MsplatStats msplat_trainer_step(MsplatTrainer t) {
-    auto stats = static_cast<msplat::Trainer*>(t)->step();
-    return MsplatStats{stats.iteration, stats.splatCount, stats.msPerStep};
+    return guarded(MsplatStats{}, [&] {
+        auto stats = static_cast<msplat::Trainer*>(t)->step();
+        return MsplatStats{stats.iteration, stats.splatCount, stats.msPerStep};
+    });
 }
 
 void msplat_trainer_train(MsplatTrainer t) {
-    static_cast<msplat::Trainer*>(t)->train(0);
+    guarded_void([&] { static_cast<msplat::Trainer*>(t)->train(0); });
 }
 
 MsplatEvalMetrics msplat_trainer_evaluate(MsplatTrainer t) {
-    auto m = static_cast<msplat::Trainer*>(t)->evaluate();
-    return MsplatEvalMetrics{m.psnr, m.ssim, m.l1, m.numTest, m.numGaussians};
+    return guarded(MsplatEvalMetrics{}, [&] {
+        auto m = static_cast<msplat::Trainer*>(t)->evaluate();
+        return MsplatEvalMetrics{m.psnr, m.ssim, m.l1, m.numTest, m.numGaussians};
+    });
 }
 
 MsplatPixelBuffer msplat_trainer_render(MsplatTrainer t, int cameraIndex, bool useTest) {
-    auto buf = static_cast<msplat::Trainer*>(t)->render(cameraIndex, useTest);
-    MsplatPixelBuffer result{buf.data, buf.width, buf.height};
-    buf.data = nullptr; // Transfer ownership to caller
-    return result;
+    return guarded(MsplatPixelBuffer{}, [&] {
+        auto buf = static_cast<msplat::Trainer*>(t)->render(cameraIndex, useTest);
+        MsplatPixelBuffer result{buf.data, buf.width, buf.height};
+        buf.data = nullptr; // Transfer ownership to caller
+        return result;
+    });
 }
 
 MsplatPixelBuffer msplat_trainer_render_pose(MsplatTrainer t, const float camToWorld[16], int refCameraIndex) {
-    auto buf = static_cast<msplat::Trainer*>(t)->renderFromPose(camToWorld, refCameraIndex);
-    MsplatPixelBuffer result{buf.data, buf.width, buf.height};
-    buf.data = nullptr;
-    return result;
+    return guarded(MsplatPixelBuffer{}, [&] {
+        auto buf = static_cast<msplat::Trainer*>(t)->renderFromPose(camToWorld, refCameraIndex);
+        MsplatPixelBuffer result{buf.data, buf.width, buf.height};
+        buf.data = nullptr;
+        return result;
+    });
 }
 
 void msplat_trainer_render_pose_to_buffer(MsplatTrainer t, const float camToWorld[16],
                                       int refCameraIndex, uint8_t* outRGBA,
                                       int* outWidth, int* outHeight) {
-    static_cast<msplat::Trainer*>(t)->renderFromPoseToBuffer(
-        camToWorld, refCameraIndex, outRGBA, outWidth, outHeight);
+    guarded_void([&] {
+        static_cast<msplat::Trainer*>(t)->renderFromPoseToBuffer(
+            camToWorld, refCameraIndex, outRGBA, outWidth, outHeight);
+    });
 }
 
 void msplat_trainer_export_ply(MsplatTrainer t, const char* path) {
-    static_cast<msplat::Trainer*>(t)->exportPly(std::string(path));
+    guarded_void([&] { static_cast<msplat::Trainer*>(t)->exportPly(std::string(path)); });
 }
 
 void msplat_trainer_export_splat(MsplatTrainer t, const char* path) {
-    static_cast<msplat::Trainer*>(t)->exportSplat(std::string(path));
+    guarded_void([&] { static_cast<msplat::Trainer*>(t)->exportSplat(std::string(path)); });
 }
 
 void msplat_trainer_save_checkpoint(MsplatTrainer t, const char* path) {
-    static_cast<msplat::Trainer*>(t)->saveCheckpoint(std::string(path));
+    guarded_void([&] { static_cast<msplat::Trainer*>(t)->saveCheckpoint(std::string(path)); });
 }
 
 int msplat_trainer_load_checkpoint(MsplatTrainer t, const char* path) {
-    return static_cast<msplat::Trainer*>(t)->loadCheckpoint(std::string(path));
+    return guarded(-1, [&] { return static_cast<msplat::Trainer*>(t)->loadCheckpoint(std::string(path)); });
 }
 
 int msplat_trainer_splat_count(MsplatTrainer t) {
-    return static_cast<msplat::Trainer*>(t)->splatCount();
+    return guarded(-1, [&] { return static_cast<msplat::Trainer*>(t)->splatCount(); });
 }
 
 int msplat_trainer_iteration(MsplatTrainer t) {
-    return static_cast<msplat::Trainer*>(t)->iteration();
+    return guarded(-1, [&] { return static_cast<msplat::Trainer*>(t)->iteration(); });
 }
 
-void msplat_sync(void) { msplat::sync(); }
-void msplat_cleanup(void) { msplat::cleanup(); }
+void msplat_sync(void) { guarded_void([] { msplat::sync(); }); }
+void msplat_cleanup(void) { guarded_void([] { msplat::cleanup(); }); }
 
 // ── Viewer (render-only, no training) ───────────────────────────────────────
 //
@@ -607,8 +649,10 @@ struct ViewerImpl {
 
 MsplatViewer msplat_viewer_create(const char* plyPath,
                                    int width, int height, float fovY) {
+    g_has_error = false;
     try {
-        auto* v = new ViewerImpl();
+        // Owned until fully built: a throw below destroys it (and the tensors it already holds).
+        auto v = std::make_unique<ViewerImpl>();
         v->width = width;
         v->height = height;
         v->fovY = fovY;
@@ -639,9 +683,12 @@ MsplatViewer msplat_viewer_create(const char* plyPath,
                 v->boundsMin[0], v->boundsMin[1], v->boundsMin[2],
                 v->boundsMax[0], v->boundsMax[1], v->boundsMax[2],
                 v->densityCenterPos[0], v->densityCenterPos[1], v->densityCenterPos[2]);
-        return static_cast<MsplatViewer>(v);
+        return static_cast<MsplatViewer>(v.release());
     } catch (const std::exception& e) {
-        fprintf(stderr, "[viewer] Failed to create viewer: %s\n", e.what());
+        set_error("viewer: ", e.what());
+        return nullptr;
+    } catch (...) {
+        set_error("viewer: ", "unknown C++ exception");
         return nullptr;
     }
 }
@@ -660,17 +707,21 @@ void msplat_viewer_set_fov(MsplatViewer v, float fovY) {
 }
 
 void msplat_viewer_set_background(MsplatViewer v, float r, float g, float b) {
-    auto* viewer = static_cast<ViewerImpl*>(v);
-    if (!viewer) return;
-    float bg[3] = {r, g, b};
-    memcpy(viewer->backgroundColor.data_ptr(), bg, sizeof(bg));
+    guarded_void([&] {
+        auto* viewer = static_cast<ViewerImpl*>(v);
+        if (!viewer) return;
+        float bg[3] = {r, g, b};
+        memcpy(viewer->backgroundColor.data_ptr(), bg, sizeof(bg));
+    });
 }
 
 void msplat_viewer_render(MsplatViewer v, const float camToWorld[16],
                            uint8_t* outRGBA) {
-    auto* viewer = static_cast<ViewerImpl*>(v);
-    if (!viewer || !outRGBA) return;
-    viewer->render(camToWorld, outRGBA);
+    guarded_void([&] {
+        auto* viewer = static_cast<ViewerImpl*>(v);
+        if (!viewer || !outRGBA) return;
+        viewer->render(camToWorld, outRGBA);
+    });
 }
 
 int msplat_viewer_splat_count(MsplatViewer v) {
@@ -692,8 +743,7 @@ void* msplat_viewer_render_buffer(MsplatViewer v, const float camToWorld[16],
     if (!viewer) { *outWidth = 0; *outHeight = 0; return nullptr; }
     if (outWidth)  *outWidth  = viewer->width;
     if (outHeight) *outHeight = viewer->height;
-    id<MTLBuffer> buf = viewer->renderBuffer(camToWorld);
-    return (__bridge void*)buf;
+    return guarded<void*>(nullptr, [&] { return (__bridge void*)viewer->renderBuffer(camToWorld); });
 }
 
 void msplat_viewer_bounds(MsplatViewer v, float boundsMin[3], float boundsMax[3]) {
@@ -711,10 +761,9 @@ void msplat_viewer_density_center(MsplatViewer v, float center[3]) {
 
 void* msplat_viewer_command_queue(MsplatViewer v) {
     (void)v;  // queue is global singleton, not per-viewer
-    return (__bridge void*)msplat_command_queue();
+    return guarded<void*>(nullptr, [] { return (__bridge void*)msplat_command_queue(); });
 }
 
 void msplat_viewer_destroy(MsplatViewer v) {
-    auto* viewer = static_cast<ViewerImpl*>(v);
-    delete viewer;
+    guarded_void([&] { delete static_cast<ViewerImpl*>(v); });
 }

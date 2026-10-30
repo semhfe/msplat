@@ -107,6 +107,15 @@ int msplat_trainer_splat_count(MsplatTrainer t);
 int msplat_trainer_iteration(MsplatTrainer t);
 void msplat_dataset_camera_pose(MsplatDataset ds, int cameraIndex, float camToWorld[16]);
 
+// ── Errors ──────────────────────────────────────────────────────────────────
+
+/// No C++ exception crosses this API. A failed call returns NULL (handles, buffers), a
+/// zeroed struct, -1 (int results) or nothing (void), and this returns its message (e.g. an
+/// out-of-memory GPU buffer allocation); NULL if the last fallible call on this thread
+/// succeeded. Every call that can fail clears it on entry; plain viewer field getters and
+/// setters (resize, set_fov, get_size, splat_count, bounds, density_center) cannot fail.
+const char* msplat_last_error(void);
+
 // ── Lifecycle ───────────────────────────────────────────────────────────────
 
 void msplat_set_metallib_path(const char* path);
