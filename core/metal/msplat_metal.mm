@@ -1225,6 +1225,13 @@ std::tuple<MTensor, float> msplat_train_step(
 
     uint32_t bwd_K_max = K_max;
     constexpr uint32_t BWD_CHUNK_SIZE = 512;
+    // A1 A/B switch: MSPLAT_LEGACY_BWD_CAP=1 restores the pre-A1 backward (skip capped gaussians).
+    static const uint32_t legacy_bwd_cap = [] {
+        const char *e = std::getenv("MSPLAT_LEGACY_BWD_CAP");
+        const uint32_t v = (e && e[0] == '1') ? 1u : 0u;
+        if (v) fprintf(stderr, "msplat: MSPLAT_LEGACY_BWD_CAP=1 (pre-A1 backward alpha-cap)\n");
+        return v;
+    }();
 
     // ========================== FORWARD ENCODE LAMBDAS ==========================
 
@@ -1365,6 +1372,7 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_BUF(enc, final_idx, 9); ENC_BUF(enc, v_rendered, 10);
             ENC_BUF(enc, v_xy, 11); ENC_BUF(enc, v_conic, 12);
             ENC_BUF(enc, v_colors_rast, 13); ENC_BUF(enc, v_opacity, 14);
+            ENC_SCALAR(enc, legacy_bwd_cap, 16);
             [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
         } else {
             // Chunked backward
@@ -1396,6 +1404,7 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_BUF(enc, v_xy, 14); ENC_BUF(enc, v_conic, 15);
             ENC_BUF(enc, v_colors_rast, 16); ENC_BUF(enc, v_opacity, 17);
             ENC_SCALAR(enc, BWD_CHUNK_SIZE, 18); ENC_SCALAR(enc, bwd_K_max, 19);
+            ENC_SCALAR(enc, legacy_bwd_cap, 20);
             [enc dispatchThreadgroups:MTLSizeMake(tile_x, tile_y, bwd_K_max) threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
         }
     };
