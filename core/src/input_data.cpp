@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <random>
 #include <cmath>
+#include <chrono>
+#include <sys/stat.h>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -72,6 +74,95 @@ void Camera::loadImage(float downscaleFactor) {
 
 MTensor& Camera::getGPUImage() {
     return gpuBaseImage;
+}
+
+// ── GT image stream (--image-stream) ────────────────────────────────────────
+//
+// Replays loadImage on a copy of the pre-load camera: the same decode, resize, undistort
+// and quantization as the resident path. Runs on worker threads, so it touches only its
+// arguments (src is immutable once shared) and gpu_empty (MTLDevice allocation is
+// thread-safe); it encodes no GPU work.
+struct FileStamp { int64_t size = -1, mtimeNs = 0; uint64_t ino = 0; };
+static FileStamp fileStamp(const std::string &path) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) throw std::runtime_error("Failed to load image: " + path);
+    return {(int64_t)st.st_size, (int64_t)st.st_mtimespec.tv_sec * 1000000000 + st.st_mtimespec.tv_nsec,
+            (uint64_t)st.st_ino};
+}
+
+void Camera::beginStream() {
+    FileStamp f = fileStamp(filePath);
+    streamSize = f.size; streamMtimeNs = f.mtimeNs; streamIno = f.ino;
+    streamSource = std::make_shared<const Camera>(*this);
+}
+
+// The bytes must be the ones the run started with: a file replaced or edited in place since
+// startup (even at the same size) is an error, checked before and after the decode.
+static void checkStamp(const Camera &src) {
+    FileStamp f = fileStamp(src.filePath);
+    if (f.size != src.streamSize || f.mtimeNs != src.streamMtimeNs || f.ino != src.streamIno)
+        throw std::runtime_error("msplat: --image-stream: " + src.filePath +
+                                 " changed since startup (size, modification time or inode differ)");
+}
+
+static MTensor decodeStreamed(const Camera &src, int width, int height, float downscaleFactor) {
+    try {
+        checkStamp(src);
+        Camera c = src;
+        c.loadImage(downscaleFactor);
+        checkStamp(src);
+        if (!c.gpuBaseImage.defined() || c.width != width || c.height != height)
+            throw std::runtime_error("msplat: --image-stream: " + src.filePath + " decodes to " +
+                                     std::to_string(c.width) + "x" + std::to_string(c.height) + ", expected " +
+                                     std::to_string(width) + "x" + std::to_string(height) +
+                                     " (file changed since startup?)");
+        return std::move(c.gpuBaseImage);
+    } catch (const std::exception &e) {
+        throw ImageStreamError(e.what());  // same message ("Failed to load image: …", "out of memory", …)
+    }
+}
+
+MTensor Camera::loadStreamedImage(float downscaleFactor) const {
+    return decodeStreamed(*streamSource, width, height, downscaleFactor);
+}
+
+void ImageStream::push(size_t idx) {
+    const Camera &cam = cams_[idx];
+    try {
+        queue_.emplace_back(idx, std::async(std::launch::async,
+            [src = cam.streamSource, w = cam.width, h = cam.height, d = downscale_] {
+                return decodeStreamed(*src, w, h, d);
+            }));
+    } catch (const std::exception &e) {  // thread start / allocation
+        throw ImageStreamError(std::string("msplat: --image-stream: cannot start a decode: ") + e.what());
+    }
+}
+
+MTensor ImageStream::pop() {
+    std::future<MTensor> &f = queue_.front().second;
+    if (f.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+        auto t0 = std::chrono::steady_clock::now();
+        f.wait();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (pops == 0) firstWaitMs = ms;  // the queue's first fill has no GPU step to hide behind
+        else { stallMs += ms; stalls++; }
+    }
+    MTensor t = f.get();
+    queue_.pop_front();
+    pops++;
+    return t;
+}
+
+uint64_t ImageStream::heldBytes() {
+    uint64_t bytes = 0;
+    for (auto &entry : queue_) {
+        MTensor t = entry.second.get();  // rethrows a failed decode: never count an absent buffer
+        bytes += t.nbytes();
+        std::promise<MTensor> ready;     // put the image back for its pop()
+        ready.set_value(std::move(t));
+        entry.second = ready.get_future();
+    }
+    return bytes;
 }
 
 // Load the per-image training mask (white = use, black = ignore). All-white

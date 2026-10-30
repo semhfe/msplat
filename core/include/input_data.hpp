@@ -4,6 +4,10 @@
 #include <string>
 #include <vector>
 #include <tuple>
+#include <deque>
+#include <future>
+#include <memory>
+#include <stdexcept>
 #include "metal_tensor.hpp"
 
 // Simple float32 RGB image — replaces cv::Mat
@@ -44,7 +48,40 @@ struct Camera {
     // extension-swapped name) — call AFTER loadImage so dimensions are final.
     void loadMask(const std::string &maskDir);
     MTensor& getGPUImage();
+    // --image-stream: the camera as it was before loadImage (metadata only). The pixels are
+    // not kept resident; loadStreamedImage() replays loadImage on a copy of it, so the GT
+    // bytes come from the same code on the same inputs as the resident gpuBaseImage.
+    std::shared_ptr<const Camera> streamSource;
+    // Size, mtime (ns) and inode of filePath when streaming began; a decode fails if they changed.
+    int64_t streamSize = -1, streamMtimeNs = 0;
+    uint64_t streamIno = 0;
+    void beginStream();          // call BEFORE loadImage: stamps the file, saves streamSource
+    MTensor loadStreamedImage(float downscaleFactor) const;
     bool hasDistortion() const { return k1 != 0 || k2 != 0 || k3 != 0 || p1 != 0 || p2 != 0; }
+};
+
+// Every --image-stream failure (missing/changed file, decode, allocation, thread start) is
+// thrown as this type, so the CLI can save the run before it exits.
+struct ImageStreamError : std::runtime_error { using std::runtime_error::runtime_error; };
+
+// --image-stream: GT images decoded from disk ahead of use instead of kept resident.
+// FIFO in consumption order: push(idx) starts an asynchronous decode of camera idx,
+// pop() returns the oldest one (waiting for it if needed: a stall). With D pushes ahead,
+// camera t+D decodes while the GPU runs steps t..t+D-1.
+class ImageStream {
+public:
+    ImageStream(const std::vector<Camera> &cams, float downscaleFactor)
+        : cams_(cams), downscale_(downscaleFactor) {}
+    void push(size_t idx);
+    size_t front() const { return queue_.front().first; }
+    MTensor pop();               // rethrows a decode error
+    uint64_t heldBytes();        // waits for the queued decodes; bytes they hold (rethrows a failure)
+    uint64_t pops = 0, stalls = 0;  // stalls: a pop after the first that had to wait
+    double stallMs = 0, firstWaitMs = 0;
+private:
+    const std::vector<Camera> &cams_;
+    float downscale_;
+    std::deque<std::pair<size_t, std::future<MTensor>>> queue_;
 };
 
 struct Points {

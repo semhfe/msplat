@@ -137,6 +137,10 @@ int main(int argc, char *argv[]) {
     bool probeMemory = false;
     app.add_flag("--probe-memory", probeMemory,
                  "Allocate all training buffers at cap, print [[PROBE]] memory line, and exit");
+    bool imageStream = false;
+    app.add_flag("--image-stream", imageStream,
+                 "Decode ground-truth images from disk ahead of each step instead of keeping all "
+                 "of them in RAM (same bytes; MSPLAT_IMAGE_STREAM_DEPTH images ahead, default 2)");
 
     CLI11_PARSE(app, argc, argv);
 
@@ -147,8 +151,11 @@ int main(int argc, char *argv[]) {
     try {
         InputData inputData = inputDataFromX(projectRoot, colmapImagePath);
 
-        for (auto &cam : inputData.cameras)
+        for (auto &cam : inputData.cameras) {
+            if (imageStream) cam.beginStream();
             cam.loadImage(downScaleFactor);
+            if (imageStream) cam.gpuBaseImage.reset();  // dims/intrinsics are final; pixels stream
+        }
 
         // Load per-image training masks (after loadImage so dims are final).
         // All-white / missing masks are dropped inside loadMask, so mask GPU
@@ -238,6 +245,60 @@ int main(int argc, char *argv[]) {
         std::iota(camIndices.begin(), camIndices.end(), 0);
         InfiniteRandomIterator<size_t> camsIter(camIndices);
 
+        // --image-stream: decode `depth` training images ahead in the iterator's order (its RNG is
+        // its own, so drawing indices early leaves the sequence unchanged).
+        std::unique_ptr<ImageStream> stream;
+        int streamDepth = 2;
+        if (const char *s = std::getenv("MSPLAT_IMAGE_STREAM_DEPTH")) streamDepth = std::max(1, atoi(s));
+        // Every stream operation runs through streamGuard: on an ImageStreamError (file gone or
+        // changed, decode/allocation/thread failure) the last completed step is saved as a PLY
+        // sidecar, which --resume reads whatever -o is, then the error goes on to the exit path.
+        size_t lastDone = 0, resumedAt = 0;  // last fully trained step; the step training started after
+        bool finalSaved = false;             // outputScene already holds the finished model
+        auto emergencySave = [&]() {
+            if (finalSaved) {
+                std::cerr << "msplat: image stream failed after training; the model is saved in " << outputScene << std::endl;
+                return;
+            }
+            if (lastDone <= resumedAt) return;  // nothing trained in this run
+            try {
+                fs::path p(outputScene);
+                p.replace_filename(p.stem().string() + "_" + std::to_string(lastDone) + ".ply");
+                model.save(p.string(), (int)lastDone);  // syncs the GPU; throws if the write fails
+                std::cerr << "msplat: image stream failed after step " << lastDone << "; saved " << p.string()
+                          << " (continue with --resume " << p.string() << ")" << std::endl;
+            } catch (const std::exception &e) {
+                std::cerr << "msplat: image stream failed and the emergency save failed too: " << e.what() << std::endl;
+            }
+        };
+        auto streamGuard = [&](auto &&op) -> decltype(op()) {
+            try {
+                return op();
+            } catch (const ImageStreamError &) {
+                emergencySave();
+                throw;
+            }
+        };
+        if (imageStream && !cams.empty()) {
+            stream = std::make_unique<ImageStream>(cams, downScaleFactor);
+            for (int i = 0; i < streamDepth; i++) streamGuard([&] { stream->push(camsIter.next()); });
+        }
+        // Evaluation ground truth (dequantized); with --image-stream decoded on demand.
+        // MSPLAT_GT_HASH=<file> logs an FNV-1a hash of every training and eval ground truth (G7).
+        FILE *gtHashLog = std::getenv("MSPLAT_GT_HASH") ? fopen(std::getenv("MSPLAT_GT_HASH"), "w") : nullptr;
+        auto gtHash = [](const MTensor &t) {
+            uint64_t h = 1469598103934665603ull;
+            const uint8_t *p = static_cast<const uint8_t *>(t.data_ptr());
+            for (size_t i = 0; i < t.nbytes(); i++) h = (h ^ p[i]) * 1099511628211ull;
+            return (unsigned long long)h;
+        };
+        auto gtCpu = [&](Camera &c) {
+            MTensor g = imageStream ? streamGuard([&] { return dequantize_gt(c.loadStreamedImage(downScaleFactor)); })
+                                    : dequantize_gt(c.getGPUImage());
+            if (gtHashLog) fprintf(gtHashLog, "eval %s %016llx %zu\n", c.filePath.c_str(), gtHash(g), g.nbytes());
+            return g;
+        };
+
         // ── Memory probe: reach peak allocation (num_active = cap), then report ──
         if (probeMemory && cams.empty()) {
             std::cerr << "No training views (--test-every 1): --probe-memory needs training views" << std::endl;
@@ -250,8 +311,9 @@ int main(int argc, char *argv[]) {
             int64_t target = (int64_t)(0.99 * capMax);
             int safetyMax = 12000;
             for (int step = 1; step <= safetyMax && model.num_active < target; step++) {
-                Camera &cam = cams[camsIter.next()];
-                MTensor gt = cam.getGPUImage();
+                if (stream) streamGuard([&] { stream->push(camsIter.next()); });
+                Camera &cam = cams[stream ? stream->front() : camsIter.next()];
+                MTensor gt = stream ? streamGuard([&] { return stream->pop(); }) : cam.getGPUImage();
                 model.fullIteration(cam, step, gt, ssimWeight);
                 model.schedulersStep(step);
                 model.mcmcAfterTrain(step);
@@ -266,6 +328,15 @@ int main(int argc, char *argv[]) {
                 uint64_t p = (uint64_t)cam.width * (uint64_t)cam.height;
                 imageBytes += p * 3;
                 if ((int64_t)p > pixels) pixels = (int64_t)p;  // per-image training resolution
+            }
+            if (stream) {
+                // Streamed: the image buffers alive now are the queued decodes (waited for), so
+                // device_allocated - images_bytes stays the image-independent working set.
+                imageBytes = streamGuard([&] { return stream->heldBytes(); });
+                // bound from the code (S1_TASARIM_NOTU §2): D+1 queued after a push, plus released GTs
+                // awaiting their command buffer (<= 3 on the legacy path, 1 on the fixed-buffer path)
+                std::cout << "[image-stream] depth=" << streamDepth << " held_bytes=" << imageBytes
+                          << " peak_bound_bytes=" << (uint64_t)(streamDepth + 4) * (uint64_t)pixels * 3 << std::endl;
             }
             uint64_t deviceAllocated = (uint64_t)[msplat_device() currentAllocatedSize];
 
@@ -296,6 +367,7 @@ int main(int argc, char *argv[]) {
 
         size_t step = 1;
         if (!resume.empty()) step = model.loadPly(resume) + 1;
+        lastDone = resumedAt = step - 1;
         if (cams.empty() && step <= (size_t)numIters) {
             // --test-every 1 puts every view in the test set: only valid for a no-training re-render (--resume at its step)
             std::cerr << "No training views (--test-every 1) but " << (numIters - step + 1) << " training steps requested" << std::endl;
@@ -325,14 +397,17 @@ int main(int argc, char *argv[]) {
         auto bench_start = cpu_now();
         for (; step <= (size_t)numIters; step++) {
             @autoreleasepool {
-            Camera &cam = cams[camsIter.next()];
+            if (stream) streamGuard([&] { stream->push(camsIter.next()); });
+            Camera &cam = cams[stream ? stream->front() : camsIter.next()];
 
             auto iter_start = cpu_now();
-            MTensor gt = cam.getGPUImage();
+            MTensor gt = stream ? streamGuard([&] { return stream->pop(); }) : cam.getGPUImage();
+            if (gtHashLog) fprintf(gtHashLog, "train %zu %d %016llx %zu\n", step, (int)(&cam - cams.data()), gtHash(gt), gt.nbytes());
             model.fullIteration(cam, step, gt, ssimWeight);
             model.schedulersStep(step);
             model.mcmcAfterTrain(step);
             msplat_commit();
+            lastDone = step;
 
             if (isectLog && step % isectEvery == 0) {
                 msplat_gpu_sync();
@@ -452,7 +527,7 @@ int main(int argc, char *argv[]) {
                     MTensor rgb = model.render(tc, step);
                     msplat_gpu_sync();
                     MTensor rgb_cpu = rgb.cpu();
-                    MTensor gt_cpu = dequantize_gt(tc.getGPUImage());
+                    MTensor gt_cpu = gtCpu(tc);
                     sum += psnr(rgb_cpu, gt_cpu);
                 }
                 double gatePsnr = sum / nSub;
@@ -485,6 +560,14 @@ int main(int argc, char *argv[]) {
                 imwriteRGB((fs::path(valRender) / (std::to_string(step) + ".png")).string(), valImg);
             }
             } // @autoreleasepool
+        }
+
+        if (stream) {
+            std::cout << "[image-stream] depth=" << streamDepth << " pops=" << stream->pops << " stalls=" << stream->stalls
+                      << " stall_ms=" << std::fixed << std::setprecision(1) << stream->stallMs
+                      << " first_wait_ms=" << stream->firstWaitMs
+                      << std::defaultfloat << std::setprecision(6) << std::endl;
+            stream.reset();  // waits for the decodes still in flight and frees their buffers
         }
 
         if (benchmarking && !bench_iter_ms.empty()) {
@@ -578,6 +661,7 @@ int main(int argc, char *argv[]) {
 
         inputData.saveCameras((fs::path(outputScene).parent_path() / "cameras.json").string(), keepCrs);
         model.save(outputScene, finalStep);
+        finalSaved = true;
 
         // Evaluation
         if (evalMode && !testCams.empty()) {
@@ -590,7 +674,7 @@ int main(int argc, char *argv[]) {
                 MTensor rgb = model.render(testCams[i], finalStep);
                 msplat_gpu_sync();
                 MTensor rgb_cpu = rgb.cpu();
-                MTensor gt_cpu = dequantize_gt(testCams[i].getGPUImage());
+                MTensor gt_cpu = gtCpu(testCams[i]);
 
                 float p = psnr(rgb_cpu, gt_cpu);
                 float s = ssim_eval(rgb_cpu, gt_cpu);
@@ -626,7 +710,7 @@ int main(int argc, char *argv[]) {
             MTensor rgb = model.render(*valCam, finalStep);
             msplat_gpu_sync();
             MTensor rgb_cpu = rgb.cpu();
-            MTensor gt_cpu = dequantize_gt(valCam->getGPUImage());
+            MTensor gt_cpu = gtCpu(*valCam);
 
             std::cout << "\n=== Validation (" << valCam->filePath << ") ===" << std::endl;
             std::cout << std::fixed << std::setprecision(4);
@@ -637,6 +721,7 @@ int main(int argc, char *argv[]) {
             std::cout << std::defaultfloat << std::setprecision(6);
         }
 
+        if (gtHashLog) fclose(gtHashLog);
         cleanup_msplat_metal();
         msplat_gpu_sync();
     } catch (const std::exception &e) {
