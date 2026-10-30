@@ -758,6 +758,14 @@ void Model::saveCheckpoint(const std::string &filename, int step) {
     for (int g = 0; g < N_ADAM_GROUPS; g++) writeTensor(f, adam_exp_avg_sq[g]);
 
     f.close();
+    if (!f) {
+        std::error_code ec;
+        const bool removed = fs::remove(filename, ec);
+        throw std::runtime_error("msplat: writing checkpoint " + filename + " failed (disk full or output removed?); " +
+                                 (removed ? std::string("partial file deleted")
+                                  : ec ? "partial file could not be deleted: " + ec.message()
+                                       : std::string("no partial file left")));
+    }
     std::cout << "Checkpoint saved: " << filename << " (step " << step
               << ", " << num_active << " gaussians, "
               << fs::file_size(filename) / (1024*1024) << " MB)" << std::endl;

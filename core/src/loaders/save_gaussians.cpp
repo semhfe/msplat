@@ -1,16 +1,36 @@
 #include "loaders.hpp"
 #include "msplat.hpp"
 #include <fstream>
+#include <filesystem>
 #include <algorithm>
 #include <numeric>
 #include <cmath>
 
 static const double C0 = 0.28209479177387814;
 
+// A save must not report success it did not have (a full disk or a removed output directory
+// used to leave a short or missing file behind a "Saved" line): check the open, then the
+// writes and the close; on failure remove the partial file and throw.
+static void openOrThrow(std::ofstream &o, const std::string &path) {
+    if (!o.is_open()) throw std::runtime_error("msplat: cannot open " + path + " for writing");
+}
+static void closeOrThrow(std::ofstream &o, const std::string &path) {
+    o.close();
+    if (!o) {
+        std::error_code ec;
+        const bool removed = std::filesystem::remove(path, ec);
+        throw std::runtime_error("msplat: writing " + path + " failed (disk full or output removed?); " +
+                                 (removed ? std::string("partial file deleted")
+                                  : ec ? "partial file could not be deleted: " + ec.message()
+                                       : std::string("no partial file left")));
+    }
+}
+
 void saveGaussianPly(const std::string &path, GaussianParams &p, int step) {
     msplat_gpu_sync();
 
     std::ofstream o(path, std::ios::binary);
+    openOrThrow(o, path);
     int64_t N = p.means.size(0);
     int numDc = (int)p.featuresDc.size(1);
     int frBases = (int)p.featuresRest.size(-2);
@@ -85,12 +105,14 @@ void saveGaussianPly(const std::string &path, GaussianParams &p, int step) {
 
         o.write(reinterpret_cast<const char*>(row.data()), floatsPerRow * sizeof(float));
     }
+    closeOrThrow(o, path);
 }
 
 void saveGaussianSplat(const std::string &path, GaussianParams &p) {
     msplat_gpu_sync();
 
     std::ofstream o(path, std::ios::binary);
+    openOrThrow(o, path);
     int64_t N = p.means.size(0);
     const float *mp = p.means.data<float>(), *sp = p.scales.data<float>(), *qp = p.quats.data<float>();
     const float *dp = p.featuresDc.data<float>(), *op = p.opacities.data<float>();
@@ -136,6 +158,7 @@ void saveGaussianSplat(const std::string &path, GaussianParams &p) {
         for (int j = 0; j < 4; j++) q[j] = (uint8_t)std::clamp(qp[i*4+j] * 128.0f + 128.0f, 0.0f, 255.0f);
         o.write(reinterpret_cast<const char*>(q), 4);
     }
+    closeOrThrow(o, path);
 }
 
 LoadedGaussians loadGaussianPly(const std::string &path, float scale, const float translation[3], bool keepCrs) {
