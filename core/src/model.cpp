@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -6,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <numeric>
 #include "model.hpp"
 #include "kdtree_tensor.hpp"
 #include "msplat.hpp"
@@ -362,8 +364,8 @@ void Model::zeroAdamAt(int idx) {
 
 // Move dead Gaussians onto alive ones (weighted by opacity) and redistribute
 // opacity/scale so total weight is preserved.
-void Model::relocate(const std::vector<int>& dead, const std::vector<int>& alive) {
-    if (dead.empty() || alive.empty()) return;
+bool Model::relocate(const std::vector<int>& dead, const std::vector<int>& alive) {
+    if (dead.empty() || alive.empty()) return false;
 
     float *sbuf = scales_buf.data<float>();
     float *obuf = opacities_buf.data<float>();
@@ -379,7 +381,7 @@ void Model::relocate(const std::vector<int>& dead, const std::vector<int>& alive
         scratch_probs_[i] = p;
         probSum += p;
     }
-    if (probSum <= 0.0) return;  // no usable sources — skip this relocation pass
+    if (probSum <= 0.0) return false;  // no usable sources — skip this relocation pass
 
     std::mt19937 rng((unsigned)(0x9E3779B9u ^ (unsigned)(++mcmc_relocation_count)));
     std::discrete_distribution<int> dist(scratch_probs_.begin(), scratch_probs_.end());
@@ -424,6 +426,11 @@ void Model::relocate(const std::vector<int>& dead, const std::vector<int>& alive
         copyGaussianRow(dst, src);
         zeroAdamAt(dst);
     }
+    if (reloc_weight) {  // B2 exemption from the next weight pass, B4 position draw
+        for (int d : dead) reloc_fresh_[d] = 1;
+        placeNear(dead);
+    }
+    return true;
 }
 
 // Grow num_active toward cap_max by ~5% per call.
@@ -482,13 +489,114 @@ int Model::addNewGaussians() {
         copyGaussianRow(dst, src);
         zeroAdamAt(dst);
     }
+    if (reloc_weight) {  // B4: grown Gaussians are placed by a draw from their source too
+        std::vector<int> fresh(num_new);
+        std::iota(fresh.begin(), fresh.end(), num_active);
+        placeNear(fresh);
+    }
 
     num_active += num_new;
     return num_new;
 }
 
+// ── Package B: relocation by maximum blending weight ────────────────────────
+
+void Model::enableBlendWeights(bool relocate) {
+    wmax_accum = true;
+    reloc_weight = relocate;
+    blend_wmax = gpu_zeros({(int64_t)buf_capacity}, DType::Float32);
+    reloc_fresh_.assign(buf_capacity, 0);
+    wmax_since = -1;
+}
+
+// A reloaded model (loadPly / loadCheckpoint into this Model) starts like a fresh one: no weights,
+// no exemptions, window not started, so its first (part-filled) window is skipped (Codex C4 #6).
+void Model::resetWeightState() {
+    if (!wmax_accum) return;
+    msplat_gpu_sync();
+    memset(blend_wmax.data_ptr(), 0, blend_wmax.nbytes());
+    std::fill(reloc_fresh_.begin(), reloc_fresh_.end(), 0);
+    wmax_since = -1;
+}
+
+// Starts a new weight window after `step` (GPU synced by the caller).
+void Model::resetBlendWeights(int step) {
+    memset(blend_wmax.data_ptr(), 0, blend_wmax.nbytes());
+    wmax_since = step;
+}
+
+// B4: each slot in dst holds a copy of its source with the Eq. 9 scale; move its mean by one draw
+// from N(0, R diag(s)^2 R^T) of that copy (the source stays where it is). Same quaternion order
+// (w, x, y, z) and log-scale clamp as the kernels. A non-finite draw keeps the source position.
+void Model::placeNear(const std::vector<int>& dst) {
+    float *m = means_buf.data<float>();
+    const float *sc = scales_buf.data<float>();
+    const float *q = quats_buf.data<float>();
+    std::mt19937 rng((unsigned)(0x85EBCA6Bu ^ (unsigned)(++place_count_)));
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (int d : dst) {
+        float qw = q[d*4], qx = q[d*4+1], qy = q[d*4+2], qz = q[d*4+3];
+        const float ql = std::sqrt(std::max(qw*qw + qx*qx + qy*qy + qz*qz, 1e-8f));
+        qw /= ql; qx /= ql; qy /= ql; qz /= ql;
+        const float z0 = nd(rng) * std::exp(std::clamp(sc[d*3],   -15.0f, 15.0f));
+        const float z1 = nd(rng) * std::exp(std::clamp(sc[d*3+1], -15.0f, 15.0f));
+        const float z2 = nd(rng) * std::exp(std::clamp(sc[d*3+2], -15.0f, 15.0f));
+        const float o0 = (1-2*(qy*qy+qz*qz))*z0 + 2*(qx*qy-qw*qz)*z1 + 2*(qx*qz+qw*qy)*z2;
+        const float o1 = 2*(qx*qy+qw*qz)*z0 + (1-2*(qx*qx+qz*qz))*z1 + 2*(qy*qz-qw*qx)*z2;
+        const float o2 = 2*(qx*qz-qw*qy)*z0 + 2*(qy*qz+qw*qx)*z1 + (1-2*(qx*qx+qy*qy))*z2;
+        if (!std::isfinite(o0) || !std::isfinite(o1) || !std::isfinite(o2)) continue;
+        m[d*3] += o0; m[d*3+1] += o1; m[d*3+2] += o2;
+    }
+}
+
+// B2 (paper sec. 4.2): moves up to share*num_active alive Gaussians with the lowest blend_wmax into
+// dead. share = 10 % until step 10k, then 10 % * exp(-((t - 10k) / 5k)^2 / 2); before step 5000
+// only Gaussians with w == 0 qualify. Slots placed by the previous relocations are exempt (the mark
+// lasts one pass). Ties: highest index first. At least one donor is always left: alive minus the
+// selection plus extra_donors (slots repaired earlier in this pass) is never empty (Codex C4 #1).
+// Returns the number selected; thr = largest w selected.
+int Model::selectByWeight(int step, std::vector<int>& dead, std::vector<int>& alive, float& thr,
+                          size_t extra_donors) {
+    double share = 0.10;
+    if (step >= 10000) { const double u = (step - 10000) / 5000.0; share *= std::exp(-0.5 * u * u); }
+    const size_t kmax = (size_t)(share * num_active);
+    // float bits: non-negative floats order like their bit patterns, w == 0 <=> bits == 0
+    const uint32_t *w = static_cast<const uint32_t *>(blend_wmax.data_ptr());
+    std::vector<uint64_t> key;
+    key.reserve(alive.size());
+    for (int i : alive) {
+        if (reloc_fresh_[i] || (step < 5000 && w[i] != 0)) continue;
+        key.push_back(((uint64_t)w[i] << 32) | (uint64_t)(~(uint32_t)i));
+    }
+    std::fill(reloc_fresh_.begin(), reloc_fresh_.end(), 0);
+    const size_t pool = alive.size() + extra_donors;
+    const size_t k = std::min({key.size(), kmax, pool > 0 ? pool - 1 : (size_t)0});
+    thr = 0.0f;
+    if (k == 0) return 0;
+    std::nth_element(key.begin(), key.begin() + (k - 1), key.end());
+    const uint32_t tb = (uint32_t)(key[k - 1] >> 32);
+    memcpy(&thr, &tb, sizeof(thr));
+    std::vector<uint8_t> moved(buf_capacity, 0);
+    for (size_t j = 0; j < k; j++) {
+        const int i = (int)~(uint32_t)(key[j] & 0xffffffffu);
+        moved[i] = 1;
+        dead.push_back(i);
+    }
+    alive.erase(std::remove_if(alive.begin(), alive.end(), [&](int i) { return moved[i] != 0; }), alive.end());
+    return (int)k;
+}
+
 void Model::mcmcAfterTrain(int step) {
-    if (step < 500 || step % 100 != 0) return;
+    // B5: blend_wmax is zero from allocation, so the first window holds this run's steps from here
+    // on (a resumed run never relocates on a part-filled window: see wfull below).
+    if (wmax_accum && wmax_since < 0) wmax_since = step - 1;
+    // Weight windows are the 400-step blocks; the one ending at step 400 is rolled although no
+    // MCMC pass runs before step 500.
+    const bool wwin = wmax_accum && step % 400 == 0 && step < (int)(maxSteps * 0.833f);
+    if (step < 500 || step % 100 != 0) {
+        if (wwin) { msplat_gpu_sync(); resetBlendWeights(step); }
+        return;
+    }
     // Reference MCMC: densify_until_iter = 25000 out of 30000 (83.3%).
     // Stop relocation/growth in the final steps for pure fine-tuning.
     if (step >= (int)(maxSteps * 0.833f)) return;
@@ -542,7 +650,8 @@ void Model::mcmcAfterTrain(int step) {
         }
 
         float sig = 1.0f / (1.0f + std::exp(-op[i]));
-        bool is_dead = !finite || (sig <= 0.005f);
+        // weight mode: no opacity threshold; non-finite and culled Gaussians stay dead every pass
+        bool is_dead = !finite || (!reloc_weight && sig <= 0.005f);
         if (!is_dead && r2 > 0.0f) {
             float x = mn[i*3 + 0], y = mn[i*3 + 1], z = mn[i*3 + 2];
             if (x*x + y*y + z*z > r2) { is_dead = true; culled++; }
@@ -552,10 +661,45 @@ void Model::mcmcAfterTrain(int step) {
     }
 
     int dead_count = (int)dead.size();
-    if (!dead.empty() && !alive.empty()) relocate(dead, alive);
+    const bool repaired = !dead.empty() && !alive.empty() && relocate(dead, alive);
+    if (wwin) {
+        // B2 on a full window only (B5), then B6: one line per window. The safety repairs above run
+        // first (Codex C4 #1): the weight pass draws from the survivors plus the slots just repaired
+        // and always leaves a donor, so it can never use up the source a nonfinite slot needs.
+        const bool wfull = step - wmax_since >= 400;
+        float thr = 0.0f;
+        int moved = 0;
+        if (reloc_weight && wfull) {
+            std::vector<int> wdead;
+            moved = selectByWeight(step, wdead, alive, thr, repaired ? dead.size() : 0);
+            if (repaired) for (int d : dead) reloc_fresh_[d] = 1;  // the selection consumed every mark
+            if (!wdead.empty()) {
+                if (repaired) alive.insert(alive.end(), dead.begin(), dead.end());
+                if (!relocate(wdead, alive)) moved = 0;
+                dead_count += moved;
+            }
+        }
+        std::vector<float> w(static_cast<const float *>(blend_wmax.data_ptr()),
+                             static_cast<const float *>(blend_wmax.data_ptr()) + num_active);
+        const size_t zeros = (size_t)std::count(w.begin(), w.end(), 0.0f);
+        auto pct = [&](double p) {
+            if (w.empty()) return 0.0f;
+            auto it = w.begin() + (ptrdiff_t)std::min(w.size() - 1, (size_t)(p * (double)w.size()));
+            std::nth_element(w.begin(), it, w.end());
+            return *it;
+        };
+        std::cout << "MCMC wmax step=" << step << " window=" << (step - wmax_since)
+                  << " mode=" << (reloc_weight ? "weight" : "accum")
+                  << " full=" << (wfull ? 1 : 0) << " moved=" << moved << " thr=" << thr
+                  << " zero=" << zeros << " p1=" << pct(0.01) << " p10=" << pct(0.10)
+                  << " p50=" << pct(0.50) << " p90=" << pct(0.90)
+                  << " active=" << num_active << std::endl;
+    }
+
     int grown = addNewGaussians();
 
     if (dead_count > 0 || grown > 0) refreshViews();
+    if (wwin) resetBlendWeights(step);
 
     // Throttle stdout to every 1000 steps — matches the step-timer output cadence.
     if (step % 1000 == 0) {
@@ -683,6 +827,7 @@ int Model::loadPly(const std::string &filename){
     opacities = g.opacities;
     // decimateSeeds=false: these are trained gaussians, not SfM seeds.
     setupOptimizers(false);
+    resetWeightState();
     return g.step;
 }
 
@@ -836,6 +981,7 @@ int Model::loadCheckpoint(const std::string &filename) {
     sgld_noise_buf = gpu_empty({(int64_t)cap_max * 3}, DType::Float32);
 
     refreshViews();
+    resetWeightState();
 
     std::cout << "Checkpoint loaded: " << filename << " (step " << step
               << ", " << num_active << " gaussians)" << std::endl;
@@ -956,7 +1102,8 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
         // from step 500 the quat-moment junk test is meaningful.
         (step >= 500) ? opacity_reg : 0.0f,
         (step >= 500) ? scale_reg : 0.0f,
-        reg_visibility_duty);
+        reg_visibility_duty,
+        wmax_accum ? &blend_wmax : nullptr);
 
     radii = r;
 

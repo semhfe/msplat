@@ -1288,7 +1288,8 @@ std::tuple<MTensor, float> msplat_train_step(
     MTensor adam_params[], MTensor adam_exp_avg[], MTensor adam_exp_avg_sq[],
     float adam_step_sizes[], float adam_bc2_sqrts[],
     float adam_beta1, float adam_beta2, float adam_eps,
-    float mcmc_op_reg, float mcmc_sc_reg, float mcmc_reg_invis_scale
+    float mcmc_op_reg, float mcmc_sc_reg, float mcmc_reg_invis_scale,
+    MTensor *blend_wmax
 ) {
     MetalContext* ctx = get_global_context();
     int tile_bounds_x = std::get<0>(tile_bounds);
@@ -1379,6 +1380,10 @@ std::tuple<MTensor, float> msplat_train_step(
         if (v) fprintf(stderr, "msplat: MSPLAT_LEGACY_BWD_CAP=1 (pre-A1 backward alpha-cap)\n");
         return v;
     }();
+
+    // B1: off = flag 0 and v_opacity as a dummy binding the kernels never write through
+    const uint32_t wmax_on = blend_wmax ? 1u : 0u;
+    MTensor &wmax_buf = blend_wmax ? *blend_wmax : v_opacity;
 
     // ========================== FORWARD ENCODE LAMBDAS ==========================
 
@@ -1520,6 +1525,7 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_BUF(enc, v_xy, 11); ENC_BUF(enc, v_conic, 12);
             ENC_BUF(enc, v_colors_rast, 13); ENC_BUF(enc, v_opacity, 14);
             ENC_SCALAR(enc, legacy_bwd_cap, 16);
+            ENC_BUF(enc, wmax_buf, 17); ENC_SCALAR(enc, wmax_on, 18);
             [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
         } else {
             // Chunked backward
@@ -1552,6 +1558,7 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_BUF(enc, v_colors_rast, 16); ENC_BUF(enc, v_opacity, 17);
             ENC_SCALAR(enc, BWD_CHUNK_SIZE, 18); ENC_SCALAR(enc, bwd_K_max, 19);
             ENC_SCALAR(enc, legacy_bwd_cap, 20);
+            ENC_BUF(enc, wmax_buf, 21); ENC_SCALAR(enc, wmax_on, 22);
             [enc dispatchThreadgroups:MTLSizeMake(tile_x, tile_y, bwd_K_max) threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
         }
     };

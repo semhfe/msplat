@@ -117,6 +117,20 @@ struct Model{
   // Default 30000 (reference MCMC). Partitioned training sets this to the cell's iteration count.
   int position_lr_max_steps_ = 30000;
 
+  // Package B (--reloc-mode weight; Hofer et al., arXiv 2610.13541, sec. 4.2-4.3; off by default).
+  // blend_wmax[i] = max of alpha*T over the training pixels rendered since step wmax_since (float
+  // bits, written by the rasterizer backward with an atomic max; +4 B per Gaussian of cap).
+  // reloc_weight: relocate by blend_wmax every 400 steps instead of the 0.005 opacity threshold,
+  // and place every new Gaussian (grown or relocated) by one draw from its source's covariance.
+  // wmax_accum without reloc_weight (MSPLAT_WMAX_ACCUM=1): accumulate and log only (G2/G5 tooling).
+  bool reloc_weight = false;
+  bool wmax_accum = false;
+  MTensor blend_wmax;
+  int wmax_since = -1;               // -1: not started; else the last step whose weights were cleared
+  std::vector<uint8_t> reloc_fresh_; // slot placed by a relocation: exempt from the next weight pass
+  int place_count_ = 0;              // RNG stream for position sampling (independent of relocation's)
+  void enableBlendWeights(bool relocate);
+
   float scale;
   float translation[3] = {};
 
@@ -124,7 +138,12 @@ struct Model{
   void zeroAdamAt(int idx);
 
 private:
-  void relocate(const std::vector<int>& dead_indices, const std::vector<int>& alive_indices);
+  bool relocate(const std::vector<int>& dead_indices, const std::vector<int>& alive_indices);
+  void placeNear(const std::vector<int>& dst);
+  int selectByWeight(int step, std::vector<int>& dead, std::vector<int>& alive, float& thr,
+                     size_t extra_donors = 0);
+  void resetWeightState();
+  void resetBlendWeights(int step);
   int addNewGaussians();
   void computeRelocation(float opacity_old_sig, float* scale_old_exp, int N,
                          float& opacity_new_sig, float* scale_new_exp);

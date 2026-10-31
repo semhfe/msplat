@@ -80,6 +80,12 @@ int main(int argc, char *argv[]) {
         ->check(CLI::Range(10000, 10000000));
     float noiseLr = 5e5f;
     app.add_option("--noise-lr", noiseLr, "SGLD noise learning rate");
+    std::string relocMode = "opacity";
+    app.add_option("--reloc-mode", relocMode,
+                   "MCMC relocation: opacity = 0.005 opacity threshold every 100 steps (default); weight = the "
+                   "lowest max blending weights every 400 steps, new Gaussians placed by a draw from their "
+                   "source's covariance (arXiv 2610.13541; needs --noise-lr 0)")
+        ->check(CLI::IsMember({"opacity", "weight"}));
     float opacityReg = 0.01f;
     app.add_option("--opacity-reg", opacityReg, "Opacity regularization weight");
     float scaleReg = 0.01f;
@@ -144,6 +150,20 @@ int main(int argc, char *argv[]) {
 
     CLI11_PARSE(app, argc, argv);
 
+    // Package B: weight relocation replaces the position noise (B3), and its weights need the A1
+    // backward (T walked back past capped Gaussians); MSPLAT_WMAX_ACCUM=1 accumulates and logs the
+    // weights in opacity mode without using them (tooling).
+    const bool relocWeight = relocMode == "weight";
+    const bool wmaxAccum = relocWeight || (std::getenv("MSPLAT_WMAX_ACCUM") && std::getenv("MSPLAT_WMAX_ACCUM")[0] == '1');
+    if (relocWeight && noiseLr != 0.0f) {
+        std::cerr << "--reloc-mode weight replaces the SGLD position noise: add --noise-lr 0" << std::endl;
+        return 1;
+    }
+    if (wmaxAccum && std::getenv("MSPLAT_LEGACY_BWD_CAP") && std::getenv("MSPLAT_LEGACY_BWD_CAP")[0] == '1') {
+        std::cerr << "blend weights need the A1 backward; unset MSPLAT_LEGACY_BWD_CAP" << std::endl;
+        return 1;
+    }
+
     if (validate || !valRender.empty()) validate = true;
     if (!valRender.empty() && !fs::exists(valRender)) fs::create_directories(valRender);
     downScaleFactor = std::max(downScaleFactor, 1.0f);
@@ -196,6 +216,7 @@ int main(int argc, char *argv[]) {
                      initOpacity, initScaleMult);
         model.cull_radius = cullRadius;
         model.reg_visibility_duty = regVisibilityDuty;
+        if (wmaxAccum) model.enableBlendWeights(relocWeight);
         if (regVisibilityDuty < 1.0f) {
             std::cout << "[mcmc] reg visibility duty = " << regVisibilityDuty
                       << " (invisible-Gaussian reg scaled; 1.0 = reference)" << std::endl;
@@ -216,6 +237,18 @@ int main(int argc, char *argv[]) {
         int minTiles = INT_MAX;
         for (const auto &c : inputData.cameras)
             minTiles = std::min(minTiles, ((c.width + BLOCK_X - 1) / BLOCK_X) * ((c.height + BLOCK_Y - 1) / BLOCK_Y));
+        if (wmaxAccum && minTiles < 400) {
+            // Views under 400 tiles take the chunked backward, whose per-pixel early return (before the
+            // cooperative batch loads; extra patch A6, not applied) leaves threadgroup slots stale: the
+            // weights there are not trustworthy, so they may not drive relocation.
+            if (relocWeight) {
+                std::cerr << "--reloc-mode weight needs every view >= 400 tiles (smallest has " << minTiles
+                          << "): the chunked backward lacks fix A6" << std::endl;
+                return 1;
+            }
+            std::cerr << "warning: MSPLAT_WMAX_ACCUM on a chunked view (" << minTiles << " tiles): weights are only "
+                         "correct with fix A6" << std::endl;
+        }
         if (isectBudget > 0 && minTiles < 400) {
             std::cout << "[isect] legacy buffers: smallest view has " << minTiles << " tiles (< 400)" << std::endl;
         } else if (isectBudget > 0) {
@@ -469,6 +502,10 @@ int main(int argc, char *argv[]) {
                         {"means", &model.means}, {"scales", &model.scales}, {"quats", &model.quats},
                         {"featuresDc", &model.featuresDc}, {"featuresRest", &model.featuresRest},
                         {"opacities", &model.opacities}};
+                    if (model.wmax_accum) {  // B1: max alpha*T since the last window reset (float bits)
+                        FILE *f = fopen((std::string(dumpDir) + "/blend_wmax.bin").c_str(), "wb");
+                        if (f) { fwrite(model.blend_wmax.data_ptr(), sizeof(float), model.num_active, f); fclose(f); }
+                    }
                     for (auto &p : params) {
                         FILE *f = fopen((std::string(dumpDir) + "/" + p.first + ".bin").c_str(), "wb");
                         if (f) { fwrite(p.second->data_ptr(), 1, p.second->nbytes(), f); fclose(f); }

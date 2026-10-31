@@ -91,7 +91,11 @@ std::tuple<MTensor, float> msplat_train_step(
     // terms, torch-mean normalization). Pass 0,0 to disable. invis_scale = reg
     // multiplier for Gaussians invisible in the current view (visibility duty-cycle
     // correction for sparse-visibility captures; 1.0 = exact reference).
-    float mcmc_op_reg, float mcmc_sc_reg, float mcmc_reg_invis_scale
+    float mcmc_op_reg, float mcmc_sc_reg, float mcmc_reg_invis_scale,
+    // Package B1: when non-null, the rasterizer backward also writes, per gaussian, the max over this
+    // view's pixels of its blending weight alpha*T into this [>= N] float buffer (atomic max on the
+    // float bits; the caller zeroes it). nullptr = off (the buffer is not touched).
+    MTensor *blend_wmax = nullptr
 );
 
 // MCMC: fill an N*3 noise buffer with N(0,1) samples on GPU (PCG+Box-Muller).

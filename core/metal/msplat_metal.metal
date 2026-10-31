@@ -946,6 +946,8 @@ kernel void rasterize_backward_kernel(
     device atomic_float* v_opacity,
     constant uint2& tile_range,  // tile group [x, y)
     constant uint& legacy_bwd_cap,  // 1 = pre-A1 behaviour (MSPLAT_LEGACY_BWD_CAP=1)
+    device atomic_uint* blend_wmax, // B1: per-gaussian max of alpha*T (float bits); dummy when wmax_on == 0
+    constant uint& wmax_on,         // B1: 1 = accumulate blend_wmax (--reloc-mode weight / MSPLAT_WMAX_ACCUM)
     uint3 gp [[thread_position_in_grid]],
     uint3 blockIdx [[threadgroup_position_in_grid]],
     uint tr [[thread_index_in_threadgroup]],
@@ -1082,6 +1084,7 @@ kernel void rasterize_backward_kernel(
             float3 v_conic_local = {0.f, 0.f, 0.f};
             float2 v_xy_local = {0.f, 0.f};
             float v_opacity_local = 0.f;
+            float w_local = 0.f;  // B1: this lane's blending weight alpha*T of b_id
             //initialize everything to 0, only set if the lane is valid
             // A1 (upstream v1.1.4): the forward multiplied T by (1 - alpha) with the same
             // clamped alpha, so T must be walked back for every contributing gaussian,
@@ -1091,6 +1094,7 @@ kernel void rasterize_backward_kernel(
                 float ra = 1.f / (1.f - alpha);
                 T *= ra;
                 const float fac = alpha * T;
+                w_local = fac;
                 v_rgb_local = fac * v_out;
 
                 // b_rgb has raw SH output; clamp inline: max(raw + 0.5, 0)
@@ -1121,8 +1125,14 @@ kernel void rasterize_backward_kernel(
             v_conic_local = warpSum3(v_conic_local, warp_size, wr);
             v_xy_local = warpSum2(v_xy_local, warp_size, wr);
             v_opacity_local = warpSum(v_opacity_local, warp_size, wr);
+            // B1: warp max (wmax_on is uniform, so every lane takes the collective). fac >= 0, and the
+            // bits of non-negative floats order like the floats, so the uint atomic max is the float max
+            // (order-independent: deterministic). NaN fails w > 0 and is never written.
+            if (wmax_on != 0u) w_local = simd_max(w_local);
 
             if (wr == 0) {
+                if (wmax_on != 0u && w_local > 0.f)
+                    atomic_fetch_max_explicit(blend_wmax + b_id, as_type<uint>(w_local), memory_order_relaxed);
                 // Fused clamp_min backward: zero gradient where raw_color + 0.5 < 0
                 if (b_rgb.x + 0.5f >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 0, v_rgb_local.x, memory_order_relaxed);
                 if (b_rgb.y + 0.5f >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 1, v_rgb_local.y, memory_order_relaxed);
@@ -3205,6 +3215,8 @@ kernel void rasterize_backward_chunked_kernel(
     constant uint& chunk_size,
     constant uint& K_max,
     constant uint& legacy_bwd_cap,  // 1 = pre-A1 behaviour (MSPLAT_LEGACY_BWD_CAP=1)
+    device atomic_uint* blend_wmax, // B1, see rasterize_backward_kernel
+    constant uint& wmax_on,
     uint3 gp [[thread_position_in_grid]],
     uint3 blockIdx [[threadgroup_position_in_grid]],
     uint tr [[thread_index_in_threadgroup]],
@@ -3331,12 +3343,14 @@ kernel void rasterize_backward_chunked_kernel(
             float3 v_conic_local = {0.f, 0.f, 0.f};
             float2 v_xy_local = {0.f, 0.f};
             float v_opacity_local = 0.f;
+            float w_local = 0.f;  // B1
 
             // A1: see rasterize_backward_kernel — walk T back for capped gaussians too.
             if (valid && (legacy_bwd_cap == 0u || alpha < 0.999f)) {
                 float ra = 1.f / (1.f - alpha);
                 T *= ra;
                 const float fac = alpha * T;
+                w_local = fac;
                 v_rgb_local = fac * v_out;
 
                 const float3 rgb = max(b_rgb + 0.5f, 0.f);
@@ -3360,8 +3374,14 @@ kernel void rasterize_backward_chunked_kernel(
             v_conic_local = warpSum3(v_conic_local, warp_size, wr);
             v_xy_local = warpSum2(v_xy_local, warp_size, wr);
             v_opacity_local = warpSum(v_opacity_local, warp_size, wr);
+            // B1: warp max (wmax_on is uniform, so every lane takes the collective). fac >= 0, and the
+            // bits of non-negative floats order like the floats, so the uint atomic max is the float max
+            // (order-independent: deterministic). NaN fails w > 0 and is never written.
+            if (wmax_on != 0u) w_local = simd_max(w_local);
 
             if (wr == 0) {
+                if (wmax_on != 0u && w_local > 0.f)
+                    atomic_fetch_max_explicit(blend_wmax + b_id, as_type<uint>(w_local), memory_order_relaxed);
                 if (b_rgb.x + 0.5f >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 0, v_rgb_local.x, memory_order_relaxed);
                 if (b_rgb.y + 0.5f >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 1, v_rgb_local.y, memory_order_relaxed);
                 if (b_rgb.z + 0.5f >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 2, v_rgb_local.z, memory_order_relaxed);
