@@ -120,6 +120,9 @@ struct Model{
   float scale;
   float translation[3] = {};
 
+  void copyGaussianRow(int dst, int src);
+  void zeroAdamAt(int idx);
+
 private:
   void relocate(const std::vector<int>& dead_indices, const std::vector<int>& alive_indices);
   int addNewGaussians();

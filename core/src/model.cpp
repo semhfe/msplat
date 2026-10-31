@@ -331,26 +331,42 @@ void Model::computeRelocation(float opacity_old_sig, float* scale_old_exp, int N
         scale_new_exp[i] = (float)((double)scale_old_exp[i] * coeff);
 }
 
-// Move dead Gaussians onto alive ones (weighted by opacity) and redistribute
-// opacity/scale so total weight is preserved.
-void Model::relocate(const std::vector<int>& dead, const std::vector<int>& alive) {
-    if (dead.empty() || alive.empty()) return;
-
+// One Gaussian row, slot src -> slot dst, in every parameter buffer: the only place a Gaussian's
+// parameters are copied between slots (relocation and growth; Q extends it to the quantized store).
+// Same bytes in the same order as the former inline copies. Precondition: GPU synced, src != dst,
+// both < buf_capacity. Adam state is not touched; callers reset it with zeroAdamAt(dst).
+void Model::copyGaussianRow(int dst, int src) {
     float *mbuf = means_buf.data<float>();
     float *sbuf = scales_buf.data<float>();
     float *qbuf = quats_buf.data<float>();
     float *fdcbuf = featuresDc_buf.data<float>();
     float *frbuf = featuresRest_buf.data<float>();
     float *obuf = opacities_buf.data<float>();
-    int64_t fr_stride = featuresRest_buf.stride0();
+    const int64_t fr_stride = featuresRest_buf.stride0();
+    memcpy(mbuf + dst*3,   mbuf + src*3,   3 * sizeof(float));
+    memcpy(qbuf + dst*4,   qbuf + src*4,   4 * sizeof(float));
+    memcpy(fdcbuf + dst*3, fdcbuf + src*3, 3 * sizeof(float));
+    memcpy(frbuf + dst*fr_stride, frbuf + src*fr_stride, fr_stride * sizeof(float));
+    obuf[dst] = obuf[src];
+    memcpy(sbuf + dst*3, sbuf + src*3, 3 * sizeof(float));
+}
 
-    auto zeroAdamAt = [&](int idx) {
-        for (int g = 0; g < N_ADAM_GROUPS; g++) {
-            int64_t st = adam_exp_avg_buf[g].stride0();
-            memset(adam_exp_avg_buf[g].data<float>() + idx * st, 0, st * sizeof(float));
-            memset(adam_exp_avg_sq_buf[g].data<float>() + idx * st, 0, st * sizeof(float));
-        }
-    };
+// Zero both Adam moments of slot idx in every group.
+void Model::zeroAdamAt(int idx) {
+    for (int g = 0; g < N_ADAM_GROUPS; g++) {
+        int64_t st = adam_exp_avg_buf[g].stride0();
+        memset(adam_exp_avg_buf[g].data<float>() + idx * st, 0, st * sizeof(float));
+        memset(adam_exp_avg_sq_buf[g].data<float>() + idx * st, 0, st * sizeof(float));
+    }
+}
+
+// Move dead Gaussians onto alive ones (weighted by opacity) and redistribute
+// opacity/scale so total weight is preserved.
+void Model::relocate(const std::vector<int>& dead, const std::vector<int>& alive) {
+    if (dead.empty() || alive.empty()) return;
+
+    float *sbuf = scales_buf.data<float>();
+    float *obuf = opacities_buf.data<float>();
 
     // Weighted sample of source alive-indices, one per dead slot.
     // Non-finite weights are UB for std::discrete_distribution. After A.1 all
@@ -405,12 +421,7 @@ void Model::relocate(const std::vector<int>& dead, const std::vector<int>& alive
     for (size_t i = 0; i < dead.size(); i++) {
         int dst = dead[i];
         int src = alive[chosen_alive[i]];
-        memcpy(mbuf + dst*3,   mbuf + src*3,   3 * sizeof(float));
-        memcpy(qbuf + dst*4,   qbuf + src*4,   4 * sizeof(float));
-        memcpy(fdcbuf + dst*3, fdcbuf + src*3, 3 * sizeof(float));
-        memcpy(frbuf + dst*fr_stride, frbuf + src*fr_stride, fr_stride * sizeof(float));
-        obuf[dst] = obuf[src];
-        memcpy(sbuf + dst*3, sbuf + src*3, 3 * sizeof(float));
+        copyGaussianRow(dst, src);
         zeroAdamAt(dst);
     }
 }
@@ -421,21 +432,8 @@ int Model::addNewGaussians() {
     int num_new = target - num_active;
     if (num_new <= 0) return 0;
 
-    float *mbuf = means_buf.data<float>();
     float *sbuf = scales_buf.data<float>();
-    float *qbuf = quats_buf.data<float>();
-    float *fdcbuf = featuresDc_buf.data<float>();
-    float *frbuf = featuresRest_buf.data<float>();
     float *obuf = opacities_buf.data<float>();
-    int64_t fr_stride = featuresRest_buf.stride0();
-
-    auto zeroAdamAt = [&](int idx) {
-        for (int g = 0; g < N_ADAM_GROUPS; g++) {
-            int64_t st = adam_exp_avg_buf[g].stride0();
-            memset(adam_exp_avg_buf[g].data<float>() + idx * st, 0, st * sizeof(float));
-            memset(adam_exp_avg_sq_buf[g].data<float>() + idx * st, 0, st * sizeof(float));
-        }
-    };
 
     scratch_probs_.resize(num_active);
     double probSum = 0.0;
@@ -481,12 +479,7 @@ int Model::addNewGaussians() {
     for (int i = 0; i < num_new; i++) {
         int dst = num_active + i;
         int src = chosen_src[i];
-        memcpy(mbuf + dst*3,   mbuf + src*3,   3 * sizeof(float));
-        memcpy(qbuf + dst*4,   qbuf + src*4,   4 * sizeof(float));
-        memcpy(fdcbuf + dst*3, fdcbuf + src*3, 3 * sizeof(float));
-        memcpy(frbuf + dst*fr_stride, frbuf + src*fr_stride, fr_stride * sizeof(float));
-        obuf[dst] = obuf[src];
-        memcpy(sbuf + dst*3, sbuf + src*3, 3 * sizeof(float));
+        copyGaussianRow(dst, src);
         zeroAdamAt(dst);
     }
 
