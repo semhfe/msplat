@@ -602,8 +602,11 @@ int main(int argc, char *argv[]) {
         if (stream) {
             std::cout << "[image-stream] depth=" << streamDepth << " pops=" << stream->pops << " stalls=" << stream->stalls
                       << " stall_ms=" << std::fixed << std::setprecision(1) << stream->stallMs
-                      << " first_wait_ms=" << stream->firstWaitMs
-                      << std::defaultfloat << std::setprecision(6) << std::endl;
+                      << " first_wait_ms=" << stream->firstWaitMs << std::defaultfloat << std::setprecision(6);
+            if (std::getenv("MSPLAT_IMAGE_STREAM_RECYCLE"))
+                std::cout << " recycled=" << stream->recycled << " recycle_violations=" << stream->recycleViolations
+                          << " recycle_size_miss=" << stream->recycleSizeMiss;
+            std::cout << std::endl;
             stream.reset();  // waits for the decodes still in flight and frees their buffers
         }
 

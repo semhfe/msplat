@@ -21,25 +21,28 @@ using json = nlohmann::json;
 // copy into a Metal buffer, and immediately discard the temporary. Only one
 // allocation persists per camera: the gpuBaseImage MTensor.
 
-void Camera::loadImage(float downscaleFactor) {
-    Image raw = imreadRGB(filePath);
+void Camera::loadImage(float downscaleFactor, bool fusedDecode, MTensor into) {
+    const bool fused = fusedDecode && downscaleFactor > 1.0f;
+    int rawW, rawH;
+    Image raw = fused ? imreadRGBArea(filePath, downscaleFactor, rawW, rawH) : imreadRGB(filePath);
+    if (!fused) { rawW = raw.width; rawH = raw.height; }
     if (raw.empty()) return;
 
     // If actual image dimensions differ from metadata, rescale intrinsics
-    if (width > 0 && height > 0 && (raw.width != width || raw.height != height)) {
-        float sx = (float)raw.width / (float)width;
-        float sy = (float)raw.height / (float)height;
+    if (width > 0 && height > 0 && (rawW != width || rawH != height)) {
+        float sx = (float)rawW / (float)width;
+        float sy = (float)rawH / (float)height;
         fx *= sx; fy *= sy; cx *= sx; cy *= sy;
-        width = raw.width; height = raw.height;
+        width = rawW; height = rawH;
     } else if (width == 0 || height == 0) {
-        width = raw.width; height = raw.height;
+        width = rawW; height = rawH;
     }
 
-    // Downscale
+    // Downscale (already done by imreadRGBArea when fused: width == rawW here, same newW/newH)
     if (downscaleFactor > 1.0f) {
         int newW = (int)(width / downscaleFactor);
         int newH = (int)(height / downscaleFactor);
-        raw = resizeArea(raw, newW, newH);
+        if (!fused) raw = resizeArea(raw, newW, newH);
         // Scale intrinsics by the true resize ratio: int(W/d) truncates, so
         // 1/d misregisters camera and image by up to 0.5–0.75 px at the far edge.
         float sx = (float)newW / (float)width;
@@ -64,7 +67,14 @@ void Camera::loadImage(float downscaleFactor) {
     // Cuts per-pixel GT storage from 12 bytes (Float32×3) to 3 bytes (uint8×3).
     // Metal loss/SSIM kernels cast back to float on-the-fly at read time.
     size_t N = (size_t)raw.width * (size_t)raw.height;
-    gpuBaseImage = gpu_empty({raw.height, raw.width, 3}, DType::UInt8);
+    // Only an explicit destination (--image-stream recycling) is reused, and only when its shape
+    // matches; every byte is written below, so the result is the same as a fresh buffer. A plain
+    // reload always allocates, so tensors still holding the previous image never see it change.
+    if (into.defined() && into.dtype() == DType::UInt8 && into.nbytes() == N * 3 &&
+        into.size(0) == raw.height && into.size(1) == raw.width)
+        gpuBaseImage = std::move(into);
+    else
+        gpuBaseImage = gpu_empty({raw.height, raw.width, 3}, DType::UInt8);
     uint8_t* dst = static_cast<uint8_t*>(gpuBaseImage.data_ptr());
     const float* src = raw.ptr();
     for (size_t i = 0; i < N * 3; ++i)
@@ -105,11 +115,18 @@ static void checkStamp(const Camera &src) {
                                  " changed since startup (size, modification time or inode differ)");
 }
 
-static MTensor decodeStreamed(const Camera &src, int width, int height, float downscaleFactor) {
+// MSPLAT_IMAGE_STREAM_FUSED=1: stream decodes use imreadRGBArea (same bytes, no full-size float image).
+static bool streamFused() {
+    static const bool v = [] { const char *e = std::getenv("MSPLAT_IMAGE_STREAM_FUSED"); return e && e[0] == '1'; }();
+    return v;
+}
+
+static MTensor decodeStreamed(const Camera &src, int width, int height, float downscaleFactor,
+                              MTensor into = MTensor()) {
     try {
         checkStamp(src);
         Camera c = src;
-        c.loadImage(downscaleFactor);
+        c.loadImage(downscaleFactor, streamFused(), std::move(into));  // undefined into: loadImage allocates
         checkStamp(src);
         if (!c.gpuBaseImage.defined() || c.width != width || c.height != height)
             throw std::runtime_error("msplat: --image-stream: " + src.filePath + " decodes to " +
@@ -130,8 +147,9 @@ void ImageStream::push(size_t idx) {
     const Camera &cam = cams_[idx];
     try {
         queue_.emplace_back(idx, std::async(std::launch::async,
-            [src = cam.streamSource, w = cam.width, h = cam.height, d = downscale_] {
-                return decodeStreamed(*src, w, h, d);
+            [src = cam.streamSource, w = cam.width, h = cam.height, d = downscale_,
+             into = takeFree((size_t)cam.width * (size_t)cam.height * 3)] {
+                return decodeStreamed(*src, w, h, d, into);
             }));
     } catch (const std::exception &e) {  // thread start / allocation
         throw ImageStreamError(std::string("msplat: --image-stream: cannot start a decode: ") + e.what());
@@ -150,7 +168,33 @@ MTensor ImageStream::pop() {
     MTensor t = f.get();
     queue_.pop_front();
     pops++;
+    if (recycle_) {
+        // The previous image's step is fully encoded and committed by now; its buffer is free
+        // once a full sync completes after this point (see takeFree).
+        if (inUse_.defined()) free_.push_back({msplat_sync_epoch(), msplat_committed_serial(), std::move(inUse_)});
+        if (free_.size() > 4) free_.pop_front();  // no sync since (none recyclable): let the oldest go
+        inUse_ = t;
+    }
     return t;
+}
+
+// A recycled buffer of exactly `nbytes` whose last step is complete on the GPU, or an undefined
+// tensor (the decode then allocates). Main thread only, like push/pop.
+MTensor ImageStream::takeFree(size_t nbytes) {
+    const uint64_t epoch = msplat_sync_epoch();
+    for (auto it = free_.begin(); it != free_.end(); ++it)
+        if (it->epoch < epoch && it->t.nbytes() == nbytes) {
+            // Lifetime invariant, checked independently of the epoch rule: the last commit of the
+            // step that used this buffer has completed. If not, the buffer is not reused (counted).
+            if (msplat_completed_serial() < it->needSerial) { recycleViolations++; return MTensor(); }
+            MTensor t = std::move(it->t);
+            free_.erase(it);
+            recycled++;
+            return t;
+        }
+    for (const auto &f : free_)
+        if (f.epoch < epoch) { recycleSizeMiss++; break; }   // only other-size buffers were ready: fresh allocation
+    return MTensor();
 }
 
 uint64_t ImageStream::heldBytes() {

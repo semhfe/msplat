@@ -29,6 +29,13 @@ void msplat_commit_nosync();
 
 // Synchronize (commit + wait for completion)
 void msplat_gpu_sync();
+// Count of full syncs: when it has advanced past a value read earlier, every GPU command
+// encoded before that read has completed.
+uint64_t msplat_sync_epoch();
+// Commit serials: work committed through msplat_commit / _nosync up to serial k has completed
+// once msplat_completed_serial() >= k (independent of the sync epoch; --image-stream recycling check).
+uint64_t msplat_committed_serial();
+uint64_t msplat_completed_serial();
 
 // Diagnostic: last forward's per-tile intersection counts (after msplat_gpu_sync()).
 extern "C" int msplat_last_tile_counts(const uint32_t **counts, int *num_points,

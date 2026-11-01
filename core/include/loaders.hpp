@@ -19,6 +19,9 @@ Points readColmapPoints(const std::string &path);
 // Image I/O
 Image imreadRGB(const std::string &path);       // returns float32 [0,1] directly
 Image resizeArea(const Image &src, int dstW, int dstH);  // box-filter downscale
+// = resizeArea(imreadRGB(path), int(w/d), int(h/d)), bit for bit, without the full-size float
+// image; srcW/srcH get the decoded size.
+Image imreadRGBArea(const std::string &path, float downscale, int &srcW, int &srcH);
 void imwriteRGB(const std::string &path, const Image &img);  // save as PNG
 
 // Undistortion (Brown-Conrady model, alpha=0 crop)

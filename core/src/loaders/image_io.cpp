@@ -10,7 +10,8 @@
 
 // ── Image loading (CoreGraphics) ─────────────────────────────────────────────
 
-Image imreadRGB(const std::string &path) {
+// Decodes to 8-bit RGBX (4 bytes per pixel).
+static std::vector<uint8_t> decodeRGBX(const std::string &path, int &w, int &h) {
     CFStringRef cfPath = CFStringCreateWithCString(nullptr, path.c_str(), kCFStringEncodingUTF8);
     CFURLRef url = CFURLCreateWithFileSystemPath(nullptr, cfPath, kCFURLPOSIXPathStyle, false);
     CFRelease(cfPath);
@@ -27,8 +28,8 @@ Image imreadRGB(const std::string &path) {
         throw std::runtime_error("Failed to decode image: " + path);
     }
 
-    int w = (int)CGImageGetWidth(cgImage);
-    int h = (int)CGImageGetHeight(cgImage);
+    w = (int)CGImageGetWidth(cgImage);
+    h = (int)CGImageGetHeight(cgImage);
 
     // Render into RGBA buffer, then extract RGB and convert to float32
     std::vector<uint8_t> rgba(w * h * 4);
@@ -41,6 +42,12 @@ Image imreadRGB(const std::string &path) {
     CGContextRelease(ctx);
     CGColorSpaceRelease(colorSpace);
     CGImageRelease(cgImage);
+    return rgba;
+}
+
+Image imreadRGB(const std::string &path) {
+    int w, h;
+    std::vector<uint8_t> rgba = decodeRGBX(path, w, h);
 
     // RGBA → float32 RGB [0,1]
     Image img;
@@ -112,7 +119,11 @@ void imwriteRGB(const std::string &path, const Image &img) {
 
 // ── Area-based image resize (box filter) ─────────────────────────────────────
 
-Image resizeArea(const Image &src, int dstW, int dstH) {
+// px(i, c) = channel c of source pixel i as float. Both callers produce the same float per
+// pixel, and the arithmetic below is shared, so their results are bit-identical.
+template <class Px>
+static Image resizeAreaImpl(int srcWidth, int srcHeight, Px px, int dstW, int dstH) {
+    struct { int width, height; } src{srcWidth, srcHeight};
     Image dst;
     dst.width = dstW;
     dst.height = dstH;
@@ -142,10 +153,10 @@ Image resizeArea(const Image &src, int dstW, int dstH) {
                 for (int ix = ix0; ix < ix1; ix++) {
                     float wx = std::min((float)(ix + 1), srcX1) - std::max((float)ix, srcX0);
                     float area = wx * wy;
-                    const float *p = &src.data[(iy * src.width + ix) * 3];
-                    sum[0] += p[0] * area;
-                    sum[1] += p[1] * area;
-                    sum[2] += p[2] * area;
+                    const size_t i = (size_t)iy * src.width + ix;
+                    sum[0] += px(i, 0) * area;
+                    sum[1] += px(i, 1) * area;
+                    sum[2] += px(i, 2) * area;
                     totalArea += area;
                 }
             }
@@ -158,6 +169,20 @@ Image resizeArea(const Image &src, int dstW, int dstH) {
         }
     }
     return dst;
+}
+
+Image resizeArea(const Image &src, int dstW, int dstH) {
+    const float *d = src.data.data();
+    return resizeAreaImpl(src.width, src.height, [d](size_t i, int c) { return d[i * 3 + c]; }, dstW, dstH);
+}
+
+// resizeArea(imreadRGB(path), int(w/d), int(h/d)) without the full-resolution float image:
+// each pixel is converted (rgba / 255.0f, as imreadRGB does) where the box filter reads it.
+Image imreadRGBArea(const std::string &path, float downscale, int &srcW, int &srcH) {
+    std::vector<uint8_t> rgba = decodeRGBX(path, srcW, srcH);
+    const uint8_t *s = rgba.data();
+    return resizeAreaImpl(srcW, srcH, [s](size_t i, int c) { return s[i * 4 + c] / 255.0f; },
+                          (int)(srcW / downscale), (int)(srcH / downscale));
 }
 
 // ── Undistortion (Brown-Conrady model) ───────────────────────────────────────

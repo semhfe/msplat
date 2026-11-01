@@ -8,6 +8,7 @@
 #include <future>
 #include <memory>
 #include <stdexcept>
+#include <cstdlib>
 #include "metal_tensor.hpp"
 
 // Simple float32 RGB image — replaces cv::Mat
@@ -43,7 +44,8 @@ struct Camera {
     float cachedCamPos[3] = {};
     float cachedFovX = 0, cachedFovY = 0;
 
-    void loadImage(float downscaleFactor);
+    void loadImage(float downscaleFactor, bool fusedDecode = false,  // fused: imreadRGBArea (same bytes)
+                   MTensor into = MTensor());                         // into: recycled destination, used if shape matches
     // Load "<maskDir>/<relativeName>.png" (COLMAP convention; falls back to the
     // extension-swapped name) — call AFTER loadImage so dimensions are final.
     void loadMask(const std::string &maskDir);
@@ -77,10 +79,19 @@ public:
     MTensor pop();               // rethrows a decode error
     uint64_t heldBytes();        // waits for the queued decodes; bytes they hold (rethrows a failure)
     uint64_t pops = 0, stalls = 0;  // stalls: a pop after the first that had to wait
+    uint64_t recycled = 0;          // decodes that reused a GT buffer (MSPLAT_IMAGE_STREAM_RECYCLE=1)
+    uint64_t recycleViolations = 0; // reuse refused: its last commit not yet complete (expected 0)
+    uint64_t recycleSizeMiss = 0;   // fresh allocation although a completed buffer of another size was free
     double stallMs = 0, firstWaitMs = 0;
 private:
+    MTensor takeFree(size_t nbytes);
     const std::vector<Camera> &cams_;
     float downscale_;
+    // MSPLAT_IMAGE_STREAM_RECYCLE=1: reuse GT buffers instead of a fresh allocation per step.
+    const bool recycle_ = [] { const char *e = std::getenv("MSPLAT_IMAGE_STREAM_RECYCLE"); return e && e[0] == '1'; }();
+    MTensor inUse_;                                   // the image handed out by the last pop
+    struct FreeBuf { uint64_t epoch, needSerial; MTensor t; };  // sync epoch and commit serial when returned
+    std::deque<FreeBuf> free_;
     std::deque<std::pair<size_t, std::future<MTensor>>> queue_;
 };
 

@@ -928,6 +928,11 @@ inline float warpSum(float val, const int warp_size, const uint lane) {
     return simd_sum(val);
 }
 
+// K1 (MSPLAT_K1_SELECT=1, set per pipeline in msplat_metal.mm, always specialised): sigma-routed
+// backward gradients via a select instead of a nested branch. false: the A1 code as committed.
+constant bool k1_select_fc [[function_constant(0)]];
+constant bool k1_select = is_function_constant_defined(k1_select_fc) && k1_select_fc;
+
 kernel void rasterize_backward_kernel(
     constant uint3& tile_bounds,
     constant uint2& img_size,
@@ -1107,7 +1112,18 @@ kernel void rasterize_backward_kernel(
                 // alpha = min(0.999, opac * exp(-sigma)). Where the cap binds, alpha is
                 // constant in sigma and opac, so every sigma-routed gradient is exactly
                 // zero; the color gradient above is not.
-                if (alpha < 0.999f) {
+                if (k1_select) {
+                    // K1 (MSPLAT_K1_SELECT=1): a select instead of the nested branch below,
+                    // which measured slower on the pre-A1 path (legacy_bwd_cap=1).
+                    const float v_sigma = alpha < 0.999f ? -alpha * v_alpha : 0.f;
+                    v_conic_local = (0.5f * v_sigma) * float3(delta.x * delta.x,
+                                                               delta.x * delta.y,
+                                                               delta.y * delta.y);
+                    v_xy_local = v_sigma * float2(
+                        fma(b_conic.x, delta.x, b_conic.y * delta.y),
+                        fma(b_conic.y, delta.x, b_conic.z * delta.y));
+                    v_opacity_local = -v_sigma * (1.f - opac);
+                } else if (alpha < 0.999f) {
                     // v_sigma = d(loss)/d(sigma) = -alpha * v_alpha
                     const float v_sigma = -alpha * v_alpha;
                     v_conic_local = (0.5f * v_sigma) * float3(delta.x * delta.x,
@@ -3358,7 +3374,16 @@ kernel void rasterize_backward_chunked_kernel(
                 buffer = fma(rgb, fac, buffer);
 
                 // Where the cap binds, every sigma-routed gradient is exactly zero.
-                if (alpha < 0.999f) {
+                if (k1_select) {  // K1: see rasterize_backward_kernel
+                    const float v_sigma = alpha < 0.999f ? -alpha * v_alpha : 0.f;
+                    v_conic_local = (0.5f * v_sigma) * float3(delta.x * delta.x,
+                                                               delta.x * delta.y,
+                                                               delta.y * delta.y);
+                    v_xy_local = v_sigma * float2(
+                        fma(b_conic.x, delta.x, b_conic.y * delta.y),
+                        fma(b_conic.y, delta.x, b_conic.z * delta.y));
+                    v_opacity_local = -v_sigma * (1.f - opac);
+                } else if (alpha < 0.999f) {
                     const float v_sigma = -alpha * v_alpha;
                     v_conic_local = (0.5f * v_sigma) * float3(delta.x * delta.x,
                                                                delta.x * delta.y,

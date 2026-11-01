@@ -68,6 +68,14 @@ static size_t g_release_limit = kReleaseSlots;        // < kReleaseSlots only in
 static id<MTLCommandBuffer> g_last_committed = nil;   // retained, under g_release_lock
 static std::atomic<bool> g_gpu_idle{true};
 static std::atomic<bool> g_cb_dirty{false};           // encoded work not yet committed
+static std::atomic<uint64_t> g_sync_epoch{0};          // full syncs completed (msplat_sync_epoch)
+// Commit serials (msplat_committed_serial / msplat_completed_serial): an independent record, from
+// completion handlers and syncs, of which committed command buffers have finished.
+static std::atomic<uint64_t> g_committed_serial{0}, g_completed_serial{0};
+static void note_completed(uint64_t s) {
+    uint64_t c = g_completed_serial.load();
+    while (c < s && !g_completed_serial.compare_exchange_weak(c, s)) {}
+}
 static std::atomic<uint64_t> g_rel_deferred{0}, g_rel_waited{0}, g_rel_reclaimed{0};
 
 static void msplat_release_buffer(void* buf) noexcept {
@@ -190,7 +198,9 @@ struct MetalContext {
             }
             id<MTLCommandBuffer> under = release_after(_currentCB);
             dispatch_semaphore_t sem = inflight_sem;
+            const uint64_t serial = ++g_committed_serial;
             [_currentCB addCompletedHandler:^(id<MTLCommandBuffer>) {
+                note_completed(serial);
                 dispatch_semaphore_signal(sem);
             }];
             [_currentCB commitAndContinue];
@@ -212,6 +222,8 @@ struct MetalContext {
         os_unfair_lock_lock(&g_release_lock);
         g_gpu_idle = true;
         g_cb_dirty = false;
+        g_sync_epoch++;
+        note_completed(g_committed_serial.load());   // everything committed before has completed
         for (size_t i = 0; i < g_release_n; i++) CFRelease(g_release_slots[i]);   // GPU idle
         g_rel_reclaimed += g_release_n;
         g_release_n = 0;
@@ -444,8 +456,29 @@ MetalContext* init_msplat_metal_context() {
     ctx->rasterize_forward_chunked_kernel_cpso    = load(@"rasterize_forward_chunked_kernel");
     ctx->rasterize_forward_merge_kernel_cpso      = load(@"rasterize_forward_merge_kernel");
     ctx->compute_chunk_prefix_suffix_kernel_cpso  = load(@"compute_chunk_prefix_suffix_kernel");
-    ctx->rasterize_backward_chunked_kernel_cpso   = load(@"rasterize_backward_chunked_kernel");
-    ctx->rasterize_backward_kernel_cpso           = load(@"rasterize_backward_kernel");
+    // K1 (MSPLAT_K1_SELECT=1): the two backward rasterizers are specialised with k1_select_fc. A
+    // function that declares a function constant must always be specialised (Metal refuses a pipeline
+    // from the plain function), so the flag off is k1_select_fc = false: the committed A1 code.
+    auto load_k1 = [&](NSString* name) -> id<MTLComputePipelineState> {
+        const char *e = std::getenv("MSPLAT_K1_SELECT");
+        MTLFunctionConstantValues *cv = [[MTLFunctionConstantValues alloc] init];
+        bool on = e && e[0] == '1';
+        [cv setConstantValue:&on type:MTLDataTypeBool atIndex:0];
+        NSError *err = nil;
+        id<MTLFunction> fn = [metal_library newFunctionWithName:name constantValues:cv error:&err];
+        [cv release];
+        id<MTLComputePipelineState> pso = fn ? [ctx->device newComputePipelineStateWithFunction:fn error:&err] : nil;
+        [fn release];
+        // Required even with the flag off, so a failure here stops the run instead of training without it.
+        if (!pso) {
+            fprintf(stderr, "msplat: failed to create K1 pipeline for %s: %s\n", [name UTF8String],
+                    err ? [[err description] UTF8String] : "unknown error");
+            abort();
+        }
+        return pso;
+    };
+    ctx->rasterize_backward_chunked_kernel_cpso   = load_k1(@"rasterize_backward_chunked_kernel");
+    ctx->rasterize_backward_kernel_cpso           = load_k1(@"rasterize_backward_kernel");
     // Separable SSIM loss
     ctx->ssim_h_fwd_kernel_cpso                   = load(@"ssim_h_fwd_kernel");
     ctx->ssim_v_fwd_kernel_cpso                   = load(@"ssim_v_fwd_kernel");
@@ -586,6 +619,8 @@ void msplat_commit_nosync() {
         // 2. The Swift side creates its own CB on the same serial queue
         // 3. Metal guarantees submission order on a serial queue
         id<MTLCommandBuffer> under = release_after(ctx->_currentCB);
+        const uint64_t serial = ++g_committed_serial;
+        [ctx->_currentCB addCompletedHandler:^(id<MTLCommandBuffer>) { note_completed(serial); }];
         [ctx->_currentCB commitAndContinue];
         note_committed(under);
     }
@@ -594,6 +629,10 @@ void msplat_commit_nosync() {
 void msplat_gpu_sync() {
     get_global_context()->syncCB();
 }
+
+uint64_t msplat_sync_epoch() { return g_sync_epoch.load(); }
+uint64_t msplat_committed_serial() { return g_committed_serial.load(); }
+uint64_t msplat_completed_serial() { return g_completed_serial.load(); }
 
 void msplat_enable_gpu_timing(bool enable) {
     g_gpu_timing_enabled = enable;
