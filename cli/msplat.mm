@@ -148,6 +148,17 @@ int main(int argc, char *argv[]) {
                  "Decode ground-truth images from disk ahead of each step instead of keeping all "
                  "of them in RAM (same bytes; MSPLAT_IMAGE_STREAM_DEPTH images ahead, default 2)");
 
+    // Q1-Q3 code stores (docs .../runs/2026-11-01-hiz-q-yerlesim.md); 0 = fp32 stores, unchanged.
+    int quantLevel = 0;
+    app.add_option("--quant-level", quantLevel,
+                   "1 = int16 block-scaled SH values + coded Adam moments (Q1-Q3); 0 = fp32 (default)")
+        ->check(CLI::Range(0, 1));
+    std::string quantRound = "nearest";
+    app.add_option("--quant-round", quantRound,
+                   "Rounding of the training-step encodes with --quant-level 1 (ignored at 0): nearest, "
+                   "stochastic, or stochastic-adam (stochastic Adam codes, nearest SH values)")
+        ->check(CLI::IsMember({"nearest", "stochastic", "stochastic-adam"}));
+
     CLI11_PARSE(app, argc, argv);
 
     // Package B: weight relocation replaces the position noise (B3), and its weights need the A1
@@ -213,7 +224,11 @@ int main(int argc, char *argv[]) {
                      bgColor.data(),
                      positionLrMaxSteps,
                      !noSeedDecimation,
-                     initOpacity, initScaleMult);
+                     initOpacity, initScaleMult, quantLevel);
+        if (quantLevel) {
+            model.quant_round = quantRound == "stochastic" ? 1 : quantRound == "stochastic-adam" ? 2 : 0;
+            std::cout << "[quant] level=1 round=" << quantRound << std::endl;
+        }
         model.cull_radius = cullRadius;
         model.reg_visibility_duty = regVisibilityDuty;
         if (wmaxAccum) model.enableBlendWeights(relocWeight);
@@ -509,6 +524,22 @@ int main(int argc, char *argv[]) {
                     for (auto &p : params) {
                         FILE *f = fopen((std::string(dumpDir) + "/" + p.first + ".bin").c_str(), "wb");
                         if (f) { fwrite(p.second->data_ptr(), 1, p.second->nbytes(), f); fclose(f); }
+                    }
+                    if (model.quant_level) {  // Q: decoded SH over the zero-width featuresRest.bin, plus raw code stores
+                        MTensor fr = model.decodeFeaturesRest();
+                        const int64_t nba = ((int64_t)model.num_active + Model::QB - 1) / Model::QB;
+                        std::vector<std::pair<std::string, MTensor>> q = {
+                            {"featuresRest", fr}, {"q_fr_codes", model.fr_codes.view(nba * Model::QB)},
+                            {"q_fr_bounds", model.fr_bounds.view(nba)}, {"q_shq_state", model.shq_state.view(nba * Model::QB)},
+                            {"q_shq_bounds", model.shq_bounds.view(nba)}};
+                        for (int g = 0; g < Model::N_NSQ; g++) {
+                            q.push_back({"q_nsq_state" + std::to_string(g), model.nsq_state[g].view(nba * Model::QB)});
+                            q.push_back({"q_nsq_bounds" + std::to_string(g), model.nsq_bounds[g].view(nba)});
+                        }
+                        for (auto &p : q) {
+                            FILE *f = fopen((std::string(dumpDir) + "/" + p.first + ".bin").c_str(), "wb");
+                            if (f) { fwrite(p.second.data_ptr(), 1, p.second.nbytes(), f); fclose(f); }
+                        }
                     }
                     // Adam moments (groups as in fullIteration: means, scales, quats, featuresDc, featuresRest,
                     // opacities); the SH groups are the only record of the fused SH gradients

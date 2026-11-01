@@ -13,6 +13,7 @@
 #include "kdtree_tensor.hpp"
 #include "msplat.hpp"
 #include "loaders.hpp"
+#include "quant_codec.hpp"
 #include <mach/mach.h>
 
 // Cumulative GPU-side NaN-gate counters (msplat_metal.mm). Slots:
@@ -89,7 +90,8 @@ Model::Model(const InputData &inputData, int numCameras,
     int positionLrMaxSteps,
     bool decimateSeeds,
     float initOpacity,
-    float initScaleMult)
+    float initScaleMult,
+    int quantLevel)
     : numCameras(numCameras),
       shDegree(shDegree), shDegreeInterval(shDegreeInterval),
       maxSteps(maxSteps), keepCrs(keepCrs),
@@ -165,6 +167,7 @@ Model::Model(const InputData &inputData, int numCameras,
     backgroundColor = gpu_empty({3}, DType::Float32);
     static const float defaultBg[3] = {0.6130f, 0.0101f, 0.3984f};
     memcpy(backgroundColor.data_ptr(), bgColor ? bgColor : defaultBg, 3 * sizeof(float));
+    quant_level = quantLevel;
     setupOptimizers(decimateSeeds);
 }
 
@@ -220,11 +223,15 @@ void Model::setupOptimizers(bool decimateSeeds){
     allocBuf(scales_buf, scales);
     allocBuf(quats_buf, quats);
     allocBuf(featuresDc_buf, featuresDc);
+    if (quant_level) setupQuant(rows_to_copy, keep_indices);  // replaces featuresRest_buf + the fp32 Adam stores
+    else
     allocBuf(featuresRest_buf, featuresRest);
     allocBuf(opacities_buf, opacities);
 
     static constexpr float lr_init[] = {0.00016f, 0.005f, 0.001f, 0.0025f, 0.000125f, 0.05f};
     MTensor *params[] = {&means, &scales, &quats, &featuresDc, &featuresRest, &opacities};
+    if (quant_level) for (int g = 0; g < N_ADAM_GROUPS; g++) adam_lr[g] = lr_init[g];
+    else
     for (int g = 0; g < N_ADAM_GROUPS; g++) {
         auto shape = params[g]->shape();
         shape[0] = buf_capacity;
@@ -247,6 +254,10 @@ void Model::setupOptimizers(bool decimateSeeds){
 }
 
 void Model::releaseOptimizers(){
+    if (quant_level) {
+        fr_codes.reset(); fr_bounds.reset(); shq_state.reset(); shq_bounds.reset();
+        for (int g = 0; g < N_NSQ; g++) { nsq_state[g].reset(); nsq_bounds[g].reset(); }
+    }
     for (int g = 0; g < N_ADAM_GROUPS; g++) {
         adam_exp_avg[g].reset(); adam_exp_avg_sq[g].reset();
         adam_exp_avg_buf[g].reset(); adam_exp_avg_sq_buf[g].reset();
@@ -264,6 +275,15 @@ void Model::schedulersStep(int step){
 }
 
 void Model::refreshViews(){
+    if (quant_level) {  // Q: SH values and Adam state live in the code stores, indexed by slot
+        means = means_buf.view(num_active);
+        scales = scales_buf.view(num_active);
+        quats = quats_buf.view(num_active);
+        featuresDc = featuresDc_buf.view(num_active);
+        featuresRest = MTensor({(int64_t)num_active, 0, 3}, DType::Float32);  // zero-width, no storage
+        opacities = opacities_buf.view(num_active);
+        return;
+    }
     means = means_buf.view(num_active);
     scales = scales_buf.view(num_active);
     quats = quats_buf.view(num_active);
@@ -339,6 +359,7 @@ void Model::computeRelocation(float opacity_old_sig, float* scale_old_exp, int N
 // Same bytes in the same order as the former inline copies. Precondition: GPU synced, src != dst,
 // both < buf_capacity. Adam state is not touched; callers reset it with zeroAdamAt(dst).
 void Model::copyGaussianRow(int dst, int src) {
+    if (quant_level) { copyGaussianRowQ(dst, src); return; }
     float *mbuf = means_buf.data<float>();
     float *sbuf = scales_buf.data<float>();
     float *qbuf = quats_buf.data<float>();
@@ -356,11 +377,163 @@ void Model::copyGaussianRow(int dst, int src) {
 
 // Zero both Adam moments of slot idx in every group.
 void Model::zeroAdamAt(int idx) {
+    if (quant_level) {  // code 0 = exact 0; the block bounds are left alone
+        const int64_t sst = shq_state.stride0();
+        memset(shq_state.data<uint16_t>() + idx * sst, 0, sst * sizeof(uint16_t));
+        for (int g = 0; g < N_NSQ; g++) {
+            const int64_t st = nsq_state[g].stride0();
+            memset(nsq_state[g].data<uint32_t>() + idx * st, 0, st * sizeof(uint32_t));
+        }
+        return;
+    }
     for (int g = 0; g < N_ADAM_GROUPS; g++) {
         int64_t st = adam_exp_avg_buf[g].stride0();
         memset(adam_exp_avg_buf[g].data<float>() + idx * st, 0, st * sizeof(float));
         memset(adam_exp_avg_sq_buf[g].data<float>() + idx * st, 0, st * sizeof(float));
     }
+}
+
+// ── Q1-Q3 store (quant_level == 1) ──────────────────────────────────────────
+
+// SH degree d = l - 1 of each block bound covers the coefficients [Q_KLO[d], Q_KHI[d]) of a row's
+// [R, 3] cells, i.e. the contiguous cells [3 * Q_KLO[d], 3 * min(Q_KHI[d], R)).
+static constexpr int Q_KLO[3] = {0, 3, 8}, Q_KHI[3] = {3, 8, 15};
+
+// Allocates the code stores (nblk * QB rows, nblk = ceil(buf_capacity / QB); tail rows code 0) and
+// encodes the seed SH: rows [0, rows) take featuresRest row keep[i] (or i). Each bound starts at
+// GROW x the block's max |x| (0 for an all-zero block, i.e. every fresh seed). Adam codes 0; SH Adam bounds 0,
+// non-SH and DC Adam bounds fixed at (NS_AU, NS_H) (attempt 2). The seed bound has no SH_A_MIN floor (initial data, as the fixture).
+void Model::setupQuant(int64_t rows, const std::vector<int64_t>& keep) {
+    if (shDegree > 3) throw std::runtime_error("quant-level 1 supports --sh-degree <= 3");
+    // the loaded tensor decides: a degree-4 PLY (24 coefficients) under --sh-degree 3 would lose coefficients 15-23
+    if (featuresRest.size(-2) > Q_KHI[2])
+        throw std::runtime_error("quant-level 1 supports SH degree <= 3; loaded data has " +
+                                 std::to_string(featuresRest.size(-2)) + " rest coefficients");
+    const int64_t nblk = ((int64_t)buf_capacity + QB - 1) / QB;
+    const int64_t R = featuresRest.size(-2), st = R * 3;
+    num_rest_coeffs = (int)R;
+    fr_codes = gpu_zeros({nblk * QB, R, 3}, DType::Int16);
+    fr_bounds = gpu_zeros({nblk, 3}, DType::Float32);
+    shq_state = gpu_zeros({nblk * QB, R, 3}, DType::UInt16);
+    shq_bounds = gpu_zeros({nblk, 3, 2}, DType::Float32);
+    const MTensor *nsp[N_NSQ] = {&means, &scales, &quats, &featuresDc, &opacities};
+    for (int g = 0; g < N_NSQ; g++) {
+        nsq_state[g] = gpu_zeros({nblk * QB, nsp[g]->stride0()}, DType::UInt32);
+        nsq_bounds[g] = gpu_zeros({nblk, 2}, DType::Float32);
+        float *nb = nsq_bounds[g].data<float>();  // attempt 2: fixed (a_u, h) in every block
+        for (int64_t b = 0; b < nblk; b++) { nb[b * 2] = qcodec::NS_AU; nb[b * 2 + 1] = qcodec::NS_H; }
+    }
+    q_widen = q_shrink = 0;
+
+    const float *fr = featuresRest.data<float>();
+    auto srow = [&](int64_t i) { return fr + (keep.empty() ? i : keep[i]) * st; };
+    float *a = fr_bounds.data<float>();
+    int16_t *c = fr_codes.data<int16_t>();
+    for (int64_t i = 0; i < rows; i++)
+        for (int d = 0; d < 3; d++)
+            for (int64_t j = 3 * Q_KLO[d]; j < 3 * std::min<int64_t>(Q_KHI[d], R); j++)
+                a[(i / QB) * 3 + d] = std::max(a[(i / QB) * 3 + d], std::fabs(srow(i)[j]));
+    for (int64_t k = 0; k < nblk * 3; k++) a[k] *= qcodec::GROW;
+    for (int64_t i = 0; i < rows; i++)
+        for (int d = 0; d < 3; d++)
+            for (int64_t j = 3 * Q_KLO[d]; j < 3 * std::min<int64_t>(Q_KHI[d], R); j++)
+                c[i * st + j] = (int16_t)qcodec::encSym(srow(i)[j], a[(i / QB) * 3 + d], qcodec::SH_M);
+}
+
+// copyGaussianRow for the Q store. fp32 fields as in the flag-off path. SH per degree d: decode the
+// source cells with the source block's bound; if their max |x| exceeds the destination block's bound,
+// widen that bound to max(GROW x max, SH_A_MIN) and re-encode the degree-d cells of every row of the destination
+// block (decode at the old bound, encode at the new one); then encode the source values at the
+// destination bound. Equal bounds (always within one block) copy the codes: decode exactly preserved.
+void Model::copyGaussianRowQ(int dst, int src) {
+    float *mbuf = means_buf.data<float>();
+    float *sbuf = scales_buf.data<float>();
+    float *qbuf = quats_buf.data<float>();
+    float *fdcbuf = featuresDc_buf.data<float>();
+    float *obuf = opacities_buf.data<float>();
+    memcpy(mbuf + dst*3,   mbuf + src*3,   3 * sizeof(float));
+    memcpy(qbuf + dst*4,   qbuf + src*4,   4 * sizeof(float));
+    memcpy(fdcbuf + dst*3, fdcbuf + src*3, 3 * sizeof(float));
+    obuf[dst] = obuf[src];
+    memcpy(sbuf + dst*3, sbuf + src*3, 3 * sizeof(float));
+
+    using namespace qcodec;
+    const int64_t R = num_rest_coeffs, st = R * 3;
+    int16_t *c = fr_codes.data<int16_t>();
+    float *a = fr_bounds.data<float>();
+    const int64_t bs = src / QB, bd = dst / QB;
+    for (int d = 0; d < 3; d++) {
+        const int64_t j0 = 3 * Q_KLO[d], j1 = 3 * std::min<int64_t>(Q_KHI[d], R);
+        if (j0 >= j1) break;
+        const float as = a[bs * 3 + d];
+        float ad = a[bd * 3 + d];
+        if (as == ad) {
+            memcpy(c + dst * st + j0, c + src * st + j0, (j1 - j0) * sizeof(int16_t));
+            continue;
+        }
+        float m = 0.0f;
+        for (int64_t j = j0; j < j1; j++) m = std::max(m, std::fabs(decSym(c[src * st + j], as, SH_M)));
+        if (m > ad) {
+            const float an = shBound(m);  // max(1.25 m, SH_A_MIN); m > ad >= 0
+            for (int64_t r = bd * QB; r < (bd + 1) * QB; r++)
+                for (int64_t j = j0; j < j1; j++)
+                    c[r * st + j] = (int16_t)encSym(decSym(c[r * st + j], ad, SH_M), an, SH_M);
+            a[bd * 3 + d] = ad = an;
+            q_widen++;
+        }
+        for (int64_t j = j0; j < j1; j++)
+            c[dst * st + j] = (int16_t)encSym(decSym(c[src * st + j], as, SH_M), ad, SH_M);
+    }
+}
+
+// MCMC-pass shrink over the blocks holding active slots (GPU synced). Per block and degree:
+// a non-finite bound (its Gaussians were just counted nonfinite and are relocated next) is reset
+// to 0 with its codes; a finite bound with max |decoded| < a/2 becomes max(GROW x max, SH_A_MIN) (0 if max = 0)
+// and the cells are re-encoded. SH value bounds only; Adam bounds only grow.
+void Model::shrinkQuant() {
+    using namespace qcodec;
+    const int64_t R = num_rest_coeffs, st = R * 3, nba = ((int64_t)num_active + QB - 1) / QB;
+    int16_t *c = fr_codes.data<int16_t>();
+    float *a = fr_bounds.data<float>();
+    for (int64_t b = 0; b < nba; b++) {
+        for (int d = 0; d < 3; d++) {
+            const int64_t j0 = 3 * Q_KLO[d], j1 = 3 * std::min<int64_t>(Q_KHI[d], R);
+            if (j0 >= j1) break;
+            float &ab = a[b * 3 + d];
+            if (!std::isfinite(ab)) {
+                for (int64_t r = b * QB; r < (b + 1) * QB; r++)
+                    for (int64_t j = j0; j < j1; j++) c[r * st + j] = 0;
+                ab = 0.0f;
+                continue;
+            }
+            if (ab == 0.0f) continue;
+            int mc = 0;  // decode is monotone in |code|: max |x| = decSym(max |c|)
+            for (int64_t r = b * QB; r < (b + 1) * QB; r++)
+                for (int64_t j = j0; j < j1; j++) mc = std::max(mc, std::abs((int)c[r * st + j]));
+            const float mx = decSym(mc, ab, SH_M);
+            if (!(mx < 0.5f * ab)) continue;
+            const float an = shBound(mx);  // 0 if mx = 0, else max(1.25 mx, SH_A_MIN)
+            if (an == ab) continue;        // already at the floor: nothing to shrink
+            for (int64_t r = b * QB; r < (b + 1) * QB; r++)
+                for (int64_t j = j0; j < j1; j++)
+                    c[r * st + j] = (int16_t)encSym(decSym(c[r * st + j], ab, SH_M), an, SH_M);
+            ab = an;
+            q_shrink++;
+        }
+    }
+}
+
+MTensor Model::decodeFeaturesRest() const {
+    const int64_t R = num_rest_coeffs, st = R * 3;
+    MTensor out({(int64_t)num_active, R, 3}, DType::Float32);
+    float *o = out.data<float>();
+    const int16_t *c = fr_codes.data<int16_t>();
+    const float *a = fr_bounds.data<float>();
+    for (int64_t i = 0; i < num_active; i++)
+        for (int d = 0; d < 3; d++)
+            for (int64_t j = 3 * Q_KLO[d]; j < 3 * std::min<int64_t>(Q_KHI[d], R); j++)
+                o[i * st + j] = qcodec::decSym(c[i * st + j], a[(i / QB) * 3 + d], qcodec::SH_M);
+    return out;
 }
 
 // Move dead Gaussians onto alive ones (weighted by opacity) and redistribute
@@ -663,6 +836,14 @@ void Model::mcmcAfterTrain(int step) {
     // kernel math (exp/rsqrt overflow), several classes at once points at sort
     // corruption (wrong gaussian_ids). Only computed for already-bad Gaussians.
     int nf_mean = 0, nf_scale = 0, nf_quat = 0, nf_op = 0, nf_sh = 0;
+    // Q: codes are always finite; a Gaussian's SH is non-finite <=> a bound of its block is
+    std::vector<uint8_t> qfin;
+    if (quant_level) {
+        const float *qa = fr_bounds.data<float>();
+        qfin.resize(((size_t)num_active + QB - 1) / QB);
+        for (size_t b = 0; b < qfin.size(); b++)
+            qfin[b] = std::isfinite(qa[b*3]) && std::isfinite(qa[b*3+1]) && std::isfinite(qa[b*3+2]);
+    }
     for (int i = 0; i < num_active; i++) {
         // Any non-finite parameter poisons gradients for every Gaussian sharing
         // a tile, and NaN always fails the <= comparison below — so without this
@@ -676,6 +857,7 @@ void Model::mcmcAfterTrain(int step) {
             && std::isfinite(fdc[i*3+0]) && std::isfinite(fdc[i*3+1]) && std::isfinite(fdc[i*3+2]);
         for (int64_t j = 0; finite && j < fr_stride; j++)
             finite = std::isfinite(fr[i*fr_stride + j]);
+        if (quant_level && finite) finite = qfin[i / QB];
         if (!finite) {
             nonfinite++;
             if (!(std::isfinite(mn[i*3+0]) && std::isfinite(mn[i*3+1]) && std::isfinite(mn[i*3+2])))
@@ -690,6 +872,7 @@ void Model::mcmcAfterTrain(int step) {
             bool sh_ok = std::isfinite(fdc[i*3+0]) && std::isfinite(fdc[i*3+1]) && std::isfinite(fdc[i*3+2]);
             for (int64_t j = 0; sh_ok && j < fr_stride; j++)
                 sh_ok = std::isfinite(fr[i*fr_stride + j]);
+            if (quant_level && sh_ok) sh_ok = qfin[i / QB];
             if (!sh_ok) nf_sh++;
         }
 
@@ -703,6 +886,8 @@ void Model::mcmcAfterTrain(int step) {
         if (is_dead) dead.push_back(i);
         else         alive.push_back(i);
     }
+
+    if (quant_level) shrinkQuant();  // before relocation, which reads and may widen the bounds
 
     int dead_count = (int)dead.size();
     const bool repaired = !dead.empty() && !alive.empty() && relocate(dead, alive);
@@ -763,12 +948,30 @@ void Model::mcmcAfterTrain(int step) {
         // Diagnostic: how many slots does the junk-reg discriminator currently class
         // as never-effectively-rendered (features_dc exp_avg_sq sum == 0)?
         int junk_dc = 0;
+        if (quant_level) {  // Q: the three featuresDc Adam log_s codes (bits 16-31) are all 0
+            const uint32_t *dcq = nsq_state[3].data<uint32_t>();
+            for (int i = 0; i < num_active; ++i)
+                if (!(dcq[i*3] >> 16) && !(dcq[i*3+1] >> 16) && !(dcq[i*3+2] >> 16)) junk_dc++;
+        } else
         {
             const float* dcv = adam_exp_avg_sq[3].data<float>();
             for (int i = 0; i < num_active; ++i) {
                 if (dcv[i*3] + dcv[i*3+1] + dcv[i*3+2] == 0.0f) junk_dc++;
             }
         }
+        if (quant_level)
+        std::cout << "MCMC step=" << step
+                  << " active=" << num_active
+                  << " dead=" << dead_count
+                  << " culled=" << culled
+                  << " nonfinite=" << nonfinite
+                  << " grown=" << grown
+                  << " junkdc=" << junk_dc
+                  << " qwiden=" << q_widen
+                  << " qshrink=" << q_shrink
+                  << " qsat=" << msplat_q_qsat()
+                  << " usat=" << msplat_q_usat() << std::endl;
+        else
         std::cout << "MCMC step=" << step
                   << " active=" << num_active
                   << " dead=" << dead_count
@@ -863,12 +1066,26 @@ void Model::save(const std::string &filename, int step) {
 }
 
 void Model::savePly(const std::string &filename, int step){
+    if (quant_level) {  // Q: decoded fp32 SH, whole tensor (chunked writing: R5, later)
+        MTensor fr = decodeFeaturesRest();
+        GaussianParams p{means, scales, quats, featuresDc, fr, opacities,
+                         scale, {translation[0], translation[1], translation[2]}, keepCrs};
+        saveGaussianPly(filename, p, step);
+        return;
+    }
     GaussianParams p{means, scales, quats, featuresDc, featuresRest, opacities,
                      scale, {translation[0], translation[1], translation[2]}, keepCrs};
     saveGaussianPly(filename, p, step);
 }
 
 void Model::saveSplat(const std::string &filename){
+    if (quant_level) {
+        MTensor fr = decodeFeaturesRest();
+        GaussianParams p{means, scales, quats, featuresDc, fr, opacities,
+                         scale, {translation[0], translation[1], translation[2]}, keepCrs};
+        saveGaussianSplat(filename, p);
+        return;
+    }
     GaussianParams p{means, scales, quats, featuresDc, featuresRest, opacities,
                      scale, {translation[0], translation[1], translation[2]}, keepCrs};
     saveGaussianSplat(filename, p);
@@ -892,6 +1109,8 @@ int Model::loadPly(const std::string &filename){
 
 static constexpr uint32_t CKPT_MAGIC = 0x4C50534D; // "MSPL"
 static constexpr uint32_t CKPT_VERSION = 1;
+static constexpr uint32_t CKPT_VERSION_Q = 3;  // --quant-level 1: code stores instead of fp32 SH + Adam;
+                                                // 3 = attempt 2 (fixed non-SH bounds); 2 (attempt 1) is not readable
 
 static void writeTensor(std::ofstream &f, MTensor &t) {
     uint32_t ndim = t.ndim();
@@ -920,6 +1139,7 @@ static MTensor readTensor(std::ifstream &f) {
 
 void Model::saveCheckpoint(const std::string &filename, int step) {
     msplat_gpu_sync();
+    if (quant_level) { saveCheckpointQ(filename, step); return; }
 
     std::ofstream f(filename, std::ios::binary);
     if (!f.is_open()) throw std::runtime_error("Cannot open checkpoint file for writing: " + filename);
@@ -975,6 +1195,11 @@ int Model::loadCheckpoint(const std::string &filename) {
     f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
     f.read(reinterpret_cast<char*>(&version), sizeof(version));
     if (magic != CKPT_MAGIC) throw std::runtime_error("Not a valid msplat checkpoint file");
+    if (quant_level) {  // Q holds no fp32 Adam state to load a version 1 file into (the CPU never encodes Adam)
+        if (version != CKPT_VERSION_Q)
+            throw std::runtime_error("--quant-level 1 needs a version 3 checkpoint, got version " + std::to_string(version));
+        return loadCheckpointQ(f, filename);
+    }
     if (version != CKPT_VERSION) throw std::runtime_error("Unsupported checkpoint version: " + std::to_string(version));
 
     // Scalar state
@@ -1046,6 +1271,145 @@ int Model::loadCheckpoint(const std::string &filename) {
     return (int)step;
 }
 
+// Version 2 (quant_level 1): the version 1 header and scalars; means, scales, quats, featuresDc and
+// opacities as fp32 views; then the code stores of the blocks holding active slots (ceil(num_active /
+// QB) blocks): fr_codes, fr_bounds, shq_state, shq_bounds, nsq_state[0..4], nsq_bounds[0..4].
+static MTensor readTensorQ(std::ifstream &f, DType dt) {
+    // header fully validated before any allocation: rank 1-4, dims in [0, 2^31) (0 is legal: degree-0 SH stores
+    // are [rows, 0, 3]), checked byte count equal to the stored one and not past the end of the file
+    auto bad = [] { throw std::runtime_error("corrupt version 3 checkpoint"); };
+    uint32_t ndim = 0;
+    if (!f.read(reinterpret_cast<char*>(&ndim), sizeof(ndim)) || ndim == 0 || ndim > 4) bad();
+    std::vector<int64_t> shape(ndim);
+    uint64_t numel = 1;
+    for (uint32_t i = 0; i < ndim; i++) {
+        if (!f.read(reinterpret_cast<char*>(&shape[i]), sizeof(int64_t)) || shape[i] < 0 || shape[i] >= (int64_t(1) << 31)) bad();
+        const uint64_t d = (uint64_t)shape[i];
+        if (d && numel > ((uint64_t(1) << 40) - 1) / d) bad();  // checked before multiplying: no wrap to 0
+        numel *= d;
+    }
+    uint64_t bytes = 0;
+    if (!f.read(reinterpret_cast<char*>(&bytes), sizeof(bytes))) bad();
+    const uint64_t esz = dtypeSize(dt);
+    const std::streampos pos = f.tellg();
+    f.seekg(0, std::ios::end);
+    const std::streampos end = f.tellg();
+    f.seekg(pos);
+    if (!f || bytes != numel * esz || bytes > (uint64_t)(end - pos)) bad();
+    MTensor t = gpu_empty(shape, dt);
+    if (bytes != t.nbytes()) bad();
+    if (bytes) {
+        f.read(reinterpret_cast<char*>(t.data_ptr()), bytes);
+        if (!f || (uint64_t)f.gcount() != bytes) throw std::runtime_error("truncated version 3 checkpoint");
+    }
+    return t;
+}
+
+void Model::saveCheckpointQ(const std::string &filename, int step) {
+    std::ofstream f(filename, std::ios::binary);
+    if (!f.is_open()) throw std::runtime_error("Cannot open checkpoint file for writing: " + filename);
+    f.write(reinterpret_cast<const char*>(&CKPT_MAGIC), sizeof(CKPT_MAGIC));
+    f.write(reinterpret_cast<const char*>(&CKPT_VERSION_Q), sizeof(CKPT_VERSION_Q));
+    uint32_t u;
+    u = (uint32_t)step;            f.write(reinterpret_cast<const char*>(&u), sizeof(u));
+    u = (uint32_t)num_active;      f.write(reinterpret_cast<const char*>(&u), sizeof(u));
+    u = (uint32_t)shDegree;        f.write(reinterpret_cast<const char*>(&u), sizeof(u));
+    u = (uint32_t)adam_step_count;  f.write(reinterpret_cast<const char*>(&u), sizeof(u));
+    f.write(reinterpret_cast<const char*>(adam_lr), sizeof(adam_lr));
+    f.write(reinterpret_cast<const char*>(&means_lr_init), sizeof(means_lr_init));
+    f.write(reinterpret_cast<const char*>(&means_lr_final), sizeof(means_lr_final));
+    writeTensor(f, means);
+    writeTensor(f, scales);
+    writeTensor(f, quats);
+    writeTensor(f, featuresDc);
+    writeTensor(f, opacities);
+    const int64_t nba = ((int64_t)num_active + QB - 1) / QB;
+    MTensor v;
+    v = fr_codes.view(nba * QB);   writeTensor(f, v);
+    v = fr_bounds.view(nba);       writeTensor(f, v);
+    v = shq_state.view(nba * QB);  writeTensor(f, v);
+    v = shq_bounds.view(nba);      writeTensor(f, v);
+    for (int g = 0; g < N_NSQ; g++) { v = nsq_state[g].view(nba * QB); writeTensor(f, v); }
+    for (int g = 0; g < N_NSQ; g++) { v = nsq_bounds[g].view(nba);     writeTensor(f, v); }
+    f.close();
+    if (!f) {
+        std::error_code ec;
+        const bool removed = fs::remove(filename, ec);
+        throw std::runtime_error("msplat: writing checkpoint " + filename + " failed (disk full or output removed?); " +
+                                 (removed ? std::string("partial file deleted")
+                                  : ec ? "partial file could not be deleted: " + ec.message()
+                                       : std::string("no partial file left")));
+    }
+    std::cout << "Checkpoint saved: " << filename << " (step " << step
+              << ", " << num_active << " gaussians, quant-level 1, "
+              << fs::file_size(filename) / (1024*1024) << " MB)" << std::endl;
+}
+
+int Model::loadCheckpointQ(std::ifstream &f, const std::string &filename) {
+    uint32_t step, numPts, shDeg, adamSteps;
+    f.read(reinterpret_cast<char*>(&step), sizeof(step));
+    f.read(reinterpret_cast<char*>(&numPts), sizeof(numPts));
+    f.read(reinterpret_cast<char*>(&shDeg), sizeof(shDeg));
+    f.read(reinterpret_cast<char*>(&adamSteps), sizeof(adamSteps));
+    f.read(reinterpret_cast<char*>(adam_lr), sizeof(adam_lr));
+    f.read(reinterpret_cast<char*>(&means_lr_init), sizeof(means_lr_init));
+    f.read(reinterpret_cast<char*>(&means_lr_final), sizeof(means_lr_final));
+    adam_step_count = (int)adamSteps;
+    means = readTensorQ(f, DType::Float32);
+    scales = readTensorQ(f, DType::Float32);
+    quats = readTensorQ(f, DType::Float32);
+    featuresDc = readTensorQ(f, DType::Float32);
+    opacities = readTensorQ(f, DType::Float32);
+    MTensor codes = readTensorQ(f, DType::Int16), bounds = readTensorQ(f, DType::Float32);
+    MTensor shs = readTensorQ(f, DType::UInt16), shb = readTensorQ(f, DType::Float32);
+    MTensor nss[N_NSQ], nsb[N_NSQ];
+    for (int g = 0; g < N_NSQ; g++) nss[g] = readTensorQ(f, DType::UInt32);
+    for (int g = 0; g < N_NSQ; g++) nsb[g] = readTensorQ(f, DType::Float32);
+    f.close();
+
+    num_active = (int)numPts;
+    buf_capacity = cap_max;
+    const int64_t nblk = ((int64_t)buf_capacity + QB - 1) / QB;
+    if (num_active > buf_capacity || codes.ndim() != 3 || codes.size(0) > nblk * QB)
+        throw std::runtime_error("checkpoint " + filename + " does not fit --cap-max " + std::to_string(cap_max));
+    // every tensor's shape must match what allocBuf copies into (rows, row width, block count)
+    const int64_t rows = codes.size(0), cb = rows / QB, R = codes.size(1);
+    auto shapeIs = [](const MTensor &t, std::vector<int64_t> want) { return t.shape() == want; };
+    const MTensor *params[N_NSQ] = {&means, &scales, &quats, &featuresDc, &opacities};
+    const int64_t width[N_NSQ] = {3, 3, 4, 3, 1};
+    bool ok = shDeg == (uint32_t)shDegree && shDeg <= 3 && R == (int64_t)(shDeg + 1) * (shDeg + 1) - 1 && codes.size(2) == 3 && rows % QB == 0 &&
+              rows >= (int64_t)numPts && shapeIs(bounds, {cb, 3}) && shapeIs(shs, codes.shape()) && shapeIs(shb, {cb, 3, 2});
+    for (int g = 0; g < N_NSQ; g++)
+        ok = ok && shapeIs(*params[g], {(int64_t)numPts, width[g]}) && shapeIs(nss[g], {rows, width[g]}) && shapeIs(nsb[g], {cb, 2});
+    if (!ok) throw std::runtime_error("checkpoint " + filename + ": SH degree " + std::to_string(shDeg) + " (model " +
+                                      std::to_string(shDegree) + ") or tensor shapes inconsistent with version 3 layout");
+    auto allocBuf = [&](MTensor &buf, const MTensor &param, int64_t rows) {
+        auto shape = param.shape();
+        shape[0] = rows;
+        buf = gpu_zeros(shape, param.dtype());
+        memcpy(buf.data_ptr(), param.data_ptr(), param.nbytes());
+    };
+    allocBuf(means_buf, means, buf_capacity);
+    allocBuf(scales_buf, scales, buf_capacity);
+    allocBuf(quats_buf, quats, buf_capacity);
+    allocBuf(featuresDc_buf, featuresDc, buf_capacity);
+    allocBuf(opacities_buf, opacities, buf_capacity);
+    allocBuf(fr_codes, codes, nblk * QB);
+    allocBuf(fr_bounds, bounds, nblk);
+    allocBuf(shq_state, shs, nblk * QB);
+    allocBuf(shq_bounds, shb, nblk);
+    for (int g = 0; g < N_NSQ; g++) { allocBuf(nsq_state[g], nss[g], nblk * QB); allocBuf(nsq_bounds[g], nsb[g], nblk); }
+    num_rest_coeffs = (int)codes.size(1);
+    q_widen = q_shrink = 0;
+    sgld_noise_buf = gpu_empty({(int64_t)cap_max * 3}, DType::Float32);
+
+    refreshViews();
+    resetWeightState();
+    std::cout << "Checkpoint loaded: " << filename << " (step " << step
+              << ", " << num_active << " gaussians, quant-level 1)" << std::endl;
+    return (int)step;
+}
+
 Model::CamSetup Model::prepareCam(Camera& cam, int step) {
     const float sf = getDownscaleFactor(step);
     CamSetup s;
@@ -1081,6 +1445,7 @@ Model::CamSetup Model::prepareCam(Camera& cam, int step) {
 
     s.degreesToUse = (std::min<int>)(step / shDegreeInterval, shDegree);
     int b = featuresRest.size(-2) + 1;
+    if (quant_level) b = numRestCoeffs() + 1;  // Q: featuresRest is the zero-width placeholder
     s.degree = (b <= 1) ? 0 : (b <= 4) ? 1 : (b <= 9) ? 2 : (b <= 16) ? 3 : 4;
     s.tileBounds = std::make_tuple(
         (s.width + BLOCK_X - 1) / BLOCK_X,
@@ -1092,7 +1457,79 @@ Model::CamSetup Model::prepareCam(Camera& cam, int step) {
     return s;
 }
 
+// ── Q1-Q3 (--quant-level 1) GPU path: render and fullIteration through msplat_render_q / msplat_train_step_q ──
+
+static MsplatQ qStores(Model &m) {
+    MsplatQ q{&m.fr_codes, &m.fr_bounds, &m.shq_state, &m.shq_bounds, {}, {},
+              (uint32_t)m.adam_step_count, (uint32_t)m.quant_round};
+    for (int g = 0; g < Model::N_NSQ; g++) { q.nsq_state[g] = &m.nsq_state[g]; q.nsq_bounds[g] = &m.nsq_bounds[g]; }
+    return q;
+}
+
+static MTensor renderQ(Model &m, Camera &cam, int step) {
+    auto s = m.prepareCam(cam, step);
+    MsplatQ q = qStores(m);
+    return msplat_render_q(q,
+        m.means.size(0), m.means, m.scales, 1.0f,
+        m.quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
+        s.height, s.width, s.tileBounds, 0.01f,
+        s.degree, s.degreesToUse, s.cam_pos, m.featuresDc, m.featuresRest,
+        m.opacities, m.backgroundColor);
+}
+
+// Model::fullIteration for the code stores: the same step, Adam step sizes and SGLD noise; the SH values and every
+// Adam moment live in the Q stores (the fp32 Adam arrays passed along are unallocated and never read).
+static void fullIterationQ(Model &m, Camera &cam, int step, MTensor &gt, float ssimWeight) {
+    auto s = m.prepareCam(cam, step);
+    m.lastHeight = s.height; m.lastWidth = s.width;
+    int numPoints = m.means.size(0);
+    if (!m.window2d.defined()) {
+        auto w = createSSIMWindow(11, 1.5f);
+        m.window2d = gpu_empty({11, 11}, DType::Float32);
+        memcpy(m.window2d.data_ptr(), w.data(), w.size() * sizeof(float));
+    }
+    m.adam_step_count++;
+    float bc1 = 1.0f - std::pow(m.adam_beta1, m.adam_step_count);
+    float bc2 = 1.0f - std::pow(m.adam_beta2, m.adam_step_count);
+    MTensor adam_p[Model::N_ADAM_GROUPS], adam_ea[Model::N_ADAM_GROUPS], adam_eas[Model::N_ADAM_GROUPS];
+    float adam_ss[Model::N_ADAM_GROUPS], adam_bc2s[Model::N_ADAM_GROUPS];
+    MTensor *params[] = {&m.means, &m.scales, &m.quats, &m.featuresDc, &m.featuresRest, &m.opacities};
+    for (int i = 0; i < Model::N_ADAM_GROUPS; ++i) {
+        adam_p[i] = *params[i];
+        adam_ss[i] = m.adam_lr[i] / bc1;
+        adam_bc2s[i] = std::sqrt(bc2);
+    }
+    const bool hasMask = cam.gpuMask.defined() && cam.unmaskedPixels > 0;
+    float lossInvN = hasMask
+        ? 1.0f / (float)(cam.unmaskedPixels * 3)
+        : 1.0f / (float)(s.height * s.width * 3);
+    MsplatQ q = qStores(m);
+    auto [r, loss] = msplat_train_step_q(q,
+        numPoints, m.means, m.scales, 1.0f,
+        m.quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
+        s.height, s.width, s.tileBounds, 0.01f,
+        s.degree, s.degreesToUse, s.cam_pos, m.featuresDc, m.featuresRest,
+        m.opacities, m.backgroundColor, gt,
+        hasMask ? cam.gpuMask : gt, (int)hasMask,
+        m.window2d, ssimWeight,
+        lossInvN, m.numRestCoeffs(),
+        Model::N_ADAM_GROUPS,
+        adam_p, adam_ea, adam_eas,
+        adam_ss, adam_bc2s,
+        m.adam_beta1, m.adam_beta2, m.adam_eps,
+        (step >= 500) ? m.opacity_reg : 0.0f,   // reg grace period as in Model::fullIteration
+        (step >= 500) ? m.scale_reg : 0.0f,
+        m.reg_visibility_duty,
+        m.wmax_accum ? &m.blend_wmax : nullptr);
+    m.radii = r;
+    const float max_disp = (m.cull_radius > 0.0f) ? (m.cull_radius * 0.0167f) : 0.05f;
+    msplat_sgld_noise_gen(m.num_active, m.sgld_noise_buf, (uint32_t)step);
+    msplat_sgld_noise(m.num_active, m.means, m.scales, m.quats, m.opacities,
+                      m.sgld_noise_buf, m.noise_lr, m.adam_lr[0], max_disp);
+}
+
 MTensor Model::render(Camera& cam, int step){
+    if (quant_level) return renderQ(*this, cam, step);
     auto s = prepareCam(cam, step);
     return msplat_render(
         means.size(0), means, scales, 1.0f,
@@ -1103,6 +1540,7 @@ MTensor Model::render(Camera& cam, int step){
 }
 
 void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
+    if (quant_level) { fullIterationQ(*this, cam, step, gt, ssimWeight); return; }
     auto s = prepareCam(cam, step);
     lastHeight = s.height; lastWidth = s.width;
     int numPoints = means.size(0);

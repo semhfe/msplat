@@ -66,17 +66,26 @@ endif()
 
 set(METAL_SOURCE ${CMAKE_SOURCE_DIR}/core/metal/msplat_metal.metal)
 configure_file(${METAL_SOURCE} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.metal COPYONLY)
+# Q1-Q3 kernels (--quant-level 1): own .air, linked into the same default.metallib
+set(METAL_Q_SOURCE ${CMAKE_SOURCE_DIR}/core/metal/msplat_q.metal)
+configure_file(${METAL_Q_SOURCE} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_q.metal COPYONLY)
 add_custom_command(
     OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib
     COMMAND xcrun -sdk ${MSPLAT_METAL_SDK} metal -O3 ${METAL_MIN_VERSION} -c
         ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.metal
         -o ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.air
+    COMMAND xcrun -sdk ${MSPLAT_METAL_SDK} metal -O3 ${METAL_MIN_VERSION} -c
+        ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_q.metal
+        -o ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_q.air
     COMMAND xcrun -sdk ${MSPLAT_METAL_SDK} metallib
         ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.air
+        ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_q.air
         -o ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib
     COMMAND rm -f ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.air
+    COMMAND rm -f ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_q.air
     COMMAND rm -f ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.metal
-    DEPENDS ${METAL_SOURCE}
+    COMMAND rm -f ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_q.metal
+    DEPENDS ${METAL_SOURCE} ${METAL_Q_SOURCE}
     COMMENT "Compiling Metal kernels → default.metallib"
 )
 add_custom_target(metallib ALL

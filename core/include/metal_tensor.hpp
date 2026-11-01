@@ -25,6 +25,9 @@ enum class DType : uint8_t {
     Int64,
     UInt8,
     Float64,
+    Int16,   // Q1-Q3 code stores (--quant-level 1)
+    UInt16,
+    UInt32,
 };
 
 inline size_t dtypeSize(DType dt) {
@@ -34,6 +37,9 @@ inline size_t dtypeSize(DType dt) {
         case DType::Int64:   return 8;
         case DType::UInt8:   return 1;
         case DType::Float64: return 8;
+        case DType::Int16:   return 2;
+        case DType::UInt16:  return 2;
+        case DType::UInt32:  return 4;
     }
 }
 

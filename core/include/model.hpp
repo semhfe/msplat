@@ -1,6 +1,7 @@
 #ifndef MODEL_H
 #define MODEL_H
 
+#include <iosfwd>
 #include "metal_tensor.hpp"
 #include "ssim.hpp"
 #include "input_data.hpp"
@@ -27,7 +28,9 @@ struct Model{
         // Seed initialization, reference 3dgs-mcmc create_from_pcd: opacity 0.5,
         // scale 0.1 x the kNN spacing (see the seed-fog note in the constructor).
         float initOpacity = 0.5f,
-        float initScaleMult = 0.1f);
+        float initScaleMult = 0.1f,
+        // Q1-Q3 store layout (see quant_level); must be fixed before the buffers are allocated.
+        int quantLevel = 0);
 
   ~Model(){ releaseOptimizers(); }
 
@@ -137,6 +140,29 @@ struct Model{
   void copyGaussianRow(int dst, int src);
   void zeroAdamAt(int idx);
 
+  // Q1-Q3 (--quant-level 1; layout and CPU contract: docs/superpowers/2026-10-28-confidence-densification/
+  // runs/2026-11-01-hiz-q-yerlesim.md). 0 = the fp32 stores above, unchanged. 1 = SH values as int16 codes
+  // per 256-Gaussian block x SH degree, Adam moments as (u, log_s) codes (quant_codec.hpp); means, scales,
+  // quats, featuresDc and opacities stay fp32. featuresRest_buf and the six fp32 Adam buffers are then
+  // not allocated, and featuresRest is a zero-width [num_active, 0, 3] placeholder.
+  int quant_level = 0;
+  // Rounding of the GPU training-step encodes (P2): 0 = nearest everywhere, 1 = stochastic everywhere,
+  // 2 = stochastic for Adam codes, nearest for SH values. CPU-side SH encodes (row copy, widen, shrink,
+  // seed encode) always round to nearest (rint) whatever the mode.
+  int quant_round = 0;
+  static constexpr int QB = 256;     // Gaussians per block
+  static constexpr int N_NSQ = 5;    // non-SH Adam groups: means, scales, quats, featuresDc, opacities
+  MTensor fr_codes;                  // int16  [nblk*QB, R, 3]  x = c * a / 32767
+  MTensor fr_bounds;                 // float  [nblk, 3]        a per SH degree
+  MTensor shq_state;                 // uint16 [nblk*QB, R, 3]  bits 0-7 u (int8), 8-15 log_s (uint8)
+  MTensor shq_bounds;                // float  [nblk, 3, 2]     (a_u, h_ls) per SH degree
+  MTensor nsq_state[N_NSQ];          // uint32 [nblk*QB, dim_g] bits 0-15 u (int16), 16-31 log_s (uint16)
+  MTensor nsq_bounds[N_NSQ];         // float  [nblk, 2]        (a_u, h_ls)
+  int num_rest_coeffs = 0;           // R = SH coefficients per channel minus DC (Q mode)
+  int q_widen = 0, q_shrink = 0;     // cumulative SH bound widenings / shrinks (MCMC step= line)
+  int numRestCoeffs() const { return quant_level ? num_rest_coeffs : (int)featuresRest.size(-2); }
+  MTensor decodeFeaturesRest() const;  // fp32 [num_active, R, 3] (CPU tensor)
+
 private:
   bool relocate(const std::vector<int>& dead_indices, const std::vector<int>& alive_indices);
   void placeNear(const std::vector<int>& dst);
@@ -147,6 +173,11 @@ private:
   int addNewGaussians();
   void computeRelocation(float opacity_old_sig, float* scale_old_exp, int N,
                          float& opacity_new_sig, float* scale_new_exp);
+  void setupQuant(int64_t rows, const std::vector<int64_t>& keep);
+  void copyGaussianRowQ(int dst, int src);
+  void shrinkQuant();
+  void saveCheckpointQ(const std::string &filename, int step);
+  int loadCheckpointQ(std::ifstream &f, const std::string &filename);
 };
 
 #endif

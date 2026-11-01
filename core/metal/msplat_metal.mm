@@ -818,6 +818,210 @@ extern "C" void msplat_grad_nan_counts(uint32_t out[16]) {
     std::memcpy(out, g_tcache.grad_nan_counts.data<int32_t>(), 16 * sizeof(uint32_t));
 }
 
+// ── Q1-Q3 (--quant-level 1): the Q kernels of msplat_q.metal, reached only through msplat_render_q /
+// msplat_train_step_q (bindings.h). With quant off g_q stays null, so no Q pipeline is created, no Q buffer is
+// allocated and every dispatch below is unreachable.
+struct QPipelines {
+    id<MTLComputePipelineState> fwd, bwd, adam, reg;
+};
+static QPipelines *g_qpso = nullptr;
+static const MsplatQ *g_q = nullptr;   // stores of the current msplat_*_q call (process-wide, like g_tcache)
+static MTensor g_qsat;                 // int32 [4], slot 0: qsat (log_s held at 64), slot 1: usat (non-SH |u| held at 8)
+
+// The metallib as init_msplat_metal_context finds it: explicit path, else next to this library, else next to
+// the executable (that function releases its library after loading the fp32 pipelines).
+static id<MTLLibrary> q_open_library(id<MTLDevice> device) {
+    NSError *error = nil;
+    if (g_metallib_path)
+        return [device newLibraryWithURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:g_metallib_path]] error:&error];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    id<MTLLibrary> lib = nil;
+    Dl_info dl_info;
+    if (dladdr((void*)init_msplat_metal_context, &dl_info) && dl_info.dli_fname) {
+        NSString *dir = [[NSString stringWithUTF8String:dl_info.dli_fname] stringByDeletingLastPathComponent];
+        NSString *path = [dir stringByAppendingPathComponent:@"default.metallib"];
+        if ([fm fileExistsAtPath:path]) lib = [device newLibraryWithURL:[NSURL fileURLWithPath:path] error:&error];
+    }
+    if (!lib) {
+        NSString *dir = [[[NSBundle mainBundle] executablePath] stringByDeletingLastPathComponent];
+        NSString *path = [dir stringByAppendingPathComponent:@"default.metallib"];
+        if (dir && [fm fileExistsAtPath:path]) lib = [device newLibraryWithURL:[NSURL fileURLWithPath:path] error:&error];
+    }
+    return lib;
+}
+
+// Created on the first Q call. The backward and the non-SH Adam dispatch one 256-Gaussian block per threadgroup,
+// so their pipelines must allow 256 threads (R4); a missing kernel or a lower limit stops the run.
+static void q_pipelines() {
+    if (g_qpso) return;
+    MetalContext *ctx = get_global_context();
+    id<MTLLibrary> lib = q_open_library(ctx->device);
+    if (!lib) {
+        fprintf(stderr, "msplat: FATAL: --quant-level 1 cannot load default.metallib for the Q kernels\n");
+        abort();
+    }
+    auto load = [&](NSString *name) -> id<MTLComputePipelineState> {
+        NSError *err = nil;
+        id<MTLFunction> fn = [lib newFunctionWithName:name];
+        id<MTLComputePipelineState> pso = fn ? [ctx->device newComputePipelineStateWithFunction:fn error:&err] : nil;
+        [fn release];
+        if (!pso) {
+            fprintf(stderr, "msplat: FATAL: --quant-level 1: no pipeline for %s: %s\n", [name UTF8String],
+                    err ? [[err description] UTF8String] : "kernel not in the metallib");
+            abort();
+        }
+        return pso;
+    };
+    QPipelines *q = new QPipelines{load(@"project_and_sh_forward_q"), load(@"project_and_sh_backward_q"),
+                                   load(@"fused_adam_q16"), load(@"mcmc_reg_grad_q")};
+    [lib release];
+    struct { const char *name; id<MTLComputePipelineState> pso; bool block; } psos[] = {
+        {"project_fwd_q", q->fwd, false}, {"project_bwd_q", q->bwd, true},
+        {"fused_adam_q16", q->adam, true}, {"mcmc_reg_q", q->reg, false}};
+    fprintf(stderr, "[engine] Q PSO maxThreads:");
+    for (const auto &p : psos) fprintf(stderr, " %s=%lu", p.name, (unsigned long)p.pso.maxTotalThreadsPerThreadgroup);
+    fprintf(stderr, "\n");
+    const bool shader_validation = std::getenv("MTL_SHADER_VALIDATION") != nullptr;
+    for (const auto &p : psos) {
+        if (p.block && p.pso.maxTotalThreadsPerThreadgroup < 256) {
+            fprintf(stderr, "msplat: FATAL: %s allows %lu threads/threadgroup on %s; the Q kernels need 256 "
+                    "(one block). Please report this GPU model.\n", p.name,
+                    (unsigned long)p.pso.maxTotalThreadsPerThreadgroup, [ctx->device.name UTF8String]);
+            abort();
+        }
+        if (p.pso.staticThreadgroupMemoryLength > ctx->device.maxThreadgroupMemoryLength && !shader_validation) {
+            fprintf(stderr, "msplat: FATAL: %s uses %lu bytes of threadgroup memory, %s allows %lu\n", p.name,
+                    (unsigned long)p.pso.staticThreadgroupMemoryLength, [ctx->device.name UTF8String],
+                    (unsigned long)ctx->device.maxThreadgroupMemoryLength);
+            abort();
+        }
+    }
+    g_qsat = gpu_zeros({4}, DType::Int32);
+    g_qpso = q;
+}
+
+void msplat_q_select(const MsplatQ *q) {
+    if (q) q_pipelines();
+    g_q = q;
+}
+
+uint32_t msplat_q_qsat() {
+    return g_qsat.defined() ? (uint32_t)g_qsat.data<int32_t>()[0] : 0u;
+}
+
+uint32_t msplat_q_usat() {
+    return g_qsat.defined() ? (uint32_t)g_qsat.data<int32_t>()[1] : 0u;
+}
+
+// project_and_sh_forward_q: the bindings of encode_proj_sh, fr_codes at 20 (features_rest there) and fr_bounds at 24.
+static void q_encode_proj_sh(id<MTLComputeCommandEncoder> enc, uint32_t num_points, MTensor &means3d, MTensor &scales,
+                             float glob_scale, MTensor &quats, MTensor &viewmat, MTensor &projmat,
+                             const std::array<float, 4> &intrins, const std::array<uint32_t, 2> &img_size,
+                             const std::array<uint32_t, 4> &tile_bounds, float clip_thresh, unsigned degree,
+                             unsigned degrees_to_use, const std::array<float, 4> &cam_pos, MTensor &features_dc) {
+    NSUInteger tpg = MIN(g_qpso->fwd.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
+    [enc setComputePipelineState:g_qpso->fwd];
+    ENC_SCALAR(enc, num_points, 0);
+    ENC_BUF(enc, means3d, 1); ENC_BUF(enc, scales, 2);
+    ENC_SCALAR(enc, glob_scale, 3); ENC_BUF(enc, quats, 4);
+    ENC_BUF(enc, viewmat, 5); ENC_BUF(enc, projmat, 6);
+    [enc setBytes:intrins.data() length:sizeof(intrins) atIndex:7];
+    [enc setBytes:img_size.data() length:sizeof(img_size) atIndex:8];
+    [enc setBytes:tile_bounds.data() length:sizeof(tile_bounds) atIndex:9];
+    ENC_SCALAR(enc, clip_thresh, 10);
+    ENC_BUF(enc, g_tcache.xys, 11); ENC_BUF(enc, g_tcache.depths, 12);
+    ENC_BUF(enc, g_tcache.radii_out, 13); ENC_BUF(enc, g_tcache.conics, 14);
+    ENC_BUF(enc, g_tcache.num_tiles_hit, 15);
+    ENC_SCALAR(enc, degree, 16); ENC_SCALAR(enc, degrees_to_use, 17);
+    [enc setBytes:cam_pos.data() length:sizeof(cam_pos) atIndex:18];
+    ENC_BUF(enc, features_dc, 19); ENC_BUF(enc, (*g_q->fr_codes), 20);
+    ENC_BUF(enc, g_tcache.colors, 21); ENC_BUF(enc, g_tcache.aabb, 22);
+    ENC_BUF(enc, g_tcache.grad_nan_counts, 23); // zombie-gate telemetry
+    ENC_BUF(enc, (*g_q->fr_bounds), 24);
+    [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+}
+
+// The Q replacement of encode_proj_sh_bwd_adam: project_and_sh_backward_q (projection gradients + DC/SH Adam on the
+// code stores), then mcmc_reg_grad_q when the regularizer is on, then fused_adam_q16 for means, scales, quats and
+// opacity; barriers as in encode_proj_sh_bwd_adam. One threadgroup of 256 per block.
+static void q_encode_bwd_adam(id<MTLComputeCommandEncoder> enc, int num_points, MTensor &means3d, MTensor &scales,
+                              float glob_scale, MTensor &quats, MTensor &viewmat, MTensor &projmat,
+                              const std::array<float, 4> &intrins, const std::array<uint32_t, 2> &img_size,
+                              unsigned degree, unsigned degrees_to_use, const std::array<float, 4> &cam_pos,
+                              MTensor adam_params[], float adam_step_sizes[], float adam_bc2_sqrts[],
+                              float beta1, float beta2, float eps,
+                              float op_reg, float sc_reg, float invis_scale) {
+    const MsplatQ &q = *g_q;
+    const NSUInteger nblk = ((NSUInteger)num_points + 255) / 256;
+    if (nblk == 0) return;
+    struct {  // QSHAdamParams in msplat_q.metal
+        float dc_step_size, dc_bc2_sqrt, rest_step_size, rest_bc2_sqrt, beta1, beta2, eps;
+        uint32_t step, qround;
+    } hp = {adam_step_sizes[3], adam_bc2_sqrts[3], adam_step_sizes[4], adam_bc2_sqrts[4], beta1, beta2, eps,
+            q.step, q.round};
+    [enc setComputePipelineState:g_qpso->bwd];
+    ENC_SCALAR(enc, num_points, 0); ENC_BUF(enc, means3d, 1); ENC_BUF(enc, scales, 2);
+    ENC_SCALAR(enc, glob_scale, 3); ENC_BUF(enc, quats, 4);
+    ENC_BUF(enc, viewmat, 5); ENC_BUF(enc, projmat, 6);
+    [enc setBytes:intrins.data() length:sizeof(intrins) atIndex:7];
+    [enc setBytes:img_size.data() length:sizeof(img_size) atIndex:8];
+    ENC_BUF(enc, g_tcache.radii_out, 9); ENC_BUF(enc, g_tcache.conics, 10);
+    ENC_BUF(enc, g_tcache.v_xy, 11); ENC_BUF(enc, g_tcache.v_depth, 12); ENC_BUF(enc, g_tcache.v_conic, 13);
+    ENC_BUF(enc, g_tcache.v_mean3d, 14); ENC_BUF(enc, g_tcache.v_scale, 15); ENC_BUF(enc, g_tcache.v_quat, 16);
+    ENC_SCALAR(enc, degree, 17); ENC_SCALAR(enc, degrees_to_use, 18);
+    [enc setBytes:cam_pos.data() length:sizeof(cam_pos) atIndex:19];
+    ENC_BUF(enc, g_tcache.v_colors_rast, 20);
+    ENC_BUF(enc, adam_params[3], 21);  // features_dc params
+    ENC_BUF(enc, (*q.fr_codes), 22); ENC_BUF(enc, (*q.fr_bounds), 23);
+    ENC_BUF(enc, (*q.shq_state), 24); ENC_BUF(enc, (*q.shq_bounds), 25);
+    ENC_BUF(enc, (*q.nsq_state[3]), 26); ENC_BUF(enc, (*q.nsq_bounds[3]), 27);
+    [enc setBytes:&hp length:sizeof(hp) atIndex:28];
+    ENC_BUF(enc, g_tcache.grad_nan_counts, 29);
+    ENC_BUF(enc, g_qsat, 30);
+    [enc dispatchThreadgroups:MTLSizeMake(nblk, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    if (op_reg > 0.0f || sc_reg > 0.0f) {
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        NSUInteger rtpg = MIN(g_qpso->reg.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
+        [enc setComputePipelineState:g_qpso->reg];
+        ENC_BUF(enc, adam_params[5], 0);  // opacity params
+        ENC_BUF(enc, adam_params[1], 1);  // scale params
+        ENC_BUF(enc, g_tcache.v_opacity, 2);
+        ENC_BUF(enc, g_tcache.v_scale, 3);
+        ENC_SCALAR(enc, num_points, 4);
+        ENC_SCALAR(enc, op_reg, 5);
+        ENC_SCALAR(enc, sc_reg, 6);
+        ENC_BUF(enc, g_tcache.radii_out, 7);
+        ENC_SCALAR(enc, invis_scale, 8);
+        ENC_BUF(enc, (*q.nsq_state[3]), 9);  // featuresDc codes: junk <=> the three log_s codes are 0
+        [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(rtpg, 1, 1)];
+    }
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    // Adam groups means 0, scales 1, quats 2, opacities 5 = nsq stores 0, 1, 2, 4
+    static const int adam_group[4] = {0, 1, 2, 5}, nsq[4] = {0, 1, 2, 4};
+    static const uint32_t dims[4] = {3, 3, 4, 1};
+    MTensor *grads[4] = {&g_tcache.v_mean3d, &g_tcache.v_scale, &g_tcache.v_quat, &g_tcache.v_opacity};
+    for (int k = 0; k < 4; k++) {
+        const int g = adam_group[k];
+        uint32_t rows = (uint32_t)num_points, gi = (uint32_t)g, dim = dims[k], step = q.step, round = q.round;
+        [enc setComputePipelineState:g_qpso->adam];
+        ENC_BUF(enc, adam_params[g], 0); ENC_BUF(enc, (*grads[k]), 1);
+        ENC_BUF(enc, (*q.nsq_state[nsq[k]]), 2); ENC_BUF(enc, (*q.nsq_bounds[nsq[k]]), 3);
+        ENC_SCALAR(enc, adam_step_sizes[g], 4);
+        ENC_SCALAR(enc, beta1, 5);
+        ENC_SCALAR(enc, beta2, 6);
+        ENC_SCALAR(enc, adam_bc2_sqrts[g], 7);
+        ENC_SCALAR(enc, eps, 8);
+        ENC_SCALAR(enc, rows, 9);
+        ENC_BUF(enc, g_tcache.grad_nan_counts, 10);
+        ENC_SCALAR(enc, gi, 11);
+        ENC_SCALAR(enc, dim, 12);
+        ENC_SCALAR(enc, step, 13);
+        ENC_SCALAR(enc, round, 14);
+        ENC_BUF(enc, g_qsat, 15);
+        [enc dispatchThreadgroups:MTLSizeMake(nblk, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+}
+
 // Diagnostic (CLI MSPLAT_ISECT_LOG): per-tile intersection counts of the last forward
 // pass, read in place (shared storage; count kernel output, never clamped). Call only
 // after msplat_gpu_sync(). Returns num_tiles (0 before the first forward).
@@ -1082,6 +1286,11 @@ static void forward_pipeline(
 
     // Helper lambdas to encode each stage onto a given encoder
     auto encode_proj_sh = [&](id<MTLComputeCommandEncoder> enc) {
+        if (g_q) {  // --quant-level 1: SH decoded from the code stores
+            q_encode_proj_sh(enc, num_points_u32, means3d, scales, glob_scale, quats, viewmat, projmat, *proj_intrins,
+                             *proj_img_size, *tile_bounds_arr, clip_thresh, degree, degrees_to_use, *cam_pos_arr, features_dc);
+            return;
+        }
         NSUInteger tpg = MIN(ctx->project_and_sh_forward_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
         [enc setComputePipelineState:ctx->project_and_sh_forward_kernel_cpso];
         ENC_SCALAR(enc, num_points_u32, 0);
@@ -1427,6 +1636,11 @@ std::tuple<MTensor, float> msplat_train_step(
     // ========================== FORWARD ENCODE LAMBDAS ==========================
 
     auto encode_proj_sh = [&](id<MTLComputeCommandEncoder> enc) {
+        if (g_q) {  // --quant-level 1: SH decoded from the code stores
+            q_encode_proj_sh(enc, num_points_u32, means3d, scales, glob_scale, quats, viewmat, projmat, *proj_intrins,
+                             *proj_img_size, *tile_bounds_arr, clip_thresh, degree, degrees_to_use, *cam_pos_arr, features_dc);
+            return;
+        }
         NSUInteger tpg = MIN(ctx->project_and_sh_forward_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
         [enc setComputePipelineState:ctx->project_and_sh_forward_kernel_cpso];
         ENC_SCALAR(enc, num_points_u32, 0);
@@ -1620,6 +1834,13 @@ std::tuple<MTensor, float> msplat_train_step(
     }
 
     auto encode_proj_sh_bwd_adam = [&](id<MTLComputeCommandEncoder> enc) {
+        if (g_q) {  // --quant-level 1: Q backward + DC/SH Adam, Q reg gradient, Q non-SH Adam
+            q_encode_bwd_adam(enc, num_points, means3d, scales, glob_scale, quats, viewmat, projmat, *proj_bwd_intr,
+                              *proj_bwd_isz, degree, degrees_to_use, *cam_pos_arr, adam_params, adam_step_sizes,
+                              adam_bc2_sqrts, adam_beta1, adam_beta2, adam_eps, mcmc_op_reg, mcmc_sc_reg,
+                              mcmc_reg_invis_scale);
+            return;
+        }
         NSUInteger tpg = MIN(ctx->project_and_sh_backward_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
         [enc setComputePipelineState:ctx->project_and_sh_backward_kernel_cpso];
         ENC_SCALAR(enc, num_points, 0); ENC_BUF(enc, means3d, 1); ENC_BUF(enc, scales, 2);

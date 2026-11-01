@@ -2,6 +2,7 @@
 #define MSPLAT_BINDINGS_H
 
 #include <tuple>
+#include <utility>
 #include "metal_tensor.hpp"
 
 // Release all cached GPU tensors (call before exit to prevent GPU memory leak)
@@ -114,6 +115,38 @@ void msplat_sgld_noise(
     MTensor &opacities, MTensor &noise,
     float noise_lr, float xyz_lr, float max_disp
 );
+
+// ── Q1-Q3 (--quant-level 1): code stores read and written by the Q kernels (core/metal/msplat_q.metal).
+// Layout and contract: docs/superpowers/2026-10-28-confidence-densification/runs/2026-11-01-hiz-q-yerlesim.md.
+// nsq index: 0 means, 1 scales, 2 quats, 3 featuresDc, 4 opacities.
+struct MsplatQ {
+    MTensor *fr_codes, *fr_bounds, *shq_state, *shq_bounds;
+    MTensor *nsq_state[5], *nsq_bounds[5];
+    uint32_t step;   // adam_step_count of this step (stochastic-rounding hash key)
+    uint32_t round;  // Model::quant_round: 0 nearest, 1 stochastic, 2 stochastic Adam codes only
+};
+// Selects the Q stores for the msplat_render / msplat_train_step calls that follow; nullptr = the fp32 path.
+// The first non-null call creates the Q pipelines. Callers use the entry points below.
+void msplat_q_select(const MsplatQ *q);
+struct MsplatQScope {
+    explicit MsplatQScope(const MsplatQ &q) { msplat_q_select(&q); }
+    ~MsplatQScope() { msplat_q_select(nullptr); }
+};
+// Q entry points: the arguments of msplat_render / msplat_train_step after q. The Q kernels replace
+// project_and_sh_forward_kernel, project_and_sh_backward_kernel, mcmc_reg_grad_kernel and fused_adam_kernel;
+// features_rest is the zero-width placeholder and adam_exp_avg / adam_exp_avg_sq are not read.
+template <class... A> MTensor msplat_render_q(const MsplatQ &q, A &&...a) {
+    MsplatQScope s(q);
+    return msplat_render(std::forward<A>(a)...);
+}
+template <class... A> std::tuple<MTensor, float> msplat_train_step_q(const MsplatQ &q, A &&...a) {
+    MsplatQScope s(q);
+    return msplat_train_step(std::forward<A>(a)...);
+}
+// Cumulative Q saturation counts (0 before the first Q step; read after a sync). qsat: SH Adam log_s bounds held at
+// h = 64 plus non-SH/DC log_s values clamped at 64; usat: non-SH/DC |u| values clamped at a_u = 8 (attempt 2).
+uint32_t msplat_q_qsat();
+uint32_t msplat_q_usat();
 
 // MCMC: Apply opacity and scale regularization as post-Adam parameter nudge.
 // Reg-parity: op_lr / sc_lr are the opacity and scale Adam group LRs.
