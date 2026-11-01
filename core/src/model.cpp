@@ -5,6 +5,7 @@
 #include <random>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <limits>
 #include <numeric>
@@ -501,6 +502,49 @@ int Model::addNewGaussians() {
 
 // ── Package B: relocation by maximum blending weight ────────────────────────
 
+// K4 (MSPLAT_WMAX_PCT_RADIX=1): the B6 window percentiles by a two-pass radix select on the float
+// bits. blend_wmax holds non-negative floats (zero-filled; the kernels write only w > 0), whose bit
+// patterns order like the floats, so the result is the order statistic nth_element returns, without
+// the copy. Pass 1 histograms the high 16 bits, pass 2 the low 16 bits inside each selected bucket.
+// Returns false (the caller keeps the nth_element path) if a value has the sign bit set.
+static bool wmaxPercentiles(const uint32_t *b, size_t n, const double (&p)[4], float (&out)[4], size_t &zeros) {
+    std::vector<uint32_t> hist(65536, 0);
+    zeros = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (b[i] >> 31) return false;
+        zeros += b[i] == 0;
+        hist[b[i] >> 16]++;
+    }
+    if (n == 0) { std::fill(out, out + 4, 0.0f); return true; }
+    uint32_t hi[4]; size_t r[4]; int slot[4];
+    for (int k = 0; k < 4; k++) {
+        r[k] = std::min(n - 1, (size_t)(p[k] * (double)n));
+        hi[k] = 0;
+        while (r[k] >= hist[hi[k]]) r[k] -= hist[hi[k]++];
+        slot[k] = k;
+        for (int j = 0; j < k; j++) if (hi[j] == hi[k]) { slot[k] = slot[j]; break; }
+    }
+    std::vector<uint32_t> lo(4 * 65536, 0);
+    for (size_t i = 0; i < n; i++) {
+        const uint32_t h = b[i] >> 16;
+        for (int k = 0; k < 4; k++)
+            if (slot[k] == k && h == hi[k]) lo[(size_t)k * 65536 + (b[i] & 0xFFFFu)]++;
+    }
+    for (int k = 0; k < 4; k++) {
+        const uint32_t *l = lo.data() + (size_t)slot[k] * 65536;
+        uint32_t v = 0;
+        while (r[k] >= l[v]) r[k] -= l[v++];
+        v |= hi[k] << 16;
+        std::memcpy(&out[k], &v, sizeof(float));
+    }
+    return true;
+}
+
+static bool wmaxPctRadix() {
+    static const bool v = [] { const char *e = std::getenv("MSPLAT_WMAX_PCT_RADIX"); return e && e[0] == '1'; }();
+    return v;
+}
+
 void Model::enableBlendWeights(bool relocate) {
     wmax_accum = true;
     reloc_weight = relocate;
@@ -679,6 +723,18 @@ void Model::mcmcAfterTrain(int step) {
                 dead_count += moved;
             }
         }
+        const double ps[4] = {0.01, 0.10, 0.50, 0.90};
+        float pv[4];
+        size_t kzeros;
+        if (wmaxPctRadix() && wmaxPercentiles(static_cast<const uint32_t *>(blend_wmax.data_ptr()),
+                                              (size_t)num_active, ps, pv, kzeros)) {
+            std::cout << "MCMC wmax step=" << step << " window=" << (step - wmax_since)
+                      << " mode=" << (reloc_weight ? "weight" : "accum")
+                      << " full=" << (wfull ? 1 : 0) << " moved=" << moved << " thr=" << thr
+                      << " zero=" << kzeros << " p1=" << pv[0] << " p10=" << pv[1]
+                      << " p50=" << pv[2] << " p90=" << pv[3]
+                      << " active=" << num_active << std::endl;
+        } else {
         std::vector<float> w(static_cast<const float *>(blend_wmax.data_ptr()),
                              static_cast<const float *>(blend_wmax.data_ptr()) + num_active);
         const size_t zeros = (size_t)std::count(w.begin(), w.end(), 0.0f);
@@ -694,6 +750,7 @@ void Model::mcmcAfterTrain(int step) {
                   << " zero=" << zeros << " p1=" << pct(0.01) << " p10=" << pct(0.10)
                   << " p50=" << pct(0.50) << " p90=" << pct(0.90)
                   << " active=" << num_active << std::endl;
+        }  // K4 off: the code above is unchanged from 8811d57
     }
 
     int grown = addNewGaussians();
