@@ -2260,11 +2260,12 @@ std::tuple<MTensor, float> msplat_train_step(
                 [blit fillBuffer:g_tcache.tile_write_counters.buffer()
                            range:NSMakeRange(0, g_tcache.tile_write_counters.nbytes()) value:0];
                 [blit endEncoding];
-                enc = prof_compute(cb2, "rast_bwd");
+                enc = prof_compute(cb2, "build");   // the first rebuild (level 2: no empty encoder before it)
             }
-            for (const auto &g : groups) {
+            for (size_t gi = 0; gi < groups.size(); gi++) {
+                const auto &g = groups[gi];
                 if (rebuild) {
-                    prof_split(enc, "build");
+                    if (gi) prof_split(enc, "build");
                     encode_build_fx(enc, g[0], g[1]);
                     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 }
