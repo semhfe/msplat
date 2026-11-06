@@ -53,6 +53,25 @@ extern "C" void msplat_isect_cache_state(int64_t out[4]);
 // Diagnostic: last step's image, transmittance and gradients as raw files (after msplat_gpu_sync()).
 extern "C" void msplat_dump_step_buffers(const char *dir);
 
+// Step profiler (runs/2026-11-06-hiz-profil-plan.md s2). MSPLAT_PROFILE_STEP=<file>: per-command-buffer GPU
+// start/end, CPU leaf spans and step metadata as text lines; encoders unchanged (level 1).
+// MSPLAT_PROFILE_SPLIT=count|nocount (level 2): the training encoders are split per stage, with (count) or
+// without (nocount) stage-boundary timestamps. Without MSPLAT_PROFILE_STEP every call below is a no-op.
+bool msplat_prof_on();
+void msplat_prof_set_step(int step);
+uint64_t msplat_prof_now();                                        // mach_absolute_time
+void msplat_prof_span(const char *name, uint64_t t0, uint64_t t1); // leaf CPU span (never nested)
+void msplat_prof_step_wall(uint64_t t0, uint64_t t1);              // whole step, start to end of the loop body
+void msplat_prof_meta(const char *key, double value);
+void msplat_prof_cb_kind(const char *kind);                        // label of the next committed command buffer
+void msplat_prof_calibrate();                                      // paired CPU/GPU timestamp sample
+void msplat_prof_flush();
+struct MsplatProfSpan {
+    const char *name; uint64_t t0;
+    explicit MsplatProfSpan(const char *n) : name(n), t0(msplat_prof_on() ? msplat_prof_now() : 0) {}
+    ~MsplatProfSpan() { if (t0) msplat_prof_span(name, t0, msplat_prof_now()); }
+};
+
 // GPU timing — non-invasive, uses completion handlers on committed CBs
 void msplat_enable_gpu_timing(bool enable);
 // Drains accumulated GPU times (ms per CB) into the provided vector. Thread-safe.

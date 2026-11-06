@@ -358,7 +358,20 @@ void Model::computeRelocation(float opacity_old_sig, float* scale_old_exp, int N
 // parameters are copied between slots (relocation and growth; Q extends it to the quantized store).
 // Same bytes in the same order as the former inline copies. Precondition: GPU synced, src != dst,
 // both < buf_capacity. Adam state is not touched; callers reset it with zeroAdamAt(dst).
+// step profiler: total time and count of row copies in the current MCMC pass (reported as M copy_row_*)
+static uint64_t g_prof_copy_ticks = 0, g_prof_copy_rows = 0;
 void Model::copyGaussianRow(int dst, int src) {
+    if (msplat_prof_on()) {
+        const uint64_t t0 = msplat_prof_now();
+        copyGaussianRowImpl(dst, src);
+        g_prof_copy_ticks += msplat_prof_now() - t0;
+        g_prof_copy_rows++;
+        return;
+    }
+    copyGaussianRowImpl(dst, src);
+}
+
+void Model::copyGaussianRowImpl(int dst, int src) {
     if (quant_level) { copyGaussianRowQ(dst, src); return; }
     float *mbuf = means_buf.data<float>();
     float *sbuf = scales_buf.data<float>();
@@ -818,6 +831,15 @@ void Model::mcmcAfterTrain(int step) {
     // Stop relocation/growth in the final steps for pure fine-tuning.
     if (step >= (int)(maxSteps * 0.833f)) return;
     msplat_gpu_sync();
+    // step profiler: consecutive leaf spans of this pass (the sync above is the wait_sync span)
+    const bool prof = msplat_prof_on();
+    uint64_t pt = prof ? msplat_prof_now() : 0;
+    auto prof_mark = [&](const char *name) {
+        if (!prof) return;
+        const uint64_t t = msplat_prof_now();
+        msplat_prof_span(name, pt, t);
+        pt = t;
+    };
 
     const float *op  = opacities.data<float>();
     const float *mn  = means.data<float>();
@@ -887,10 +909,13 @@ void Model::mcmcAfterTrain(int step) {
         else         alive.push_back(i);
     }
 
+    prof_mark("mcmc_scan");
     if (quant_level) shrinkQuant();  // before relocation, which reads and may widen the bounds
+    if (quant_level) prof_mark("mcmc_shrinkq");
 
     int dead_count = (int)dead.size();
     const bool repaired = !dead.empty() && !alive.empty() && relocate(dead, alive);
+    prof_mark("mcmc_relocate");
     if (wwin) {
         // B2 on a full window only (B5), then B6: one line per window. The safety repairs above run
         // first (Codex C4 #1): the weight pass draws from the survivors plus the slots just repaired
@@ -938,10 +963,20 @@ void Model::mcmcAfterTrain(int step) {
         }  // K4 off: the code above is unchanged from 8811d57
     }
 
+    if (wwin) prof_mark("mcmc_wwin");
     int grown = addNewGaussians();
 
     if (dead_count > 0 || grown > 0) refreshViews();
     if (wwin) resetBlendWeights(step);
+    prof_mark("mcmc_grow");
+    if (prof) {
+        msplat_prof_meta("mcmc_dead", dead_count);
+        msplat_prof_meta("mcmc_grown", grown);
+        msplat_prof_meta("n_post", num_active);
+        msplat_prof_meta("copy_row_ticks", (double)g_prof_copy_ticks);  // mach ticks, inside mcmc_relocate/mcmc_grow
+        msplat_prof_meta("copy_rows", (double)g_prof_copy_rows);
+        g_prof_copy_ticks = g_prof_copy_rows = 0;
+    }
 
     // Throttle stdout to every 1000 steps — matches the step-timer output cadence.
     if (step % 1000 == 0) {
@@ -1054,6 +1089,7 @@ void Model::mcmcAfterTrain(int step) {
         std::cout << "MCMC nan-inject step=" << step
                   << " poisoned=100 (featuresDc)" << std::endl;
     }
+    prof_mark("mcmc_tail");
 }
 
 void Model::save(const std::string &filename, int step) {
@@ -1479,10 +1515,24 @@ static MTensor renderQ(Model &m, Camera &cam, int step) {
 
 // Model::fullIteration for the code stores: the same step, Adam step sizes and SGLD noise; the SH values and every
 // Adam moment live in the Q stores (the fp32 Adam arrays passed along are unallocated and never read).
+// Step profiler: prepare_cam span (pt = its start; pt moves to its end) and the step's camera metadata.
+static void profStepMeta(uint64_t &pt, int w, int h, int degree, int n) {
+    const uint64_t t = msplat_prof_now();
+    msplat_prof_span("prepare_cam", pt, t);
+    pt = t;
+    msplat_prof_meta("w", w);
+    msplat_prof_meta("h", h);
+    msplat_prof_meta("sh_degree", degree);
+    msplat_prof_meta("n_pre", n);
+}
+
 static void fullIterationQ(Model &m, Camera &cam, int step, MTensor &gt, float ssimWeight) {
+    const bool prof = msplat_prof_on();
+    uint64_t pt = prof ? msplat_prof_now() : 0;
     auto s = m.prepareCam(cam, step);
     m.lastHeight = s.height; m.lastWidth = s.width;
     int numPoints = m.means.size(0);
+    if (prof) profStepMeta(pt, s.width, s.height, s.degreesToUse, numPoints);
     if (!m.window2d.defined()) {
         auto w = createSSIMWindow(11, 1.5f);
         m.window2d = gpu_empty({11, 11}, DType::Float32);
@@ -1504,6 +1554,7 @@ static void fullIterationQ(Model &m, Camera &cam, int step, MTensor &gt, float s
         ? 1.0f / (float)(cam.unmaskedPixels * 3)
         : 1.0f / (float)(s.height * s.width * 3);
     MsplatQ q = qStores(m);
+    if (prof) msplat_prof_span("adam_prep", pt, msplat_prof_now());
     auto [r, loss] = msplat_train_step_q(q,
         numPoints, m.means, m.scales, 1.0f,
         m.quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
@@ -1523,6 +1574,7 @@ static void fullIterationQ(Model &m, Camera &cam, int step, MTensor &gt, float s
         m.wmax_accum ? &m.blend_wmax : nullptr);
     m.radii = r;
     const float max_disp = (m.cull_radius > 0.0f) ? (m.cull_radius * 0.0167f) : 0.05f;
+    MsplatProfSpan sp("enc_sgld");
     msplat_sgld_noise_gen(m.num_active, m.sgld_noise_buf, (uint32_t)step);
     msplat_sgld_noise(m.num_active, m.means, m.scales, m.quats, m.opacities,
                       m.sgld_noise_buf, m.noise_lr, m.adam_lr[0], max_disp);
@@ -1541,9 +1593,12 @@ MTensor Model::render(Camera& cam, int step){
 
 void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
     if (quant_level) { fullIterationQ(*this, cam, step, gt, ssimWeight); return; }
+    const bool prof = msplat_prof_on();
+    uint64_t pt = prof ? msplat_prof_now() : 0;
     auto s = prepareCam(cam, step);
     lastHeight = s.height; lastWidth = s.width;
     int numPoints = means.size(0);
+    if (prof) profStepMeta(pt, s.width, s.height, s.degreesToUse, numPoints);
 
     // Initialize SSIM window (once)
     if (!window2d.defined()) {
@@ -1575,6 +1630,7 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
         ? 1.0f / (float)(cam.unmaskedPixels * 3)
         : 1.0f / (float)(s.height * s.width * 3);
 
+    if (prof) msplat_prof_span("adam_prep", pt, msplat_prof_now());
     auto [r, loss] = msplat_train_step(
         numPoints, means, scales, 1.0f,
         quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
@@ -1612,6 +1668,7 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
     // cull_radius=3.0, and adapts to any normalization. Falls back to 0.05 when
     // culling is disabled (cull_radius == 0).
     const float max_disp = (cull_radius > 0.0f) ? (cull_radius * 0.0167f) : 0.05f;
+    MsplatProfSpan sp("enc_sgld");
     msplat_sgld_noise_gen(num_active, sgld_noise_buf, (uint32_t)step);
     msplat_sgld_noise(num_active, means, scales, quats, opacities,
                       sgld_noise_buf, noise_lr, adam_lr[0], max_disp);

@@ -1,6 +1,7 @@
 #include <filesystem>
 #include <chrono>
 #include <algorithm>
+#include <csignal>
 #include <numeric>
 #include <climits>
 #include <cmath>
@@ -442,20 +443,59 @@ int main(int argc, char *argv[]) {
         FILE *isectLog = std::getenv("MSPLAT_ISECT_LOG") ? fopen(std::getenv("MSPLAT_ISECT_LOG"), "wb") : nullptr;
         const size_t isectEvery = std::getenv("MSPLAT_ISECT_EVERY") ? std::max(1, atoi(std::getenv("MSPLAT_ISECT_EVERY"))) : 10;
 
+        // Step profiler (runs/2026-11-06-hiz-profil-plan.md): MSPLAT_PROFILE_STEP turns it on (bindings.h);
+        // SIGTERM then stops after the current step with a final sync and flush (controlled stop).
+        // MSPLAT_PROFILE_MARKS=a,b,...: prints the mach time at the start of those steps (no sync).
+        const bool prof = msplat_prof_on();
+        static volatile sig_atomic_t profStop = 0;
+        if (prof) signal(SIGTERM, [](int) { profStop = 1; });
+        std::vector<size_t> profMarks;
+        if (const char *mk = std::getenv("MSPLAT_PROFILE_MARKS"))
+            for (const char *c = mk; *c; ) { profMarks.push_back(strtoull(c, (char **)&c, 10)); if (*c == ',') c++; else break; }
+        const size_t profFirst = step;   // first step of this process (a resumed run starts later)
+        // end of training, both exits: drain, end record, last calibration, write (C4 #4); the sync's own wait
+        // is the wait_sync span, so no span wraps it (C4 #9)
+        auto profEnd = [&] {
+            msplat_gpu_sync();
+            msplat_prof_meta("train_end", (double)msplat_prof_now());
+            msplat_prof_calibrate();
+            msplat_prof_flush();
+        };
         auto bench_start = cpu_now();
         for (; step <= (size_t)numIters; step++) {
             @autoreleasepool {
+            const uint64_t profW0 = (prof || !profMarks.empty()) ? msplat_prof_now() : 0;
+            if (!profMarks.empty() && std::find(profMarks.begin(), profMarks.end(), step) != profMarks.end())
+                std::cout << "[mark] step=" << step << " mach=" << profW0 << std::endl;
+            if (prof) {
+                msplat_prof_set_step((int)step);
+                if (step == profFirst || step % 1000 == 0) msplat_prof_calibrate();
+            }
             if (stream) streamGuard([&] { stream->push(camsIter.next()); });
             Camera &cam = cams[stream ? stream->front() : camsIter.next()];
 
             auto iter_start = cpu_now();
+            const uint64_t profG0 = prof ? msplat_prof_now() : 0;
             MTensor gt = stream ? streamGuard([&] { return stream->pop(); }) : cam.getGPUImage();
+            if (prof) {
+                msplat_prof_span("gt_fetch", profG0, msplat_prof_now());
+                msplat_prof_meta("cam", (double)(&cam - cams.data()));
+            }
             if (gtHashLog) fprintf(gtHashLog, "train %zu %d %016llx %zu\n", step, (int)(&cam - cams.data()), gtHash(gt), gt.nbytes());
             model.fullIteration(cam, step, gt, ssimWeight);
             model.schedulersStep(step);
             model.mcmcAfterTrain(step);
             msplat_commit();
             lastDone = step;
+            if (prof) {
+                msplat_prof_step_wall(profW0, msplat_prof_now());
+                if (step % 1000 == 0) msplat_prof_flush();
+                if (profStop) {
+                    profEnd();
+                    std::cout << "[profile] stopped after step " << step << " (SIGTERM)" << std::endl;
+                    std::exit(0);
+                }
+            }
 
             if (isectLog && step % isectEvery == 0) {
                 msplat_gpu_sync();
@@ -629,6 +669,7 @@ int main(int argc, char *argv[]) {
             }
             } // @autoreleasepool
         }
+        if (prof) profEnd();
 
         if (stream) {
             std::cout << "[image-stream] depth=" << streamDepth << " pops=" << stream->pops << " stalls=" << stream->stalls

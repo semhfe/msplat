@@ -41,6 +41,26 @@ static std::mutex g_stage_timing_mutex;
 static std::vector<double> g_stage_times[N_TRAIN_STAGES];
 static int g_stage_report_count = 0;
 
+// Step profiler state (bindings.h, msplat_prof_*). g_prof null = off: no handler, no split, no line.
+static FILE *g_prof = nullptr;
+static bool g_prof_checked = false;
+static int g_prof_split = 0;                       // 0 off, 1 split without counters, 2 split with counters
+static std::atomic<int> g_prof_step{0};
+static std::mutex g_prof_mu;
+static std::string g_prof_buf;                     // lines since the last flush (GPU handlers append too)
+static const char *g_prof_kind = "other";          // label of the next committed command buffer
+static uint64_t g_prof_seq = 0;
+// Timestamp sample buffers: each command buffer takes its own from a pool (C4 #3) and they return to the pool
+// after its completion handler has resolved them, so no sample is reused before it is read.
+static constexpr NSUInteger kProfSlots = 1024;     // samples per buffer, 2 per encoder
+static std::vector<id<MTLCounterSampleBuffer>> g_prof_pool;   // free buffers (g_prof_mu)
+static std::vector<id<MTLCounterSampleBuffer>> g_prof_cb_csb; // buffers of the command buffer being encoded
+static NSUInteger g_prof_slot = kProfSlots;        // next free sample in g_prof_cb_csb.back()
+struct ProfEnc { const char *name; id<MTLCounterSampleBuffer> csb; NSUInteger idx; };
+static std::vector<ProfEnc> g_prof_pending;        // encoders with timestamps since the last commit
+static void prof_init();
+static void prof_attach(id<MTLCommandBuffer> cb);  // completion handler of a command buffer about to be committed
+
 // A4: deferred MTLBuffer release. MTensor's RAII hands owned buffers to this hook instead of
 // releasing them, so a buffer still referenced by uncommitted or in-flight GPU work is never
 // freed under it, whatever the command buffer's reference-retention mode:
@@ -203,16 +223,23 @@ struct MetalContext {
                 note_completed(serial);
                 dispatch_semaphore_signal(sem);
             }];
+            if (g_prof) prof_attach(_currentCB);
             [_currentCB commitAndContinue];
             note_committed(under);
+            const uint64_t w0 = g_prof ? mach_absolute_time() : 0;
             dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+            if (g_prof) msplat_prof_span("wait_inflight", w0, mach_absolute_time());
         }
     }
     void syncCB() {
         if (_currentCB) {
             std::vector<void*>* v = take_released_pending();
+            const bool cb1 = g_prof && !strcmp(g_prof_kind, "cb1");
+            if (g_prof) prof_attach(_currentCB);
+            const uint64_t w0 = g_prof ? mach_absolute_time() : 0;
             [_currentCB commit];
             [_currentCB waitUntilCompleted];
+            if (g_prof) msplat_prof_span(cb1 ? "wait_cb1" : "wait_sync", w0, mach_absolute_time());
             [_currentCB release];
             _currentCB = nil;
             release_list(v);
@@ -581,6 +608,193 @@ MetalContext* get_global_context() {
     return ctx;
 }
 
+// ── Step profiler (bindings.h). Line format (one event per line, fields separated by spaces):
+//   H <mach numer> <mach denom> <split 0|1|2>        header
+//   C <cpu_ts> <gpu_ts> <mach> <host_s>              paired sampleTimestamps + mach_absolute_time (also in seconds)
+//   W <step> <t0> <t1>                               step wall (mach)
+//   S <step> <t0> <t1> <name>                        leaf CPU span (mach)
+//   G <step> <seq> <kind> <gpu_start_s> <gpu_end_s>  command buffer GPUStartTime / GPUEndTime (host seconds)
+//   E <step> <seq> <name> <ts0> <ts1>                encoder stage-boundary timestamps (raw GPU ticks; NA on error)
+//   M <step> <key> <value>                           metadata
+// <step> is the training step current when the event was recorded (G/E: when the buffer was committed).
+static void prof_line(const std::string &s) {
+    std::lock_guard<std::mutex> lock(g_prof_mu);
+    g_prof_buf += s;
+}
+
+static void prof_init() {
+    if (g_prof_checked) return;
+    g_prof_checked = true;
+    const char *path = std::getenv("MSPLAT_PROFILE_STEP");
+    if (!path || !*path) return;
+    g_prof = fopen(path, "w");
+    if (!g_prof) { fprintf(stderr, "msplat: FATAL: MSPLAT_PROFILE_STEP: cannot open %s\n", path); abort(); }
+    const char *sp = std::getenv("MSPLAT_PROFILE_SPLIT");
+    g_prof_split = !sp ? 0 : !strcmp(sp, "count") ? 2 : !strcmp(sp, "nocount") ? 1 : -1;
+    if (g_prof_split < 0) { fprintf(stderr, "msplat: FATAL: MSPLAT_PROFILE_SPLIT must be count or nocount\n"); abort(); }
+    if (g_prof_split == 2) {
+        id<MTLDevice> dev = get_global_context()->device;
+        id<MTLCounterSet> ts = nil;
+        for (id<MTLCounterSet> cs in dev.counterSets)
+            if ([[cs name] isEqualToString:MTLCommonCounterSetTimestamp]) ts = cs;
+        if (!ts || ![dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+            fprintf(stderr, "msplat: FATAL: MSPLAT_PROFILE_SPLIT=count: no stage-boundary timestamp sampling\n");
+            abort();
+        }
+    }
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    char b[96];
+    snprintf(b, sizeof b, "H %u %u %d\n", tb.numer, tb.denom, g_prof_split);
+    prof_line(b);
+    fprintf(stderr, "[profile] step profile -> %s (split %d)\n", path, g_prof_split);
+}
+
+bool msplat_prof_on() { prof_init(); return g_prof != nullptr; }
+void msplat_prof_set_step(int step) { g_prof_step = step; }
+uint64_t msplat_prof_now() { return mach_absolute_time(); }
+
+void msplat_prof_span(const char *name, uint64_t t0, uint64_t t1) {
+    if (!g_prof) return;
+    char b[160];
+    snprintf(b, sizeof b, "S %d %llu %llu %s\n", g_prof_step.load(), (unsigned long long)t0, (unsigned long long)t1, name);
+    prof_line(b);
+}
+
+void msplat_prof_step_wall(uint64_t t0, uint64_t t1) {
+    if (!g_prof) return;
+    char b[96];
+    snprintf(b, sizeof b, "W %d %llu %llu\n", g_prof_step.load(), (unsigned long long)t0, (unsigned long long)t1);
+    prof_line(b);
+}
+
+void msplat_prof_meta(const char *key, double value) {
+    if (!g_prof) return;
+    char b[160];
+    snprintf(b, sizeof b, "M %d %s %.17g\n", g_prof_step.load(), key, value);
+    prof_line(b);
+}
+
+void msplat_prof_cb_kind(const char *kind) { if (g_prof) g_prof_kind = kind; }
+
+void msplat_prof_calibrate() {
+    if (!g_prof) return;
+    MTLTimestamp cpu = 0, gpu = 0;
+    [get_global_context()->device sampleTimestamps:&cpu gpuTimestamp:&gpu];
+    const uint64_t m = mach_absolute_time();
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    const double host = (double)m * tb.numer / tb.denom * 1e-9;  // the host-time base of GPUStartTime (CACurrentMediaTime)
+    char b[160];
+    snprintf(b, sizeof b, "C %llu %llu %llu %.9f\n", (unsigned long long)cpu, (unsigned long long)gpu,
+             (unsigned long long)m, host);
+    prof_line(b);
+}
+
+void msplat_prof_flush() {
+    if (!g_prof) return;
+    std::string s;
+    { std::lock_guard<std::mutex> lock(g_prof_mu); s.swap(g_prof_buf); }
+    fwrite(s.data(), 1, s.size(), g_prof);
+    fflush(g_prof);
+}
+
+// The buffer's label and the timestamped encoders recorded since the previous commit go to its handler.
+static void prof_attach(id<MTLCommandBuffer> cb) {
+    const int step = g_prof_step.load();
+    const uint64_t seq = ++g_prof_seq;
+    const char *kind = g_prof_kind;
+    g_prof_kind = "other";
+    auto *pend = new std::vector<ProfEnc>();
+    pend->swap(g_prof_pending);
+    auto *bufs = new std::vector<id<MTLCounterSampleBuffer>>();
+    bufs->swap(g_prof_cb_csb);
+    g_prof_slot = kProfSlots;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        char b[192];
+        snprintf(b, sizeof b, "G %d %llu %s %.9f %.9f\n", step, (unsigned long long)seq, kind,
+                 done.GPUStartTime, done.GPUEndTime);
+        std::string s = b;
+        for (const auto &p : *pend) {
+            NSData *data = [p.csb resolveCounterRange:NSMakeRange(p.idx, 2)];
+            const MTLCounterResultTimestamp *r = data ? (const MTLCounterResultTimestamp *)data.bytes : nullptr;
+            if (r && r[0].timestamp != MTLCounterErrorValue && r[1].timestamp != MTLCounterErrorValue)
+                snprintf(b, sizeof b, "E %d %llu %s %llu %llu\n", step, (unsigned long long)seq, p.name,
+                         (unsigned long long)r[0].timestamp, (unsigned long long)r[1].timestamp);
+            else
+                snprintf(b, sizeof b, "E %d %llu %s NA NA\n", step, (unsigned long long)seq, p.name);
+            s += b;
+        }
+        delete pend;
+        std::lock_guard<std::mutex> lock(g_prof_mu);
+        g_prof_buf += s;
+        for (auto c : *bufs) g_prof_pool.push_back(c);
+        delete bufs;
+    }];
+}
+
+// Two samples for the next timestamped encoder of the command buffer being encoded; a full buffer is followed
+// by another one from the pool (created when the pool is empty).
+static ProfEnc prof_slot(const char *name) {
+    if (g_prof_slot + 2 > kProfSlots) {
+        id<MTLCounterSampleBuffer> c = nil;
+        {
+            std::lock_guard<std::mutex> lock(g_prof_mu);
+            if (!g_prof_pool.empty()) { c = g_prof_pool.back(); g_prof_pool.pop_back(); }
+        }
+        if (!c) {
+            id<MTLDevice> dev = get_global_context()->device;
+            id<MTLCounterSet> ts = nil;
+            for (id<MTLCounterSet> cs in dev.counterSets)
+                if ([[cs name] isEqualToString:MTLCommonCounterSetTimestamp]) ts = cs;
+            MTLCounterSampleBufferDescriptor *d = [MTLCounterSampleBufferDescriptor new];
+            d.counterSet = ts; d.sampleCount = kProfSlots; d.storageMode = MTLStorageModeShared;
+            NSError *err = nil;
+            c = [dev newCounterSampleBufferWithDescriptor:d error:&err];
+            [d release];
+            if (!c) { fprintf(stderr, "msplat: FATAL: counter sample buffer: %s\n", err.localizedDescription.UTF8String); abort(); }
+        }
+        g_prof_cb_csb.push_back(c);
+        g_prof_slot = 0;
+    }
+    ProfEnc e{name, g_prof_cb_csb.back(), g_prof_slot};
+    g_prof_slot += 2;
+    g_prof_pending.push_back(e);
+    return e;
+}
+
+// Level 2 encoders. Off (or level 1): exactly [cb computeCommandEncoder] / [cb blitCommandEncoder].
+static id<MTLComputeCommandEncoder> prof_compute(id<MTLCommandBuffer> cb, const char *name) {
+    prof_init();
+    if (g_prof_split != 2) return [cb computeCommandEncoder];
+    const ProfEnc e = prof_slot(name);
+    MTLComputePassDescriptor *d = [MTLComputePassDescriptor computePassDescriptor];
+    d.sampleBufferAttachments[0].sampleBuffer = e.csb;
+    d.sampleBufferAttachments[0].startOfEncoderSampleIndex = e.idx;
+    d.sampleBufferAttachments[0].endOfEncoderSampleIndex = e.idx + 1;
+    return [cb computeCommandEncoderWithDescriptor:d];
+}
+
+static id<MTLBlitCommandEncoder> prof_blit(id<MTLCommandBuffer> cb, const char *name) {
+    prof_init();
+    if (g_prof_split != 2) return [cb blitCommandEncoder];
+    const ProfEnc e = prof_slot(name);
+    MTLBlitPassDescriptor *d = [MTLBlitPassDescriptor blitPassDescriptor];
+    d.sampleBufferAttachments[0].sampleBuffer = e.csb;
+    d.sampleBufferAttachments[0].startOfEncoderSampleIndex = e.idx;
+    d.sampleBufferAttachments[0].endOfEncoderSampleIndex = e.idx + 1;
+    return [cb blitCommandEncoderWithDescriptor:d];
+}
+
+// Level 2: end the current compute encoder and continue the same command buffer in a new one named
+// name. The caller has already issued the barrier the next stage needs; buffers are hazard-tracked
+// across encoders. No-op unless MSPLAT_PROFILE_SPLIT is set.
+static void prof_split(id<MTLComputeCommandEncoder> &enc, const char *name) {
+    if (g_prof_split <= 0) return;
+    [enc endEncoding];
+    enc = prof_compute(get_global_context()->_currentCB, name);
+}
+
 
 
 #define ENC_SCALAR(encoder, x, i) [encoder setBytes:&x length:sizeof(x) atIndex:i]
@@ -726,6 +940,7 @@ struct FusedTensorCache {
         // group's size marker is invalidated first and set only after all its buffers exist;
         // a failed group is rebuilt on the next call instead of being skipped half-allocated.
         if (np != fwd_num_points) {
+            msplat_prof_meta("realloc_fwd", np);
             fwd_num_points = -1;
             xys.reset();            xys = mtensor_empty(dev, {np, 2}, DType::Float32);
             depths.reset();         depths = mtensor_empty(dev, {np}, DType::Float32);
@@ -786,6 +1001,7 @@ struct FusedTensorCache {
 
     void ensure_backward(int np, int frb, id<MTLDevice> dev) {
         if (np != bwd_num_points || frb != features_rest_bases || !v_xy.defined()) {
+            msplat_prof_meta("realloc_bwd", np);
             bwd_num_points = -1;  // set only after success (see ensure_forward)
             // reset() before reassign — see the leak note in ensure_forward.
             v_xy.reset();            v_xy = mtensor_empty(dev, {np, 2}, DType::Float32);
@@ -944,7 +1160,7 @@ static void q_encode_proj_sh(id<MTLComputeCommandEncoder> enc, uint32_t num_poin
 // The Q replacement of encode_proj_sh_bwd_adam: project_and_sh_backward_q (projection gradients + DC/SH Adam on the
 // code stores), then mcmc_reg_grad_q when the regularizer is on, then fused_adam_q16 for means, scales, quats and
 // opacity; barriers as in encode_proj_sh_bwd_adam. One threadgroup of 256 per block.
-static void q_encode_bwd_adam(id<MTLComputeCommandEncoder> enc, int num_points, MTensor &means3d, MTensor &scales,
+static void q_encode_bwd_adam(id<MTLComputeCommandEncoder> &enc, int num_points, MTensor &means3d, MTensor &scales,
                               float glob_scale, MTensor &quats, MTensor &viewmat, MTensor &projmat,
                               const std::array<float, 4> &intrins, const std::array<uint32_t, 2> &img_size,
                               unsigned degree, unsigned degrees_to_use, const std::array<float, 4> &cam_pos,
@@ -981,6 +1197,7 @@ static void q_encode_bwd_adam(id<MTLComputeCommandEncoder> enc, int num_points, 
     [enc dispatchThreadgroups:MTLSizeMake(nblk, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     if (op_reg > 0.0f || sc_reg > 0.0f) {
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        prof_split(enc, "reg");
         NSUInteger rtpg = MIN(g_qpso->reg.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
         [enc setComputePipelineState:g_qpso->reg];
         ENC_BUF(enc, adam_params[5], 0);  // opacity params
@@ -996,6 +1213,7 @@ static void q_encode_bwd_adam(id<MTLComputeCommandEncoder> enc, int num_points, 
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(rtpg, 1, 1)];
     }
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    prof_split(enc, "adam_nonsh");
     // Adam groups means 0, scales 1, quats 2, opacities 5 = nsq stores 0, 1, 2, 4
     static const int adam_group[4] = {0, 1, 2, 5}, nsq[4] = {0, 1, 2, 4};
     static const uint32_t dims[4] = {3, 3, 4, 1};
@@ -1133,9 +1351,9 @@ static void encode_count_isect(MetalContext *ctx, id<MTLComputeCommandEncoder> e
     [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
 }
 
-static void encode_build_isect(MetalContext *ctx, id<MTLComputeCommandEncoder> enc, uint32_t num_points,
+static void encode_build_isect(MetalContext *ctx, id<MTLComputeCommandEncoder> &enc, uint32_t num_points,
                                uint32_t num_tiles, const std::array<uint32_t, 4> &tile_bounds,
-                               MTensor &opacities, uint32_t lo, uint32_t hi) {
+                               MTensor &opacities, uint32_t lo, uint32_t hi, bool prof_sort = false) {
     uint32_t capacity_u32 = (uint32_t)g_tcache.capacity;
     uint32_t key_capacity_u32 = (uint32_t)g_tcache.key_capacity;
     uint32_t tile_range[2] = {lo, hi};
@@ -1164,6 +1382,7 @@ static void encode_build_isect(MetalContext *ctx, id<MTLComputeCommandEncoder> e
     [enc setBytes:tile_range length:sizeof(tile_range) atIndex:10];
     [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    if (prof_sort) prof_split(enc, "sort_pack");
 
     // hybrid_sort_pack — per-tile bitonic sort + pack into rasterizer buffers
     [enc setComputePipelineState:ctx->hybrid_sort_pack_kernel_cpso];
@@ -1545,6 +1764,11 @@ std::tuple<MTensor, float> msplat_train_step(
     int num_tiles = tile_bounds_x * tile_bounds_y;
 
     const bool fixed_isect = g_tcache.key_slots > 0;
+    const uint64_t prof_t0 = msplat_prof_on() ? mach_absolute_time() : 0;
+    if (g_prof_split && !fixed_isect) {
+        fprintf(stderr, "msplat: FATAL: MSPLAT_PROFILE_SPLIT needs the fixed intersection buffers\n");
+        abort();
+    }
     int64_t capacity = fixed_isect ? g_tcache.out_slots : (int64_t)num_points * g_tcache.capacity_multiplier;
     int64_t key_capacity = fixed_isect ? g_tcache.key_slots : capacity;
     uint32_t channels = 3;
@@ -1668,6 +1892,10 @@ std::tuple<MTensor, float> msplat_train_step(
     };
     auto encode_build = [&](id<MTLComputeCommandEncoder> enc, uint32_t lo, uint32_t hi) {
         encode_build_isect(ctx, enc, num_points_u32, (uint32_t)num_tiles, *tile_bounds_arr, opacities, lo, hi);
+    };
+    // fixed-isect path: level 2 splits prefix+scatter from sort_pack
+    auto encode_build_fx = [&](id<MTLComputeCommandEncoder> &enc, uint32_t lo, uint32_t hi) {
+        encode_build_isect(ctx, enc, num_points_u32, (uint32_t)num_tiles, *tile_bounds_arr, opacities, lo, hi, true);
     };
     auto encode_prefix_sort_pack = [&](id<MTLComputeCommandEncoder> enc) {
         encode_count(enc);
@@ -1833,7 +2061,7 @@ std::tuple<MTensor, float> msplat_train_step(
         sh_adam_hp->eps = adam_eps;
     }
 
-    auto encode_proj_sh_bwd_adam = [&](id<MTLComputeCommandEncoder> enc) {
+    auto encode_proj_sh_bwd_adam = [&](id<MTLComputeCommandEncoder> &enc) {
         if (g_q) {  // --quant-level 1: Q backward + DC/SH Adam, Q reg gradient, Q non-SH Adam
             q_encode_bwd_adam(enc, num_points, means3d, scales, glob_scale, quats, viewmat, projmat, *proj_bwd_intr,
                               *proj_bwd_isz, degree, degrees_to_use, *cam_pos_arr, adam_params, adam_step_sizes,
@@ -1870,6 +2098,7 @@ std::tuple<MTensor, float> msplat_train_step(
         // Gaussians (photometric grad == 0) thus receive near-full-LR downward steps.
         if (mcmc_op_reg > 0.0f || mcmc_sc_reg > 0.0f) {
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            prof_split(enc, "reg");
             NSUInteger rtpg = MIN(ctx->mcmc_reg_grad_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
             [enc setComputePipelineState:ctx->mcmc_reg_grad_kernel_cpso];
             [enc setBuffer:adam_params[5].buffer() offset:0 atIndex:0];  // opacity params
@@ -1887,6 +2116,7 @@ std::tuple<MTensor, float> msplat_train_step(
         // Adam for remaining groups (skip 3=featuresDc, 4=featuresRest — fused above)
         if (num_adam_groups > 0) {
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            prof_split(enc, "adam_nonsh");
             for (int g = 0; g < num_adam_groups; ++g) {
                 if (g == 3 || g == 4) continue;  // fused into backward kernel
                 uint32_t n = adam_params[g].numel();
@@ -1917,7 +2147,7 @@ std::tuple<MTensor, float> msplat_train_step(
 
     // Blit-zero helper (shared by both paths)
     auto do_blit_zero = [&](id<MTLCommandBuffer> cb, bool zero_loss) {
-        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        id<MTLBlitCommandEncoder> blit = prof_blit(cb, "blit_zero");
         if (zero_loss) [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
         // tile_counts and tile_write_counters are atomically incremented by kernels 1 and 3
         [blit fillBuffer:g_tcache.tile_counts.buffer() range:NSMakeRange(0, g_tcache.tile_counts.nbytes()) value:0];
@@ -1949,16 +2179,22 @@ std::tuple<MTensor, float> msplat_train_step(
         // single projection backward + Adam at the end; gradients accumulate across groups.
         // The loss accumulator is zeroed in CB2, so after the wait it still holds the previous
         // (completed) step's loss — what this function returns on this path.
+        const uint64_t prof_tc = g_prof ? mach_absolute_time() : 0;
+        if (g_prof) msplat_prof_span("train_prep", prof_t0, prof_tc);   // cache (re)allocation, argument setup
         id<MTLCommandBuffer> cb1 = ctx->getCommandBuffer();
         dispatch_sync(ctx->d_queue, ^(){
             do_blit_zero(cb1, false);
-            id<MTLComputeCommandEncoder> enc = [cb1 computeCommandEncoder];
+            id<MTLComputeCommandEncoder> enc = prof_compute(cb1, "proj_sh_fwd");
             encode_proj_sh(enc);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            prof_split(enc, "count");
             encode_count(enc);
             [enc endEncoding];
         });
+        if (g_prof) msplat_prof_span("enc_cb1", prof_tc, mach_absolute_time());
+        msplat_prof_cb_kind("cb1");
         ctx->syncCB();
+        const uint64_t prof_t1 = g_prof ? mach_absolute_time() : 0;
         fixed_prev_loss = *loss_sum.data<float>();
         const uint32_t *counts = (const uint32_t *)g_tcache.tile_counts.data<int32_t>();
         // Diagnostic order-only mode: one list build for the whole view (it must fit the buffers),
@@ -1976,47 +2212,73 @@ std::tuple<MTensor, float> msplat_train_step(
         g_tcache.isect_groups += groups.size();
         g_tcache.isect_max_groups = std::max(g_tcache.isect_max_groups, (uint32_t)groups.size());
         const bool rebuild = groups.size() > 1 && !order_only;
+        if (g_prof) {
+            int64_t keys = 0, padded = 0, kmax = 0;
+            for (int t = 0; t < num_tiles; t++) {
+                const int64_t c = counts[t];
+                if (!c) continue;
+                int64_t p = 32;
+                while (p < c) p <<= 1;
+                keys += c; padded += p; kmax = std::max(kmax, c);
+            }
+            msplat_prof_meta("isect_keys", (double)keys);
+            msplat_prof_meta("isect_padded", (double)padded);
+            msplat_prof_meta("isect_tile_max", (double)kmax);
+            msplat_prof_meta("groups", (double)groups.size());
+            msplat_prof_span("groups", prof_t1, mach_absolute_time());
+        }
+        const uint64_t prof_t2 = g_prof ? mach_absolute_time() : 0;
 
         id<MTLCommandBuffer> cb2 = ctx->getCommandBuffer();
         dispatch_sync(ctx->d_queue, ^(){
-            id<MTLBlitCommandEncoder> zero = [cb2 blitCommandEncoder];
+            id<MTLBlitCommandEncoder> zero = prof_blit(cb2, "blit_loss");
             [zero fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
             [zero endEncoding];
-            id<MTLComputeCommandEncoder> enc = [cb2 computeCommandEncoder];
+            id<MTLComputeCommandEncoder> enc = prof_compute(cb2, "build");
             if (order_only) {
-                encode_build(enc, 0, (uint32_t)num_tiles);
+                encode_build_fx(enc, 0, (uint32_t)num_tiles);
                 [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                prof_split(enc, "rast_fwd");
                 encode_rast_fwd(enc, 0, (uint32_t)num_tiles);
                 [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            } else for (const auto &g : groups) {
-                encode_build(enc, g[0], g[1]);
+            } else for (size_t gi = 0; gi < groups.size(); gi++) {
+                const auto &g = groups[gi];
+                if (gi) prof_split(enc, "build");
+                encode_build_fx(enc, g[0], g[1]);
                 [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                prof_split(enc, "rast_fwd");
                 encode_rast_fwd(enc, g[0], g[1]);
                 [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             }
+            prof_split(enc, "loss_fwd_bwd");
             encode_loss_fwd_bwd(enc);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             if (rebuild) {
                 // every tile is in one group, so one re-zero serves all the rebuilds
                 [enc endEncoding];
-                id<MTLBlitCommandEncoder> blit = [cb2 blitCommandEncoder];
+                id<MTLBlitCommandEncoder> blit = prof_blit(cb2, "blit_rebuild");
                 [blit fillBuffer:g_tcache.tile_write_counters.buffer()
                            range:NSMakeRange(0, g_tcache.tile_write_counters.nbytes()) value:0];
                 [blit endEncoding];
-                enc = [cb2 computeCommandEncoder];
+                enc = prof_compute(cb2, "rast_bwd");
             }
             for (const auto &g : groups) {
                 if (rebuild) {
-                    encode_build(enc, g[0], g[1]);
+                    prof_split(enc, "build");
+                    encode_build_fx(enc, g[0], g[1]);
                     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 }
+                prof_split(enc, "rast_bwd");
                 encode_rast_bwd(enc, g[0], g[1]);
                 [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             }
+            prof_split(enc, "proj_bwd_sh_adam");
             encode_proj_sh_bwd_adam(enc);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             [enc endEncoding];
         });
+        if (g_prof) msplat_prof_span("enc_cb2", prof_t2, mach_absolute_time());
+        msplat_prof_cb_kind("cb2");
     } else if (g_profile_stages && ctx->counterSamplingAvailable) {
         // Per-stage profiling: separate encoders on the SAME command buffer,
         // each with start/end timestamp sampling via the pass descriptor.
@@ -2170,7 +2432,7 @@ void msplat_sgld_noise_gen(int N, MTensor &noise, uint32_t seed) {
     MetalContext* ctx = get_global_context();
     dispatch_sync(ctx->d_queue, ^(){
         id<MTLCommandBuffer> cb = ctx->getCommandBuffer();
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = prof_compute(cb, "sgld_gen");
         NSUInteger tpg = MIN(ctx->sgld_noise_gen_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)N);
         [enc setComputePipelineState:ctx->sgld_noise_gen_kernel_cpso];
         ENC_BUF(enc, noise, 0);
@@ -2192,7 +2454,7 @@ void msplat_sgld_noise(
     MetalContext* ctx = get_global_context();
     dispatch_sync(ctx->d_queue, ^(){
         id<MTLCommandBuffer> cb = ctx->getCommandBuffer();
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = prof_compute(cb, "sgld_apply");
         NSUInteger tpg = MIN(ctx->sgld_noise_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)N);
         [enc setComputePipelineState:ctx->sgld_noise_kernel_cpso];
         ENC_BUF(enc, means, 0);

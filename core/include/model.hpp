@@ -138,6 +138,7 @@ struct Model{
   float translation[3] = {};
 
   void copyGaussianRow(int dst, int src);
+  void copyGaussianRowImpl(int dst, int src);   // copyGaussianRow without the profiler timing
   void zeroAdamAt(int idx);
 
   // Q1-Q3 (--quant-level 1; layout and CPU contract: docs/superpowers/2026-10-28-confidence-densification/
