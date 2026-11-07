@@ -805,6 +805,26 @@ int main(int argc, char *argv[]) {
                         imwriteRGB(stem.string() + suffix, img);
                     }
                 }
+                // Diagnostic: MSPLAT_EVAL_DUMP=<dir> writes each eval render as raw float32 <dir>/<i>.f32 (HxWx3)
+                // and a line "<i> <h> <w> <bytes> <camera path>" to <dir>/manifest.txt (bit-exact A/B).
+                // A failed write is an error: the run exits 4 instead of leaving an incomplete dump.
+                if (const char *evalDump = std::getenv("MSPLAT_EVAL_DUMP")) {
+                    fs::create_directories(evalDump);
+                    char name[32];
+                    snprintf(name, sizeof(name), "%05d.f32", i);
+                    const auto path = fs::path(evalDump) / name;
+                    FILE *f = fopen(path.c_str(), "wb");
+                    bool ok = f && fwrite(rgb_cpu.data_ptr(), 1, rgb_cpu.nbytes(), f) == (size_t)rgb_cpu.nbytes();
+                    if (f) ok = (fclose(f) == 0) && ok;
+                    FILE *m = ok ? fopen((fs::path(evalDump) / "manifest.txt").c_str(), i ? "a" : "w") : nullptr;
+                    ok = m && fprintf(m, "%05d %lld %lld %lld %s\n", i, (long long)rgb_cpu.size(0), (long long)rgb_cpu.size(1),
+                                      (long long)rgb_cpu.nbytes(), testCams[i].filePath.c_str()) > 0;
+                    if (m) ok = (fclose(m) == 0) && ok;
+                    if (!ok) {
+                        fprintf(stderr, "msplat: MSPLAT_EVAL_DUMP write failed for %s\n", path.c_str());
+                        std::exit(4);
+                    }
+                }
 
                 std::cout << "  [" << (i+1) << "/" << nTest << "] "
                           << fs::path(testCams[i].filePath).filename().string()

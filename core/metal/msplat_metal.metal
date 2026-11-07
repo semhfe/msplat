@@ -2308,6 +2308,77 @@ inline bool gaussian_is_active(
     return true;
 }
 
+// Tile culling (MSPLAT_TILE_CULL=1; function constant 1, specialised per pipeline in
+// msplat_metal.mm; off = the 3-sigma box lists, unchanged). An entry (Gaussian, tile) is dropped
+// only when no pixel centre of the tile can pass the rasterizer's tests (sigma < 5.55 and
+// opac * exp(-sigma) >= 1/255). Kept tiles = 3-sigma box columns that meet the ellipse
+// sigma <= s, s = (min(5.55, log(255 opac)) + 1e-3) * (1 + 4e-6 k), k = a c / det (float error of
+// the rasterizer's sigma grows with k through the b term; k > 6.25e4 keeps the whole box). Each
+// tile row is exact: a tile spans its whole row band, so it meets ellipse-and-band iff its column
+// range meets the x-projection of that set (one interval per row). The pixel-centre rectangle
+// is widened by TILE_CULL_PAD px. count and scatter run this same code under safe math (no
+// contraction, precise functions), so both compute identical ranges. Safe math is not outward
+// rounding: conservativeness rests on the margins (1e-3 absorbs the precise-vs-fast sigmoid and
+// exp/log difference; the 4e-6 k factor bounds the b-term cancellation, <= ~4k ulp; 0.05 px covers
+// delta and extent rounding), checked on 1.2 M float32 boundary cases (Codex C4) and bit-exact GPU
+// renders, not proven for every input. Any nonfinite intermediate keeps the whole box. Used on the
+// fixed-buffer path only (K = 1); see load_cull.
+constant bool cull_fc [[function_constant(1)]];
+constant bool tile_cull = is_function_constant_defined(cull_fc) && cull_fc;
+#define TILE_CULL_PAD 0.05f
+
+struct TileCull {
+    bool on;     // false: keep the whole box (nonfinite input, degenerate or ill-conditioned conic)
+    bool empty;  // no pixel can reach alpha 1/255
+    float cx, cy, a, b, det, s2a, Y, dy_r;
+};
+
+inline TileCull tile_cull_setup(float2 center, float3 conic, float raw_opac) {
+#pragma METAL fp math_mode(safe)
+#pragma METAL fp contract(off)
+    TileCull t = {};
+    const float a = conic.x, b = conic.y, c = conic.z;
+    const float det = a * c - b * b;
+    const float opac = precise::divide(1.0f, 1.0f + precise::exp(-raw_opac));
+    if (!(finite_bits(center.x) && finite_bits(center.y) && finite_bits3(conic) && finite_bits(opac))
+        || !(a > 0.0f) || !(c > 0.0f) || !(det > 0.0f)) return t;
+    const float k = precise::divide(a * c, det);
+    if (!(k <= 6.25e4f)) return t;
+    t.on = true;
+    const float s = (min(5.55f, precise::log(255.0f * opac)) + 1e-3f) * (1.0f + 4e-6f * k);
+    if (!(s > 0.0f)) { t.empty = true; return t; }
+    const float s2 = 2.0f * s;
+    t.cx = center.x; t.cy = center.y; t.a = a; t.b = b; t.det = det; t.s2a = s2 * a;
+    t.Y = precise::sqrt(precise::divide(s2 * a, det));                      // ellipse half-height
+    t.dy_r = precise::divide(-b * precise::sqrt(precise::divide(s2 * c, det)), c);  // dy of the rightmost point
+    if (!(finite_bits(t.s2a) && finite_bits(t.Y) && finite_bits(t.dy_r))) return TileCull{};  // keep the box
+    return t;
+}
+
+// Kept tile columns [x0, x1) of tile row y: a sub-range of the box columns [bx0, bx1).
+inline uint2 tile_cull_row(thread const TileCull &t, uint y, uint bx0, uint bx1) {
+#pragma METAL fp math_mode(safe)
+#pragma METAL fp contract(off)
+    if (!t.on) return uint2(bx0, bx1);
+    if (t.empty) return uint2(bx0, bx0);
+    // pixel-centre rows of the tile relative to the centre, widened, cut to the ellipse
+    const float lo = max((float)(y * BLOCK_Y) - t.cy - TILE_CULL_PAD, -t.Y);
+    const float hi = min((float)(y * BLOCK_Y + BLOCK_Y - 1) - t.cy + TILE_CULL_PAD, t.Y);
+    if (!(lo <= hi)) return uint2(bx0, bx0);
+    // x(dy) on the boundary: (-b dy +- sqrt(2 s a - det dy^2)) / a; right edge is concave with
+    // its maximum at dy_r, left edge convex with its minimum at -dy_r
+    const float dr = clamp(t.dy_r, lo, hi), dl = clamp(-t.dy_r, lo, hi);
+    const float xr = precise::divide(-t.b * dr + precise::sqrt(max(0.0f, t.s2a - t.det * dr * dr)), t.a);
+    const float xl = precise::divide(-t.b * dl - precise::sqrt(max(0.0f, t.s2a - t.det * dl * dl)), t.a);
+    // column tx holds pixel centres [16 tx, 16 tx + 15]: keep iff that meets [L, R]
+    const float L = t.cx + xl - TILE_CULL_PAD, R = t.cx + xr + TILE_CULL_PAD;
+    const float f0 = ceil((L - (float)(BLOCK_X - 1)) / (float)BLOCK_X);
+    const float f1 = floor(R / (float)BLOCK_X) + 1.0f;
+    const uint x0 = (uint)clamp(f0, (float)bx0, (float)bx1);
+    const uint x1 = (uint)clamp(f1, (float)bx0, (float)bx1);
+    return uint2(x0, max(x0, x1));
+}
+
 // Hillis-Steele exclusive scan over threadgroup memory.
 // Operates on exactly HYBRID_SORT_TG_THREADS (1024) elements.
 inline void exclusive_scan_hillis_steele(
@@ -2380,6 +2451,8 @@ kernel void count_intersections_kernel(
     device   atomic_uint* tile_counts    [[buffer(4)]],
     constant uint&        num_points     [[buffer(5)]],
     constant float*       aabb           [[buffer(6)]],    // float2: per-axis pixel extents
+    constant float*       conics         [[buffer(7)]],    // float3, packed (tile cull only)
+    constant float*       opacities      [[buffer(8)]],    // raw logits (tile cull only)
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= num_points) return;
@@ -2388,9 +2461,13 @@ kernel void count_intersections_kernel(
     float2 center = read_packed_float2(xys, gid);
     uint2 tile_min, tile_max;
     get_tile_bbox(center, read_packed_float2(aabb, gid), (int3)tile_bounds, tile_min, tile_max);
+    const TileCull tc = tile_cull ? tile_cull_setup(center, read_packed_float3(conics, gid), opacities[gid])
+                                  : TileCull{};
 
     for (uint y = tile_min.y; y < tile_max.y; ++y) {
-        for (uint x = tile_min.x; x < tile_max.x; ++x) {
+        uint2 xr = uint2(tile_min.x, tile_max.x);
+        if (tile_cull) xr = tile_cull_row(tc, y, xr.x, xr.y);
+        for (uint x = xr.x; x < xr.y; ++x) {
             uint tile_id = y * tile_bounds.x + x;
             atomic_fetch_add_explicit(&tile_counts[tile_id], 1u, memory_order_relaxed);
         }
@@ -2482,6 +2559,8 @@ kernel void scatter_intersections_kernel(
     constant float*       aabb           [[buffer(8)]],    // float2: per-axis pixel extents
     constant uint&        capacity       [[buffer(9)]],    // isect_keys_unsorted size (bounds guard)
     constant uint2&       tile_range     [[buffer(10)]],   // tile group [x, y)
+    constant float*       conics         [[buffer(11)]],   // float3, packed (tile cull only)
+    constant float*       opacities      [[buffer(12)]],   // raw logits (tile cull only)
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= num_points) return;
@@ -2493,11 +2572,15 @@ kernel void scatter_intersections_kernel(
     float2 center = read_packed_float2(xys, gid);
     uint2 tile_min, tile_max;
     get_tile_bbox(center, read_packed_float2(aabb, gid), (int3)tile_bounds, tile_min, tile_max);
+    const TileCull tc = tile_cull ? tile_cull_setup(center, read_packed_float3(conics, gid), opacities[gid])
+                                  : TileCull{};
 
     // only rows of the tile group; Gaussians outside them loop zero times
     uint row_lo = tile_range.x / tile_bounds.x, row_hi = (tile_range.y + tile_bounds.x - 1) / tile_bounds.x;
     for (uint y = max(tile_min.y, row_lo); y < min(tile_max.y, row_hi); ++y) {
-        for (uint x = tile_min.x; x < tile_max.x; ++x) {
+        uint2 xr = uint2(tile_min.x, tile_max.x);
+        if (tile_cull) xr = tile_cull_row(tc, y, xr.x, xr.y);
+        for (uint x = xr.x; x < xr.y; ++x) {
             uint tile_id = y * tile_bounds.x + x;
             if (tile_id < tile_range.x || tile_id >= tile_range.y) continue;
             uint pos = atomic_fetch_add_explicit(&tile_write_counters[tile_id], 1u, memory_order_relaxed);

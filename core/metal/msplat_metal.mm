@@ -319,6 +319,9 @@ struct MetalContext {
     id<MTLComputePipelineState> count_intersections_kernel_cpso;
     id<MTLComputePipelineState> prefix_sum_tiles_kernel_cpso;
     id<MTLComputePipelineState> scatter_intersections_kernel_cpso;
+    // MSPLAT_TILE_CULL=1 only (nil otherwise): count/scatter specialised with cull_fc = true
+    id<MTLComputePipelineState> count_intersections_cull_cpso;
+    id<MTLComputePipelineState> scatter_intersections_cull_cpso;
     id<MTLComputePipelineState> hybrid_sort_pack_kernel_cpso;
     // Legacy radix sort PSOs (kept for reference, no longer dispatched)
     id<MTLComputePipelineState> map_gaussian_to_intersects_kernel_cpso;
@@ -425,14 +428,38 @@ MetalContext* init_msplat_metal_context() {
         }
         return pso;
     };
+    // Tile cull (MSPLAT_TILE_CULL=1): count and scatter declare cull_fc (function constant 1), so
+    // every pipeline is specialised. The default pair is cull_fc = false (the 3-sigma box lists);
+    // with the flag a second pair with cull_fc = true is built and used only on the fixed-buffer
+    // path (K = 1 always): on the legacy path culling would move entries across chunk boundaries
+    // and change which entries a truncated or overflowed list keeps (Codex C4 #1, #2).
+    const bool tile_cull_on = [] { const char *e = std::getenv("MSPLAT_TILE_CULL"); return e && e[0] == '1'; }();
+    if (tile_cull_on) fprintf(stderr, "[engine] MSPLAT_TILE_CULL=1: ellipse x opacity tile lists (fixed-buffer path only)\n");
+    auto load_cull = [&](NSString* name, bool on) -> id<MTLComputePipelineState> {
+        MTLFunctionConstantValues *cv = [[MTLFunctionConstantValues alloc] init];
+        [cv setConstantValue:&on type:MTLDataTypeBool atIndex:1];
+        NSError *err = nil;
+        id<MTLFunction> fn = [metal_library newFunctionWithName:name constantValues:cv error:&err];
+        [cv release];
+        id<MTLComputePipelineState> pso = fn ? [ctx->device newComputePipelineStateWithFunction:fn error:&err] : nil;
+        [fn release];
+        if (!pso) {
+            fprintf(stderr, "msplat: failed to create tile-cull pipeline for %s: %s\n", [name UTF8String],
+                    err ? [[err description] UTF8String] : "unknown error");
+            abort();
+        }
+        return pso;
+    };
 
     // Forward pipeline
     ctx->project_and_sh_forward_kernel_cpso       = load(@"project_and_sh_forward_kernel");
     ctx->nd_rasterize_forward_kernel_cpso         = load(@"nd_rasterize_forward_kernel");
     // Hybrid per-tile sort pipeline
-    ctx->count_intersections_kernel_cpso          = load(@"count_intersections_kernel");
+    ctx->count_intersections_kernel_cpso          = load_cull(@"count_intersections_kernel", false);
     ctx->prefix_sum_tiles_kernel_cpso             = load(@"prefix_sum_tiles_kernel");
-    ctx->scatter_intersections_kernel_cpso        = load(@"scatter_intersections_kernel");
+    ctx->scatter_intersections_kernel_cpso        = load_cull(@"scatter_intersections_kernel", false);
+    ctx->count_intersections_cull_cpso   = tile_cull_on ? load_cull(@"count_intersections_kernel", true) : nil;
+    ctx->scatter_intersections_cull_cpso = tile_cull_on ? load_cull(@"scatter_intersections_kernel", true) : nil;
     ctx->hybrid_sort_pack_kernel_cpso             = load(@"hybrid_sort_pack_kernel");
     // Runtime safety checks — always on (NSCAssert is compiled out in Release,
     // which is exactly the build TestFlight testers run). Both sort kernels are
@@ -1341,13 +1368,18 @@ extern "C" void msplat_dump_step_buffers(const char *dir) {
 // (prefix, scatter, sort/pack) the lists of tiles [lo, hi) — the whole image on the legacy
 // path, one tile group with fixed buffers. Buffers and capacities come from g_tcache.
 static void encode_count_isect(MetalContext *ctx, id<MTLComputeCommandEncoder> enc,
-                               uint32_t num_points, const std::array<uint32_t, 4> &tile_bounds) {
-    NSUInteger tpg = MIN(ctx->count_intersections_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
-    [enc setComputePipelineState:ctx->count_intersections_kernel_cpso];
+                               uint32_t num_points, const std::array<uint32_t, 4> &tile_bounds,
+                               MTensor &opacities) {
+    // tile cull: fixed-buffer path only (see load_cull); count and scatter pick the same pair
+    id<MTLComputePipelineState> pso = (ctx->count_intersections_cull_cpso && g_tcache.key_slots > 0)
+        ? ctx->count_intersections_cull_cpso : ctx->count_intersections_kernel_cpso;
+    NSUInteger tpg = MIN(pso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
+    [enc setComputePipelineState:pso];
     ENC_BUF(enc, g_tcache.xys, 0); ENC_BUF(enc, g_tcache.radii_out, 1); ENC_BUF(enc, g_tcache.depths, 2);
     [enc setBytes:tile_bounds.data() length:sizeof(tile_bounds) atIndex:3];
     ENC_BUF(enc, g_tcache.tile_counts, 4);
     ENC_SCALAR(enc, num_points, 5); ENC_BUF(enc, g_tcache.aabb, 6);
+    ENC_BUF(enc, g_tcache.conics, 7); ENC_BUF(enc, opacities, 8);  // tile cull only
     [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
 }
 
@@ -1370,8 +1402,10 @@ static void encode_build_isect(MetalContext *ctx, id<MTLComputeCommandEncoder> &
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
     // scatter_intersections — write sort keys into per-tile buckets
-    NSUInteger tpg = MIN(ctx->scatter_intersections_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
-    [enc setComputePipelineState:ctx->scatter_intersections_kernel_cpso];
+    id<MTLComputePipelineState> scatter_pso = (ctx->scatter_intersections_cull_cpso && g_tcache.key_slots > 0)
+        ? ctx->scatter_intersections_cull_cpso : ctx->scatter_intersections_kernel_cpso;
+    NSUInteger tpg = MIN(scatter_pso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
+    [enc setComputePipelineState:scatter_pso];
     ENC_BUF(enc, g_tcache.xys, 0); ENC_BUF(enc, g_tcache.depths, 1); ENC_BUF(enc, g_tcache.radii_out, 2);
     [enc setBytes:tile_bounds.data() length:sizeof(tile_bounds) atIndex:3];
     ENC_BUF(enc, g_tcache.sort_offsets, 4);
@@ -1380,6 +1414,7 @@ static void encode_build_isect(MetalContext *ctx, id<MTLComputeCommandEncoder> &
     ENC_SCALAR(enc, num_points, 7); ENC_BUF(enc, g_tcache.aabb, 8);
     ENC_SCALAR(enc, key_capacity_u32, 9);
     [enc setBytes:tile_range length:sizeof(tile_range) atIndex:10];
+    ENC_BUF(enc, g_tcache.conics, 11); ENC_BUF(enc, opacities, 12);  // tile cull only
     [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     if (prof_sort) prof_split(enc, "sort_pack");
@@ -1533,7 +1568,7 @@ static void forward_pipeline(
     };
 
     auto encode_count = [&](id<MTLComputeCommandEncoder> enc) {
-        encode_count_isect(ctx, enc, num_points_u32, *tile_bounds_arr);
+        encode_count_isect(ctx, enc, num_points_u32, *tile_bounds_arr, opacities);
     };
     auto encode_build = [&](id<MTLComputeCommandEncoder> enc, uint32_t lo, uint32_t hi) {
         encode_build_isect(ctx, enc, num_points_u32, (uint32_t)num_tiles, *tile_bounds_arr, opacities, lo, hi);
@@ -1888,7 +1923,7 @@ std::tuple<MTensor, float> msplat_train_step(
     };
 
     auto encode_count = [&](id<MTLComputeCommandEncoder> enc) {
-        encode_count_isect(ctx, enc, num_points_u32, *tile_bounds_arr);
+        encode_count_isect(ctx, enc, num_points_u32, *tile_bounds_arr, opacities);
     };
     auto encode_build = [&](id<MTLComputeCommandEncoder> enc, uint32_t lo, uint32_t hi) {
         encode_build_isect(ctx, enc, num_points_u32, (uint32_t)num_tiles, *tile_bounds_arr, opacities, lo, hi);
