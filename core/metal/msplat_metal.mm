@@ -319,7 +319,7 @@ struct MetalContext {
     id<MTLComputePipelineState> count_intersections_kernel_cpso;
     id<MTLComputePipelineState> prefix_sum_tiles_kernel_cpso;
     id<MTLComputePipelineState> scatter_intersections_kernel_cpso;
-    // MSPLAT_TILE_CULL=1 only (nil otherwise): count/scatter specialised with cull_fc = true
+    // Tile cull on (default; nil with MSPLAT_TILE_CULL=0): count/scatter specialised with cull_fc = true
     id<MTLComputePipelineState> count_intersections_cull_cpso;
     id<MTLComputePipelineState> scatter_intersections_cull_cpso;
     id<MTLComputePipelineState> hybrid_sort_pack_kernel_cpso;
@@ -428,12 +428,16 @@ MetalContext* init_msplat_metal_context() {
         }
         return pso;
     };
-    // Tile cull (MSPLAT_TILE_CULL=1): count and scatter declare cull_fc (function constant 1), so
-    // every pipeline is specialised. The default pair is cull_fc = false (the 3-sigma box lists);
-    // with the flag a second pair with cull_fc = true is built and used only on the fixed-buffer
+    // Tile cull (default on since 2026-11-07, 30k quality screen passed; MSPLAT_TILE_CULL=0 turns it
+    // off): count and scatter declare cull_fc (function constant 1), so every pipeline is specialised.
+    // The base pair is cull_fc = false (the 3-sigma box lists); when on, a second pair with
+    // cull_fc = true is built and used only on the fixed-buffer
     // path (K = 1 always): on the legacy path culling would move entries across chunk boundaries
     // and change which entries a truncated or overflowed list keeps (Codex C4 #1, #2).
-    const bool tile_cull_on = [] { const char *e = std::getenv("MSPLAT_TILE_CULL"); return e && e[0] == '1'; }();
+    const bool tile_cull_on = [] { const char *e = std::getenv("MSPLAT_TILE_CULL"); return !(e && e[0] == '0'); }();
+    // The marker text is frozen (evaluators grep it): it states the effective setting (also printed
+    // when the variable is unset), not the literal environment, and not whether a dispatch used the
+    // cull PSOs (the legacy path never does).
     if (tile_cull_on) fprintf(stderr, "[engine] MSPLAT_TILE_CULL=1: ellipse x opacity tile lists (fixed-buffer path only)\n");
     auto load_cull = [&](NSString* name, bool on) -> id<MTLComputePipelineState> {
         MTLFunctionConstantValues *cv = [[MTLFunctionConstantValues alloc] init];
