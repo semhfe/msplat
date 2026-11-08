@@ -464,7 +464,23 @@ MetalContext* init_msplat_metal_context() {
     ctx->scatter_intersections_kernel_cpso        = load_cull(@"scatter_intersections_kernel", false);
     ctx->count_intersections_cull_cpso   = tile_cull_on ? load_cull(@"count_intersections_kernel", true) : nil;
     ctx->scatter_intersections_cull_cpso = tile_cull_on ? load_cull(@"scatter_intersections_kernel", true) : nil;
-    ctx->hybrid_sort_pack_kernel_cpso             = load(@"hybrid_sort_pack_kernel");
+    // S1 (MSPLAT_SORT_SIMD=1): register bitonic stages for j < 32 (function constant 4)
+    {
+        const char *e = std::getenv("MSPLAT_SORT_SIMD");
+        bool on = e && e[0] == '1';
+        MTLFunctionConstantValues *cv = [[MTLFunctionConstantValues alloc] init];
+        [cv setConstantValue:&on type:MTLDataTypeBool atIndex:4];
+        NSError *err = nil;
+        id<MTLFunction> fn = [metal_library newFunctionWithName:@"hybrid_sort_pack_kernel" constantValues:cv error:&err];
+        [cv release];
+        ctx->hybrid_sort_pack_kernel_cpso = fn ? [ctx->device newComputePipelineStateWithFunction:fn error:&err] : nil;
+        [fn release];
+        if (!ctx->hybrid_sort_pack_kernel_cpso) {
+            fprintf(stderr, "msplat: failed to create hybrid_sort_pack pipeline: %s\n",
+                    err ? [[err description] UTF8String] : "unknown error");
+            abort();
+        }
+    }
     // Runtime safety checks — always on (NSCAssert is compiled out in Release,
     // which is exactly the build TestFlight testers run). Both sort kernels are
     // dispatched with exactly 1024 threads/threadgroup; if this device's PSO
@@ -522,6 +538,15 @@ MetalContext* init_msplat_metal_context() {
         MTLFunctionConstantValues *cv = [[MTLFunctionConstantValues alloc] init];
         bool on = e && e[0] == '1';
         [cv setConstantValue:&on type:MTLDataTypeBool atIndex:0];
+        // R1 (MSPLAT_RB_UNIFORM=1): uniform threadgroup reads in rasterize_backward_kernel (constant 2;
+        // the chunked kernel does not declare it, so the value is unused there)
+        const char *r1 = std::getenv("MSPLAT_RB_UNIFORM");
+        bool r1_on = r1 && r1[0] == '1';
+        [cv setConstantValue:&r1_on type:MTLDataTypeBool atIndex:2];
+        // T1 (MSPLAT_RB_TREDUCE=1): reduce-scatter warp sums in rasterize_backward_kernel (constant 6)
+        const char *t1 = std::getenv("MSPLAT_RB_TREDUCE");
+        bool t1_on = t1 && t1[0] == '1';
+        [cv setConstantValue:&t1_on type:MTLDataTypeBool atIndex:6];
         NSError *err = nil;
         id<MTLFunction> fn = [metal_library newFunctionWithName:name constantValues:cv error:&err];
         [cv release];
@@ -540,8 +565,26 @@ MetalContext* init_msplat_metal_context() {
     // Separable SSIM loss
     ctx->ssim_h_fwd_kernel_cpso                   = load(@"ssim_h_fwd_kernel");
     ctx->ssim_v_fwd_kernel_cpso                   = load(@"ssim_v_fwd_kernel");
-    ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso       = load(@"ssim_fused_v_fwd_h_bwd_kernel");
-    ctx->ssim_v_bwd_kernel_cpso                   = load(@"ssim_v_bwd_kernel");
+    // D1 (MSPLAT_SSIM_DENSE=1): dense derivative fields (function constant 5); both kernels or neither
+    auto load_d1 = [&](NSString* name) -> id<MTLComputePipelineState> {
+        const char *e = std::getenv("MSPLAT_SSIM_DENSE");
+        bool on = e && e[0] == '1';
+        MTLFunctionConstantValues *cv = [[MTLFunctionConstantValues alloc] init];
+        [cv setConstantValue:&on type:MTLDataTypeBool atIndex:5];
+        NSError *err = nil;
+        id<MTLFunction> fn = [metal_library newFunctionWithName:name constantValues:cv error:&err];
+        [cv release];
+        id<MTLComputePipelineState> pso = fn ? [ctx->device newComputePipelineStateWithFunction:fn error:&err] : nil;
+        [fn release];
+        if (!pso) {
+            fprintf(stderr, "msplat: failed to create D1 pipeline for %s: %s\n", [name UTF8String],
+                    err ? [[err description] UTF8String] : "unknown error");
+            abort();
+        }
+        return pso;
+    };
+    ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso       = load_d1(@"ssim_fused_v_fwd_h_bwd_kernel");
+    ctx->ssim_v_bwd_kernel_cpso                   = load_d1(@"ssim_v_bwd_kernel");
     // Backward pipeline
     ctx->project_and_sh_backward_kernel_cpso      = load(@"project_and_sh_backward_kernel");
     ctx->fused_adam_kernel_cpso                    = load(@"fused_adam_kernel");

@@ -932,6 +932,46 @@ inline float warpSum(float val, const int warp_size, const uint lane) {
 // backward gradients via a select instead of a nested branch. false: the A1 code as committed.
 constant bool k1_select_fc [[function_constant(0)]];
 constant bool k1_select = is_function_constant_defined(k1_select_fc) && k1_select_fc;
+// R1 (MSPLAT_RB_UNIFORM=1, function constant 2, set with K1 in msplat_metal.mm): every lane reads
+// the batch entry from threadgroup memory at the same address instead of lane 0 reading it and
+// four simd_broadcasts. Same values, so bit-identical; false = the committed code.
+constant bool rb_uniform_fc [[function_constant(2)]];
+constant bool rb_uniform = is_function_constant_defined(rb_uniform_fc) && rb_uniform_fc;
+// T1 (MSPLAT_RB_TREDUCE=1, function constant 6): the nine per-warp gradient sums by one
+// reduce-scatter (each level halves the values a lane carries: 5+3+2+1+1 = 12 shuffles) and lane 0
+// collecting the nine totals (9 shuffles), instead of nine simd_sum. Same terms, different addition
+// order, so the gradients differ at rounding level (the image is not affected).
+constant bool rb_treduce_fc [[function_constant(6)]];
+constant bool rb_treduce = is_function_constant_defined(rb_treduce_fc) && rb_treduce_fc;
+
+// One reduce-scatter level: n slots, the lower lane half (lane & m == 0) keeps slots [0, k), the upper
+// keeps [k, n) (zero-padded to k), each adding its partner's copy of the kept slots.
+template <int N, int K>
+inline void rs_level(thread float *v, uint lane, ushort m) {
+    const bool lo = (lane & m) == 0;
+    float out[K];
+    for (int i = 0; i < K; i++) {
+        const float hi_v = (K + i < N) ? v[K + i] : 0.0f;
+        const float keep = lo ? v[i] : hi_v;
+        const float send = lo ? hi_v : v[i];
+        out[i] = keep + simd_shuffle_xor(send, m);
+    }
+    for (int i = 0; i < K; i++) v[i] = out[i];
+}
+// Full warp sums of v[0..8]; the totals are valid in lane 0 only.
+inline void warp_sum9_lane0(thread float *v, uint lane) {
+    // slot bookkeeping: after the levels, lane L holds the total of value idx(L)
+    rs_level<9, 5>(v, lane, 16);
+    rs_level<5, 3>(v, lane, 8);
+    rs_level<3, 2>(v, lane, 4);
+    rs_level<2, 1>(v, lane, 2);
+    v[0] += simd_shuffle_xor(v[0], 1);
+    // lane holding each total (checked by an exact 32-lane emulation of these levels)
+    const ushort src[9] = {0, 2, 4, 8, 10, 16, 18, 20, 24};
+    float tot[9];
+    for (int j = 0; j < 9; j++) tot[j] = simd_shuffle(v[0], src[j]);
+    for (int j = 0; j < 9; j++) v[j] = tot[j];
+}
 
 kernel void rasterize_backward_kernel(
     constant uint3& tile_bounds,
@@ -1045,16 +1085,23 @@ kernel void rasterize_backward_kernel(
             // simd_broadcast replaces 32 redundant threadgroup reads.
             float3 b_conic, b_xy_opac, b_rgb;
             int32_t b_id;
-            if (wr == 0) {
+            if (rb_uniform) {
                 b_conic = conic_batch[t];
                 b_xy_opac = xy_opacity_batch[t];
                 b_rgb = rgbs_batch[t];
                 b_id = id_batch[t];
+            } else {
+                if (wr == 0) {
+                    b_conic = conic_batch[t];
+                    b_xy_opac = xy_opacity_batch[t];
+                    b_rgb = rgbs_batch[t];
+                    b_id = id_batch[t];
+                }
+                b_conic = simd_broadcast(b_conic, 0);
+                b_xy_opac = simd_broadcast(b_xy_opac, 0);
+                b_rgb = simd_broadcast(b_rgb, 0);
+                b_id = simd_broadcast(b_id, 0);
             }
-            b_conic = simd_broadcast(b_conic, 0);
-            b_xy_opac = simd_broadcast(b_xy_opac, 0);
-            b_rgb = simd_broadcast(b_rgb, 0);
-            b_id = simd_broadcast(b_id, 0);
 
             int valid = inside;
             if (batch_end - t > bin_final) {
@@ -1137,10 +1184,20 @@ kernel void rasterize_backward_kernel(
                 }
             }
 
-            v_rgb_local = warpSum3(v_rgb_local, warp_size, wr);
-            v_conic_local = warpSum3(v_conic_local, warp_size, wr);
-            v_xy_local = warpSum2(v_xy_local, warp_size, wr);
-            v_opacity_local = warpSum(v_opacity_local, warp_size, wr);
+            if (rb_treduce) {
+                float v9[9] = {v_rgb_local.x, v_rgb_local.y, v_rgb_local.z, v_conic_local.x, v_conic_local.y,
+                               v_conic_local.z, v_xy_local.x, v_xy_local.y, v_opacity_local};
+                warp_sum9_lane0(v9, wr);
+                v_rgb_local = float3(v9[0], v9[1], v9[2]);
+                v_conic_local = float3(v9[3], v9[4], v9[5]);
+                v_xy_local = float2(v9[6], v9[7]);
+                v_opacity_local = v9[8];
+            } else {
+                v_rgb_local = warpSum3(v_rgb_local, warp_size, wr);
+                v_conic_local = warpSum3(v_conic_local, warp_size, wr);
+                v_xy_local = warpSum2(v_xy_local, warp_size, wr);
+                v_opacity_local = warpSum(v_opacity_local, warp_size, wr);
+            }
             // B1: warp max (wmax_on is uniform, so every lane takes the collective). fac >= 0, and the
             // bits of non-negative floats order like the floats, so the uint atomic max is the float max
             // (order-independent: deterministic). NaN fails w > 0 and is never written.
@@ -2423,6 +2480,53 @@ inline void bitonic_sort_tg(threadgroup uint64_t* a, uint n, uint tid) {
     }
 }
 
+// S1 (MSPLAT_SORT_SIMD=1, function constant 4): the same bitonic network, but every run of stages
+// with partner distance j < 32 is done in registers with simd_shuffle_xor (partners idx ^ j are in
+// the same SIMD group: n is a power of two >= 32 and thread tid holds idx = tid + m*1024), and all
+// stages of k <= 32 are one register pass. Only stages with j >= 32 go through threadgroup memory
+// with a barrier. Same compare-exchange outcome per stage, so with unique keys the same order.
+constant bool sort_simd_fc [[function_constant(4)]];
+constant bool sort_simd = is_function_constant_defined(sort_simd_fc) && sort_simd_fc;
+
+inline uint64_t shuffle_xor_u64(uint64_t v, ushort m) {
+    return as_type<uint64_t>(simd_shuffle_xor(as_type<uint2>(v), m));
+}
+// compare-exchange of v with its partner at distance j inside element idx's bitonic block of size k
+inline uint64_t bitonic_reg_stage(uint64_t v, uint idx, uint k, uint j) {
+    const uint64_t w = shuffle_xor_u64(v, (ushort)j);
+    const bool keep_min = ((idx & j) == 0) == ((idx & k) == 0);
+    return keep_min ? (v < w ? v : w) : (v < w ? w : v);
+}
+inline void bitonic_sort_tg_simd(threadgroup uint64_t* a, uint n, uint tid) {
+    const uint kfirst = min(n, 32u);
+    for (uint idx = tid; idx < n; idx += HYBRID_SORT_TG_THREADS) {
+        uint64_t v = a[idx];
+        for (uint k = 2; k <= kfirst; k <<= 1)
+            for (uint j = k >> 1; j > 0; j >>= 1) v = bitonic_reg_stage(v, idx, k, j);
+        a[idx] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint k = 64; k <= n; k <<= 1) {
+        for (uint j = k >> 1; j >= 32; j >>= 1) {
+            for (uint idx = tid; idx < n; idx += HYBRID_SORT_TG_THREADS) {
+                uint ixj = idx ^ j;
+                if (ixj > idx) {
+                    bool ascending = ((idx & k) == 0);
+                    uint64_t va = a[idx], vb = a[ixj];
+                    if ((va > vb) == ascending) { a[idx] = vb; a[ixj] = va; }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        for (uint idx = tid; idx < n; idx += HYBRID_SORT_TG_THREADS) {
+            uint64_t v = a[idx];
+            for (uint j = 16; j > 0; j >>= 1) v = bitonic_reg_stage(v, idx, k, j);
+            a[idx] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 // Bitonic sort in device memory. n must be a power of 2.
 inline void bitonic_sort_device(device uint64_t* a, uint n, uint tid) {
     for (uint k = 2; k <= n; k <<= 1) {
@@ -2660,7 +2764,8 @@ kernel void hybrid_sort_pack_kernel(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        bitonic_sort_tg(tg_data, padded, tid);
+        if (sort_simd) bitonic_sort_tg_simd(tg_data, padded, tid);
+        else bitonic_sort_tg(tg_data, padded, tid);
 
         // Pack sorted results into output arrays
         for (uint i = tid; i < count; i += HYBRID_SORT_TG_THREADS) {
@@ -3699,6 +3804,12 @@ kernel void ssim_v_fwd_kernel(
 // Fused V-forward + H-backward: recomputes SSIM stats from ssim_h_buf (V conv),
 // computes loss + derivative fields, then H convs derivatives to output buffer.
 // Eliminates loss_intermediates round-trip (130 MB/iter bandwidth saved).
+// D1 (MSPLAT_SSIM_DENSE=1, function constant 5): the nine derivative fields (3 per channel) go to
+// loss_intermediates densely, (H, W, 9) at c*3, instead of (H, W, 15) at c*5. Written by the fused
+// kernel, read by ssim_v_bwd_kernel; same values, so bit-identical.
+constant bool ssim_dense_fc [[function_constant(5)]];
+constant bool ssim_dense = is_function_constant_defined(ssim_dense_fc) && ssim_dense_fc;
+
 kernel void ssim_fused_v_fwd_h_bwd_kernel(
     constant float* rendered, constant uchar* gt,
     constant float* ssim_h_buf, constant uint2& img_size,
@@ -3801,7 +3912,7 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
                 float w = GAUSS_1D[SSIM_WIN-1-dx];
                 h1 += w*tg_f1[lid.y][lid.x+dx]; h2 += w*tg_f2[lid.y][lid.x+dx]; h3 += w*tg_f3[lid.y][lid.x+dx];
             }
-            uint out = (py*W+px)*15 + c*5;
+            uint out = ssim_dense ? (py*W+px)*9 + c*3 : (py*W+px)*15 + c*5;
             deriv_h_buf[out+0]=h1; deriv_h_buf[out+1]=h2; deriv_h_buf[out+2]=h3;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3822,6 +3933,9 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
 // Backward pass 1: compute derivative fields + horizontal convolution.
 // For each pixel, computes F1, F2, F3 from intermediates, then convolves horizontally.
 // Output: ssim_h_buf (H, W, 15) — 3 values per channel at stride 5
+// No host caller (the fused ssim_fused_v_fwd_h_bwd_kernel replaced it). It always writes stride 15;
+// a ssim_v_bwd_kernel specialised with ssim_dense (MSPLAT_SSIM_DENSE, constant 5) reads stride 9, so
+// reconnecting this kernel requires specialising it with the same constant (Codex C4 2026-11-07 #1).
 kernel void ssim_h_bwd_kernel(
     constant float* intermediates,  // (H, W, 15) from forward
     constant uint2& img_size,       // (W, H)
@@ -3938,7 +4052,7 @@ kernel void ssim_v_bwd_kernel(
             int gx = base_gx + (int)sx;
             float v1 = 0, v2 = 0, v3 = 0;
             if (gx >= 0 && gx < (int)W && gy >= 0 && gy < (int)H) {
-                uint hp = (gy * W + gx) * 15 + c * 5;
+                uint hp = ssim_dense ? (gy * W + gx) * 9 + c * 3 : (gy * W + gx) * 15 + c * 5;
                 v1 = ssim_h_buf[hp + 0];
                 v2 = ssim_h_buf[hp + 1];
                 v3 = ssim_h_buf[hp + 2];
