@@ -273,7 +273,7 @@ void autoScaleAndCenter(InputData &data) {
 
     // Compute scale from max absolute camera position.
     // CONTRACT: this camera-anchored convention is load-bearing. The fixed
-    // position LR, the SGLD noise_lr default (5e5), and cull_radius default
+    // position LR, the SGLD noise_lr (5e5: the opacity-mode and C API default; weight mode uses 0), and cull_radius default
     // (3.0) all assume cameras span ≈[-1, 1] after this transform. Anchoring
     // the scale to point-cloud extent instead (tried 2026-06-11) enlarges the
     // frame by λ and makes relative SGLD noise λ× stronger (noise ∝ s²),

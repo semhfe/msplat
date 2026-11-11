@@ -467,7 +467,7 @@ MetalContext* init_msplat_metal_context() {
     // S1 (MSPLAT_SORT_SIMD=1): register bitonic stages for j < 32 (function constant 4)
     {
         const char *e = std::getenv("MSPLAT_SORT_SIMD");
-        bool on = e && e[0] == '1';
+        bool on = !(e && e[0] == '0');   // default on since 2026-11-11 (weight+speed 30k screen); =0 turns it off
         MTLFunctionConstantValues *cv = [[MTLFunctionConstantValues alloc] init];
         [cv setConstantValue:&on type:MTLDataTypeBool atIndex:4];
         NSError *err = nil;
@@ -541,11 +541,11 @@ MetalContext* init_msplat_metal_context() {
         // R1 (MSPLAT_RB_UNIFORM=1): uniform threadgroup reads in rasterize_backward_kernel (constant 2;
         // the chunked kernel does not declare it, so the value is unused there)
         const char *r1 = std::getenv("MSPLAT_RB_UNIFORM");
-        bool r1_on = r1 && r1[0] == '1';
+        bool r1_on = !(r1 && r1[0] == '0');   // default on since 2026-11-11; =0 turns it off
         [cv setConstantValue:&r1_on type:MTLDataTypeBool atIndex:2];
         // T1 (MSPLAT_RB_TREDUCE=1): reduce-scatter warp sums in rasterize_backward_kernel (constant 6)
         const char *t1 = std::getenv("MSPLAT_RB_TREDUCE");
-        bool t1_on = t1 && t1[0] == '1';
+        bool t1_on = !(t1 && t1[0] == '0');   // default on since 2026-11-11; =0 turns it off
         [cv setConstantValue:&t1_on type:MTLDataTypeBool atIndex:6];
         NSError *err = nil;
         id<MTLFunction> fn = [metal_library newFunctionWithName:name constantValues:cv error:&err];
@@ -568,7 +568,7 @@ MetalContext* init_msplat_metal_context() {
     // D1 (MSPLAT_SSIM_DENSE=1): dense derivative fields (function constant 5); both kernels or neither
     auto load_d1 = [&](NSString* name) -> id<MTLComputePipelineState> {
         const char *e = std::getenv("MSPLAT_SSIM_DENSE");
-        bool on = e && e[0] == '1';
+        bool on = !(e && e[0] == '0');   // default on since 2026-11-11; =0 turns it off
         MTLFunctionConstantValues *cv = [[MTLFunctionConstantValues alloc] init];
         [cv setConstantValue:&on type:MTLDataTypeBool atIndex:5];
         NSError *err = nil;

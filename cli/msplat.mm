@@ -79,13 +79,18 @@ int main(int argc, char *argv[]) {
     int capMax = 1000000;
     app.add_option("--cap-max", capMax, "Maximum Gaussian budget (fixed)")
         ->check(CLI::Range(10000, 10000000));
-    float noiseLr = 5e5f;
-    app.add_option("--noise-lr", noiseLr, "SGLD noise learning rate");
-    std::string relocMode = "opacity";
-    app.add_option("--reloc-mode", relocMode,
-                   "MCMC relocation: opacity = 0.005 opacity threshold every 100 steps (default); weight = the "
-                   "lowest max blending weights every 400 steps, new Gaussians placed by a draw from their "
-                   "source's covariance (arXiv 2610.13541; needs --noise-lr 0)")
+    // Default since 2026-11-11 (weight+speed 30k screen passed, 4 scenes): --reloc-mode weight with
+    // --noise-lr 0. Unset --noise-lr follows the mode: 0 for weight, 5e5 (SGLD) for opacity, so
+    // --reloc-mode opacity alone restores the old behaviour.
+    float noiseLr = 0.0f;
+    auto *noiseOpt = app.add_option("--noise-lr", noiseLr,
+                                    "SGLD noise learning rate (default 0 with --reloc-mode weight, 5e5 with opacity)");
+    std::string relocMode = "weight";
+    auto *relocOpt = app.add_option("--reloc-mode", relocMode,
+                   "MCMC relocation: weight = the lowest max blending weights every 400 steps, new Gaussians "
+                   "placed by a draw from their source's covariance (arXiv 2610.13541; needs --noise-lr 0; "
+                   "default; falls back to opacity when a view has < 400 tiles unless given explicitly); "
+                   "opacity = 0.005 opacity threshold every 100 steps (the old default)")
         ->check(CLI::IsMember({"opacity", "weight"}));
     float opacityReg = 0.01f;
     app.add_option("--opacity-reg", opacityReg, "Opacity regularization weight");
@@ -165,16 +170,11 @@ int main(int argc, char *argv[]) {
     // Package B: weight relocation replaces the position noise (B3), and its weights need the A1
     // backward (T walked back past capped Gaussians); MSPLAT_WMAX_ACCUM=1 accumulates and logs the
     // weights in opacity mode without using them (tooling).
-    const bool relocWeight = relocMode == "weight";
-    const bool wmaxAccum = relocWeight || (std::getenv("MSPLAT_WMAX_ACCUM") && std::getenv("MSPLAT_WMAX_ACCUM")[0] == '1');
-    if (relocWeight && noiseLr != 0.0f) {
-        std::cerr << "--reloc-mode weight replaces the SGLD position noise: add --noise-lr 0" << std::endl;
-        return 1;
-    }
-    if (wmaxAccum && std::getenv("MSPLAT_LEGACY_BWD_CAP") && std::getenv("MSPLAT_LEGACY_BWD_CAP")[0] == '1') {
-        std::cerr << "blend weights need the A1 backward; unset MSPLAT_LEGACY_BWD_CAP" << std::endl;
-        return 1;
-    }
+    bool relocWeight = relocMode == "weight";
+    const bool relocExplicit = relocOpt->count() > 0;
+    if (noiseOpt->count() == 0) noiseLr = relocWeight ? 0.0f : 5e5f;
+    bool wmaxAccum = relocWeight || (std::getenv("MSPLAT_WMAX_ACCUM") && std::getenv("MSPLAT_WMAX_ACCUM")[0] == '1');
+    // Compatibility checks run after the small-view fallback below has fixed the effective mode.
 
     if (validate || !valRender.empty()) validate = true;
     if (!valRender.empty() && !fs::exists(valRender)) fs::create_directories(valRender);
@@ -216,6 +216,30 @@ int main(int argc, char *argv[]) {
         } else {
             auto [train, val] = inputData.getCameras(validate, valImage);
             cams = train; valCam = val;
+        }
+
+        // Weight relocation needs every view >= 400 tiles (see the check after model init). The default
+        // falls back to the old opacity relocation + SGLD noise; an explicit --reloc-mode weight still fails.
+        {
+            int smallest = INT_MAX;
+            for (const auto &c : inputData.cameras)
+                smallest = std::min(smallest, ((c.width + BLOCK_X - 1) / BLOCK_X) * ((c.height + BLOCK_Y - 1) / BLOCK_Y));
+            if (relocWeight && !relocExplicit && smallest < 400) {
+                std::cerr << "[mcmc] default --reloc-mode weight needs every view >= 400 tiles (smallest has " << smallest
+                          << "): using --reloc-mode opacity" << (noiseOpt->count() ? "" : " --noise-lr 5e5") << std::endl;
+                relocWeight = false;
+                wmaxAccum = std::getenv("MSPLAT_WMAX_ACCUM") && std::getenv("MSPLAT_WMAX_ACCUM")[0] == '1';
+                if (noiseOpt->count() == 0) noiseLr = 5e5f;
+            }
+        }
+
+        if (relocWeight && noiseLr != 0.0f) {
+            std::cerr << "--reloc-mode weight (the default) replaces the SGLD position noise: use --noise-lr 0, or --reloc-mode opacity" << std::endl;
+            return 1;
+        }
+        if (wmaxAccum && std::getenv("MSPLAT_LEGACY_BWD_CAP") && std::getenv("MSPLAT_LEGACY_BWD_CAP")[0] == '1') {
+            std::cerr << "blend weights need the A1 backward; unset MSPLAT_LEGACY_BWD_CAP" << std::endl;
+            return 1;
         }
 
         Model model(inputData, cams.size(),

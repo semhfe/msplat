@@ -120,7 +120,8 @@ struct Model{
   // Default 30000 (reference MCMC). Partitioned training sets this to the cell's iteration count.
   int position_lr_max_steps_ = 30000;
 
-  // Package B (--reloc-mode weight; Hofer et al., arXiv 2610.13541, sec. 4.2-4.3; off by default).
+  // Package B (--reloc-mode weight; Hofer et al., arXiv 2610.13541, sec. 4.2-4.3). Off in Model
+  // and the C API; the CLI default since 2026-11-11 (with --noise-lr 0; opacity fallback for views < 400 tiles).
   // blend_wmax[i] = max of alpha*T over the training pixels rendered since step wmax_since (float
   // bits, written by the rasterizer backward with an atomic max; +4 B per Gaussian of cap).
   // reloc_weight: relocate by blend_wmax every 400 steps instead of the 0.005 opacity threshold,
